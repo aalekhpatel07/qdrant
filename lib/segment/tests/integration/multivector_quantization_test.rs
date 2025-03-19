@@ -274,6 +274,7 @@ fn test_multivector_quantization_hnsw(
         QuantizationVariant::Binary => BinaryQuantizationConfig {
             always_ram: Some(false),
             encoding: None,
+            query_quantization: None,
         }
         .into(),
     };

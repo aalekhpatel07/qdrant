@@ -684,6 +684,11 @@ pub struct BinaryQuantizationConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encoding: Option<BinaryQuantizationEncoding>,
+
+    /// Asymmetric quantization configuration allows a query to have different quantization than stored vectors.
+    /// It can increase the accuracy of search at the cost of performance.
+    #[serde(skip_serializing_if = "QueryQuantizationConfig::serde_skip_condition")]
+    pub query_quantization: Option<QueryQuantizationConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Eq, Hash)]
@@ -719,6 +724,24 @@ impl Validate for QuantizationConfig {
             QuantizationConfig::Product(product) => product.validate(),
             QuantizationConfig::Binary(binary) => binary.validate(),
         }
+    }
+}
+
+#[derive(
+    Default, Debug, Deserialize, Serialize, JsonSchema, Anonymize, Clone, PartialEq, Eq, Hash,
+)]
+#[serde(rename_all = "lowercase")]
+#[anonymize(false)]
+pub enum QueryQuantizationConfig {
+    #[default]
+    Default,
+    Binary,
+    Scalar,
+}
+
+impl QueryQuantizationConfig {
+    pub fn serde_skip_condition(config: &Option<Self>) -> bool {
+        config.is_none() || matches!(config, Some(Self::Default))
     }
 }
 

@@ -1191,6 +1191,56 @@ impl TryFrom<QuantizationConfig> for segment::types::QuantizationConfig {
     }
 }
 
+impl TryFrom<QueryQuantizationConfig> for segment::types::QueryQuantizationConfig {
+    type Error = Status;
+
+    fn try_from(value: QueryQuantizationConfig) -> Result<Self, Self::Error> {
+        use crate::grpc::qdrant::query_quantization_config::{Setting, Variant};
+
+        let QueryQuantizationConfig { variant } = value;
+        let variant = variant
+            .ok_or_else(|| Status::invalid_argument("Malformed `QueryQuantizationConfig`"))?;
+
+        let converted = match variant {
+            Variant::Setting(setting_int) => {
+                let setting = Setting::try_from(setting_int).map_err(|err| {
+                    Status::invalid_argument(format!(
+                        "Invalid `QueryQuantizationConfig` setting: {err}"
+                    ))
+                })?;
+                match setting {
+                    Setting::Default => segment::types::QueryQuantizationConfig::Default,
+                    Setting::Binary => segment::types::QueryQuantizationConfig::Binary,
+                    Setting::Scalar => segment::types::QueryQuantizationConfig::Scalar,
+                }
+            }
+        };
+        Ok(converted)
+    }
+}
+
+impl From<segment::types::QueryQuantizationConfig> for QueryQuantizationConfig {
+    fn from(value: segment::types::QueryQuantizationConfig) -> Self {
+        use crate::grpc::qdrant::query_quantization_config::{Setting, Variant};
+
+        let variant = match value {
+            segment::types::QueryQuantizationConfig::Default => {
+                Variant::Setting(Setting::Default.into())
+            }
+            segment::types::QueryQuantizationConfig::Binary => {
+                Variant::Setting(Setting::Binary.into())
+            }
+            segment::types::QueryQuantizationConfig::Scalar => {
+                Variant::Setting(Setting::Scalar.into())
+            }
+        };
+
+        Self {
+            variant: Some(variant),
+        }
+    }
+}
+
 impl From<segment::types::MultiVectorConfig> for MultiVectorConfig {
     fn from(value: segment::types::MultiVectorConfig) -> Self {
         let segment::types::MultiVectorConfig { comparator } = value;
