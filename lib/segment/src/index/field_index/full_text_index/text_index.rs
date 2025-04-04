@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use parking_lot::RwLock;
 use rocksdb::DB;
@@ -13,10 +14,10 @@ use super::inverted_index::{Document, InvertedIndex, ParsedQuery, TokenId};
 use super::mmap_text_index::{FullTextMmapIndexBuilder, MmapFullTextIndex};
 use super::mutable_text_index::MutableFullTextIndex;
 use super::tokenizers::Tokenizer;
+use crate::common::Flusher;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
 use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
-use crate::common::Flusher;
 use crate::data_types::index::TextIndexParams;
 use crate::index::field_index::{
     CardinalityEstimation, FieldIndexBuilderTrait, PayloadBlockCondition, PayloadFieldIndex,
@@ -25,11 +26,10 @@ use crate::index::field_index::{
 use crate::telemetry::PayloadIndexTelemetry;
 use crate::types::{FieldCondition, Match, PayloadKeyType};
 
-#[allow(clippy::large_enum_variant)]
 pub enum FullTextIndex {
     Mutable(MutableFullTextIndex),
     Immutable(ImmutableFullTextIndex),
-    Mmap(MmapFullTextIndex),
+    Mmap(Box<MmapFullTextIndex>),
 }
 
 impl FullTextIndex {
@@ -51,8 +51,14 @@ impl FullTextIndex {
         }
     }
 
-    pub fn new_mmap(path: PathBuf, config: TextIndexParams) -> OperationResult<Self> {
-        Ok(Self::Mmap(MmapFullTextIndex::open(path, config)?))
+    pub fn new_mmap(
+        path: PathBuf,
+        config: TextIndexParams,
+        is_on_disk: bool,
+    ) -> OperationResult<Self> {
+        Ok(Self::Mmap(Box::new(MmapFullTextIndex::open(
+            path, config, is_on_disk,
+        )?)))
     }
 
     pub fn init(&mut self) -> OperationResult<()> {
@@ -71,8 +77,12 @@ impl FullTextIndex {
         FullTextIndexBuilder(Self::new_memory(db, config, field, true))
     }
 
-    pub fn builder_mmap(path: PathBuf, config: TextIndexParams) -> FullTextMmapIndexBuilder {
-        FullTextMmapIndexBuilder::new(path, config)
+    pub fn builder_mmap(
+        path: PathBuf,
+        config: TextIndexParams,
+        is_on_disk: bool,
+    ) -> FullTextMmapIndexBuilder {
+        FullTextMmapIndexBuilder::new(path, config, is_on_disk)
     }
 
     fn storage_cf_name(field: &str) -> String {
@@ -95,19 +105,23 @@ impl FullTextIndex {
         }
     }
 
-    fn get_token(&self, token: &str) -> Option<TokenId> {
+    fn get_token(&self, token: &str, hw_counter: &HardwareCounterCell) -> Option<TokenId> {
         match self {
-            Self::Mutable(index) => index.inverted_index.get_token_id(token),
-            Self::Immutable(index) => index.inverted_index.get_token_id(token),
-            Self::Mmap(index) => index.inverted_index.get_token_id(token),
+            Self::Mutable(index) => index.inverted_index.get_token_id(token, hw_counter),
+            Self::Immutable(index) => index.inverted_index.get_token_id(token, hw_counter),
+            Self::Mmap(index) => index.inverted_index.get_token_id(token, hw_counter),
         }
     }
 
-    fn filter(&self, query: &ParsedQuery) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
+    fn filter<'a>(
+        &'a self,
+        query: ParsedQuery,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> Box<dyn Iterator<Item = PointOffsetType> + 'a> {
         match self {
-            Self::Mutable(index) => index.inverted_index.filter(query),
-            Self::Immutable(index) => index.inverted_index.filter(query),
-            Self::Mmap(index) => index.inverted_index.filter(query),
+            Self::Mutable(index) => index.inverted_index.filter(query, hw_counter),
+            Self::Immutable(index) => index.inverted_index.filter(query, hw_counter),
+            Self::Mmap(index) => index.inverted_index.filter(query, hw_counter),
         }
     }
 
@@ -127,19 +141,37 @@ impl FullTextIndex {
         &self,
         query: &ParsedQuery,
         condition: &FieldCondition,
+        hw_counter: &HardwareCounterCell,
     ) -> CardinalityEstimation {
         match self {
-            Self::Mutable(index) => index.inverted_index.estimate_cardinality(query, condition),
-            Self::Immutable(index) => index.inverted_index.estimate_cardinality(query, condition),
-            Self::Mmap(index) => index.inverted_index.estimate_cardinality(query, condition),
+            Self::Mutable(index) => index
+                .inverted_index
+                .estimate_cardinality(query, condition, hw_counter),
+            Self::Immutable(index) => index
+                .inverted_index
+                .estimate_cardinality(query, condition, hw_counter),
+            Self::Mmap(index) => index
+                .inverted_index
+                .estimate_cardinality(query, condition, hw_counter),
         }
     }
 
-    pub fn check_match(&self, query: &ParsedQuery, point_id: PointOffsetType) -> bool {
+    pub fn check_match(
+        &self,
+        query: &ParsedQuery,
+        point_id: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> bool {
         match self {
-            Self::Mutable(index) => index.inverted_index.check_match(query, point_id),
-            Self::Immutable(index) => index.inverted_index.check_match(query, point_id),
-            Self::Mmap(index) => index.inverted_index.check_match(query, point_id),
+            Self::Mutable(index) => index
+                .inverted_index
+                .check_match(query, point_id, hw_counter),
+            Self::Immutable(index) => index
+                .inverted_index
+                .check_match(query, point_id, hw_counter),
+            Self::Mmap(index) => index
+                .inverted_index
+                .check_match(query, point_id, hw_counter),
         }
     }
 
@@ -199,20 +231,20 @@ impl FullTextIndex {
         }
     }
 
-    pub fn parse_query(&self, text: &str) -> ParsedQuery {
+    pub fn parse_query(&self, text: &str, hw_counter: &HardwareCounterCell) -> ParsedQuery {
         let mut tokens = HashSet::new();
         Tokenizer::tokenize_query(text, self.config(), |token| {
-            tokens.insert(self.get_token(token));
+            tokens.insert(self.get_token(token, hw_counter));
         });
         ParsedQuery {
             tokens: tokens.into_iter().collect(),
         }
     }
 
-    pub fn parse_document(&self, text: &str) -> Document {
+    pub fn parse_document(&self, text: &str, hw_counter: &HardwareCounterCell) -> Document {
         let mut document_tokens = vec![];
         Tokenizer::tokenize_doc(text, self.config(), |token| {
-            if let Some(token_id) = self.get_token(token) {
+            if let Some(token_id) = self.get_token(token, hw_counter) {
                 document_tokens.push(token_id);
             }
         });
@@ -220,9 +252,13 @@ impl FullTextIndex {
     }
 
     #[cfg(test)]
-    pub fn query(&self, query: &str) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
-        let parsed_query = self.parse_query(query);
-        self.filter(&parsed_query)
+    pub fn query<'a>(
+        &'a self,
+        query: &'a str,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> Box<dyn Iterator<Item = PointOffsetType> + 'a> {
+        let parsed_query = self.parse_query(query, hw_counter);
+        self.filter(parsed_query, hw_counter)
     }
 }
 
@@ -235,8 +271,13 @@ impl FieldIndexBuilderTrait for FullTextIndexBuilder {
         self.0.init()
     }
 
-    fn add_point(&mut self, id: PointOffsetType, payload: &[&Value]) -> OperationResult<()> {
-        self.0.add_point(id, payload)
+    fn add_point(
+        &mut self,
+        id: PointOffsetType,
+        payload: &[&Value],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        self.0.add_point(id, payload, hw_counter)
     }
 
     fn finalize(self) -> OperationResult<Self::FieldIndexType> {
@@ -247,9 +288,14 @@ impl FieldIndexBuilderTrait for FullTextIndexBuilder {
 impl ValueIndexer for FullTextIndex {
     type ValueType = String;
 
-    fn add_many(&mut self, idx: PointOffsetType, values: Vec<String>) -> OperationResult<()> {
+    fn add_many(
+        &mut self,
+        idx: PointOffsetType,
+        values: Vec<String>,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
         match self {
-            Self::Mutable(index) => index.add_many(idx, values),
+            Self::Mutable(index) => index.add_many(idx, values, hw_counter),
             Self::Immutable(_) => Err(OperationError::service_error(
                 "Cannot add values to immutable text index",
             )),
@@ -288,7 +334,7 @@ impl PayloadFieldIndex for FullTextIndex {
         }
     }
 
-    fn clear(self) -> OperationResult<()> {
+    fn cleanup(self) -> OperationResult<()> {
         match self {
             Self::Mutable(index) => index.clear(),
             Self::Immutable(index) => index.clear(),
@@ -312,21 +358,26 @@ impl PayloadFieldIndex for FullTextIndex {
         }
     }
 
-    fn filter(
-        &self,
-        condition: &FieldCondition,
-    ) -> Option<Box<dyn Iterator<Item = PointOffsetType> + '_>> {
+    fn filter<'a>(
+        &'a self,
+        condition: &'a FieldCondition,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> Option<Box<dyn Iterator<Item = PointOffsetType> + 'a>> {
         if let Some(Match::Text(text_match)) = &condition.r#match {
-            let parsed_query = self.parse_query(&text_match.text);
-            return Some(self.filter(&parsed_query));
+            let parsed_query = self.parse_query(&text_match.text, hw_counter);
+            return Some(self.filter(parsed_query, hw_counter));
         }
         None
     }
 
-    fn estimate_cardinality(&self, condition: &FieldCondition) -> Option<CardinalityEstimation> {
+    fn estimate_cardinality(
+        &self,
+        condition: &FieldCondition,
+        hw_counter: &HardwareCounterCell,
+    ) -> Option<CardinalityEstimation> {
         if let Some(Match::Text(text_match)) = &condition.r#match {
-            let parsed_query = self.parse_query(&text_match.text);
-            return Some(self.estimate_cardinality(&parsed_query, condition));
+            let parsed_query = self.parse_query(&text_match.text, hw_counter);
+            return Some(self.estimate_cardinality(&parsed_query, condition, hw_counter));
         }
         None
     }

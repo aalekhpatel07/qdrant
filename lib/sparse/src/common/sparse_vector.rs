@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::hash::Hash;
 
 use common::types::ScoreType;
+use gridstore::Blob;
 use itertools::Itertools;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,7 @@ pub struct RemappedSparseVector {
 }
 
 /// Sort two arrays by the first array.
-fn double_sort<T: Ord + Copy, V: Copy>(indices: &mut [T], values: &mut [V]) {
+pub fn double_sort<T: Ord + Copy, V: Copy>(indices: &mut [T], values: &mut [V]) {
     // Check if the indices are already sorted
     if indices.windows(2).all(|w| w[0] < w[1]) {
         return;
@@ -51,7 +52,7 @@ fn double_sort<T: Ord + Copy, V: Copy>(indices: &mut [T], values: &mut [V]) {
     }
 }
 
-fn score_vectors<T: Ord + Eq>(
+pub fn score_vectors<T: Ord + Eq>(
     self_indices: &[T],
     self_values: &[DimWeight],
     other_indices: &[T],
@@ -74,11 +75,7 @@ fn score_vectors<T: Ord + Eq>(
             }
         }
     }
-    if overlap {
-        Some(score)
-    } else {
-        None
-    }
+    if overlap { Some(score) } else { None }
 }
 
 impl RemappedSparseVector {
@@ -105,6 +102,15 @@ impl RemappedSparseVector {
         debug_assert!(self.is_sorted());
         debug_assert!(other.is_sorted());
         score_vectors(&self.indices, &self.values, &other.indices, &other.values)
+    }
+
+    /// Returns the number of elements in the vector.
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -233,6 +239,16 @@ impl TryFrom<Vec<(u32, f32)>> for SparseVector {
     fn try_from(tuples: Vec<(u32, f32)>) -> Result<Self, Self::Error> {
         let (indices, values): (Vec<_>, Vec<_>) = tuples.into_iter().unzip();
         SparseVector::new(indices, values)
+    }
+}
+
+impl Blob for SparseVector {
+    fn to_bytes(&self) -> Vec<u8> {
+        bincode::serialize(&self).expect("Sparse vector serialization should not fail")
+    }
+
+    fn from_bytes(data: &[u8]) -> Self {
+        bincode::deserialize(data).expect("Sparse vector deserialization should not fail")
     }
 }
 

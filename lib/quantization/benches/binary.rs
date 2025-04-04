@@ -1,17 +1,15 @@
+use std::sync::atomic::AtomicBool;
+
 use common::counter::hardware_counter::HardwareCounterCell;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use permutation_iterator::Permutor;
 use quantization::encoded_vectors::{DistanceType, EncodedVectors, VectorParameters};
 use quantization::encoded_vectors_binary::EncodedVectorsBin;
 use rand::{Rng, SeedableRng};
 
 fn generate_number(rng: &mut rand::rngs::StdRng) -> f32 {
-    let n = f32::signum(rng.gen_range(-1.0..1.0));
-    if n == 0.0 {
-        1.0
-    } else {
-        n
-    }
+    let n = f32::signum(rng.random_range(-1.0..1.0));
+    if n == 0.0 { 1.0 } else { n }
 }
 
 fn generate_vector(dim: usize, rng: &mut rand::rngs::StdRng) -> Vec<f32> {
@@ -28,7 +26,7 @@ fn binary_bench(c: &mut Criterion) {
         .map(|_| generate_vector(vector_dim, &mut rng))
         .collect();
     for _ in 0..vectors_count {
-        let vector: Vec<f32> = (0..vector_dim).map(|_| rng.gen()).collect();
+        let vector: Vec<f32> = (0..vector_dim).map(|_| rng.random()).collect();
         vectors.push(vector);
     }
 
@@ -41,7 +39,7 @@ fn binary_bench(c: &mut Criterion) {
             distance_type: DistanceType::Dot,
             invert: false,
         },
-        || false,
+        &AtomicBool::new(false),
     )
     .unwrap();
 
@@ -80,7 +78,7 @@ fn binary_bench(c: &mut Criterion) {
             distance_type: DistanceType::Dot,
             invert: false,
         },
-        || false,
+        &AtomicBool::new(false),
     )
     .unwrap();
 
@@ -107,8 +105,6 @@ fn binary_bench(c: &mut Criterion) {
             }
         });
     });
-
-    hardware_counter.discard_results();
 }
 
 criterion_group! {

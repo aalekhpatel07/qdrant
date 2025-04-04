@@ -5,10 +5,10 @@ use parking_lot::Mutex;
 
 use super::transfer_tasks_pool::TransferTaskProgress;
 use crate::operations::types::{CollectionError, CollectionResult, CountRequestInternal};
+use crate::shards::CollectionId;
 use crate::shards::remote_shard::RemoteShard;
 use crate::shards::shard::ShardId;
 use crate::shards::shard_holder::LockedShardHolder;
-use crate::shards::CollectionId;
 
 pub(super) const TRANSFER_BATCH_SIZE: usize = 100;
 
@@ -49,15 +49,16 @@ pub(super) async fn transfer_stream_records(
             .proxify_local(remote_shard.clone(), None)
             .await?;
 
-        let hw_acc = HwMeasurementAcc::new();
+        // Don't increment hardware usage for internal operations
+        let hw_acc = HwMeasurementAcc::disposable();
         let Some(count_result) = replica_set
             .count_local(
                 Arc::new(CountRequestInternal {
                     filter: None,
-                    exact: true,
+                    exact: false,
                 }),
                 None, // no timeout
-                &hw_acc,
+                hw_acc,
             )
             .await?
         else {
@@ -65,8 +66,7 @@ pub(super) async fn transfer_stream_records(
                 "Shard {shard_id} not found"
             )));
         };
-        progress.lock().points_total = count_result.count;
-        hw_acc.discard(); // Don't measure hardware in internal operations
+        progress.lock().set(0, count_result.count);
 
         replica_set.transfer_indexes().await?;
 
@@ -90,17 +90,12 @@ pub(super) async fn transfer_stream_records(
             )));
         };
 
-        offset = replica_set
+        let (new_offset, count) = replica_set
             .transfer_batch(offset, TRANSFER_BATCH_SIZE, None, false)
             .await?;
 
-        {
-            let mut progress = progress.lock();
-            let transferred =
-                (progress.points_transferred + TRANSFER_BATCH_SIZE).min(progress.points_total);
-            progress.points_transferred = transferred;
-            progress.eta.set_progress(transferred);
-        }
+        offset = new_offset;
+        progress.lock().add(count);
 
         // If this is the last batch, finalize
         if offset.is_none() {

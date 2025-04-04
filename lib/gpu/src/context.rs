@@ -112,6 +112,56 @@ impl Context {
         Ok(())
     }
 
+    /// Barrier for buffers.
+    /// It's used to synchronize access to buffers between different shaders.
+    /// By Vulkan specification, resources between different shaders/transfers must be synchronized.
+    /// Example of compute shader sync:
+    /// https://github.com/KhronosGroup/Vulkan-Docs/wiki/Synchronization-Examples#compute-to-compute-dependencies
+    /// In practice, we use `context.wait_finish()` to synchronize between different shaders.
+    /// But, for additional safety, we have this `barrier_buffers` to synchronize access to buffers.
+    pub fn barrier_buffers(&mut self, buffers: &[Arc<Buffer>]) -> GpuResult<()> {
+        if self.vk_command_buffer == vk::CommandBuffer::null() {
+            self.init_command_buffer()?;
+        }
+
+        let buffer_memory_barriers = buffers
+            .iter()
+            .map(|buffer| {
+                self.resources.push(buffer.clone() as Arc<dyn Resource>);
+                vk::BufferMemoryBarrier::default()
+                    .buffer(buffer.vk_buffer())
+                    .offset(0)
+                    .size(buffer.size() as vk::DeviceSize)
+                    .src_queue_family_index(
+                        self.device.compute_queue().vk_queue_family_index as u32,
+                    )
+                    .dst_queue_family_index(
+                        self.device.compute_queue().vk_queue_family_index as u32,
+                    )
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(
+                        vk::AccessFlags::TRANSFER_READ
+                            | vk::AccessFlags::SHADER_READ
+                            | vk::AccessFlags::SHADER_WRITE,
+                    )
+            })
+            .collect::<Vec<_>>();
+
+        unsafe {
+            self.device.vk_device().cmd_pipeline_barrier(
+                self.vk_command_buffer,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &buffer_memory_barriers,
+                &[],
+            );
+        }
+
+        Ok(())
+    }
+
     /// Bind pipeline to the context.
     /// It means which shader and binded resources to shader will be used.
     /// It records command to run it on GPU after `run` call.
@@ -169,6 +219,10 @@ impl Context {
         dst_offset: usize,
         size: usize,
     ) -> GpuResult<()> {
+        if size == 0 {
+            return Ok(());
+        }
+
         if self.vk_command_buffer == vk::CommandBuffer::null() {
             self.init_command_buffer()?;
         }
@@ -201,6 +255,10 @@ impl Context {
 
     /// Clear buffer with zeros command. It records command to run it on GPU after `run` call.
     pub fn clear_buffer(&mut self, buffer: Arc<Buffer>) -> GpuResult<()> {
+        if buffer.size() == 0 {
+            return Ok(());
+        }
+
         if buffer.size() % std::mem::size_of::<u32>() != 0 {
             return Err(GpuError::OutOfBounds(
                 "Buffer size must be a multiple of `uint32` size to clear it".to_string(),
@@ -390,7 +448,7 @@ impl Drop for Context {
                 // Error was logged, do memory leak to keep the gpu running.
                 let resources = self.resources.clone();
                 self.resources.clear();
-                for resource in resources.into_iter() {
+                for resource in resources {
                     // !!!!!!!!!
                     std::mem::forget(resource);
                 }
@@ -400,7 +458,7 @@ impl Drop for Context {
                 wait_result.unwrap_or_else(|e|
                     // Cannot return error from Drop trait.
                     // Log it instead.
-                    log::error!("Error while clear GPU context: {:?}", e));
+                    log::error!("Error while clear GPU context: {e:?}"));
 
                 // If command buffer was not destroyed, destroy it.
                 // This situation may appear if `wait_finish` is an error.

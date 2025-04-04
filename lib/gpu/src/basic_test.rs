@@ -19,17 +19,8 @@ void main() {
 // It takes list of numbers and adds parameter to each number.
 #[test]
 fn basic_gpu_test() {
-    // First step: initialize GPU device.
-
-    // Panic if case of wrong Vulkan API calls.
-    let debug_messenger = crate::PanicIfErrorMessenger {};
-    // Use default CPU allocator.
-    let allocation_callbacks = None;
-    // Don't dump Vulkan API calls.
-    let dump_api = false;
-    // Create Vulkan API instance.
-    let instance =
-        crate::Instance::new(Some(&debug_messenger), allocation_callbacks, dump_api).unwrap();
+    // Get Vulkan API instance.
+    let instance = crate::GPU_TEST_INSTANCE.clone();
     // Choose any GPU hardware to use.
     let physical_device = &instance.physical_devices()[0];
     // Create GPU device.
@@ -78,7 +69,7 @@ fn basic_gpu_test() {
     )
     .unwrap();
     // Copy numbers.
-    upload_buffer.upload_slice(&numbers, 0).unwrap();
+    upload_buffer.upload(numbers.as_slice(), 0).unwrap();
     // Copy parameter to the end.
     upload_buffer.upload(&param, storage_buffer.size()).unwrap();
 
@@ -108,7 +99,9 @@ fn basic_gpu_test() {
     // Third step: create computation pipeline.
 
     // Compile shader code to SPIR-V.
-    let spirv = instance.compile_shader(SHADER_CODE, None, None).unwrap();
+    let spirv = crate::GPU_TEST_INSTANCE
+        .compile_shader(SHADER_CODE, "shader.glsl", None, None)
+        .unwrap();
     // Create shader.
     let shader = crate::Shader::new(device.clone(), &spirv).unwrap();
 
@@ -137,6 +130,8 @@ fn basic_gpu_test() {
     context.bind_pipeline(pipeline, &descriptor_sets).unwrap();
     // Run computeation command. Threads count is the inputs count.
     context.dispatch(numbers_count, 1, 1).unwrap();
+    // Add barrier to ensure that all writes to the storage buffer are visible to the next command.
+    context.barrier_buffers(&[storage_buffer.clone()]).unwrap();
     // Run GPU and wait finish.
     context.run().unwrap();
     context.wait_finish(context_timeout).unwrap();
@@ -166,8 +161,9 @@ fn basic_gpu_test() {
     context.wait_finish(context_timeout).unwrap();
 
     // Download data from intermediate buffer.
-    let mut result = vec![0f32; numbers_count];
-    download_buffer.download_slice(&mut result, 0).unwrap();
+    let result = download_buffer
+        .download_vec::<f32>(0, numbers_count)
+        .unwrap();
 
     // Check results.
     for i in 0..numbers_count {

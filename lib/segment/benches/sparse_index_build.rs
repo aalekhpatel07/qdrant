@@ -2,32 +2,33 @@
 mod prof;
 
 use std::borrow::Cow;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use atomic_refcell::AtomicRefCell;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use half::f16;
-use rand::rngs::StdRng;
 use rand::SeedableRng;
-use segment::common::rocksdb_wrapper::{open_db, DB_VECTOR_CF};
+use rand::rngs::StdRng;
+use segment::common::rocksdb_wrapper::{DB_VECTOR_CF, open_db};
 use segment::fixtures::payload_context_fixture::FixtureIdTracker;
+use segment::index::VectorIndex;
 use segment::index::sparse_index::sparse_index_config::{SparseIndexConfig, SparseIndexType};
 use segment::index::sparse_index::sparse_vector_index::{
     SparseVectorIndex, SparseVectorIndexOpenArgs,
 };
 use segment::index::struct_payload_index::StructPayloadIndex;
-use segment::index::VectorIndex;
 use segment::payload_storage::in_memory_payload_storage::InMemoryPayloadStorage;
 use segment::types::VectorStorageDatatype;
-use segment::vector_storage::simple_sparse_vector_storage::open_simple_sparse_vector_storage;
 use segment::vector_storage::VectorStorage;
+use segment::vector_storage::sparse::simple_sparse_vector_storage::open_simple_sparse_vector_storage;
 use sparse::common::sparse_vector_fixture::random_sparse_vector;
+use sparse::index::inverted_index::InvertedIndex;
 use sparse::index::inverted_index::inverted_index_compressed_mmap::InvertedIndexCompressedMmap;
 use sparse::index::inverted_index::inverted_index_mmap::InvertedIndexMmap;
 use sparse::index::inverted_index::inverted_index_ram::InvertedIndexRam;
-use sparse::index::inverted_index::InvertedIndex;
 use tempfile::Builder;
 
 const NUM_VECTORS: usize = 10_000;
@@ -60,11 +61,13 @@ fn sparse_vector_index_build_benchmark(c: &mut Criterion) {
     let db = open_db(storage_dir.path(), &[DB_VECTOR_CF]).unwrap();
     let mut vector_storage = open_simple_sparse_vector_storage(db, DB_VECTOR_CF, &stopped).unwrap();
 
+    let hw_counter = HardwareCounterCell::new();
+
     // add points to storage only once
     for idx in 0..NUM_VECTORS {
         let vec = &random_sparse_vector(&mut rnd, MAX_SPARSE_DIM);
         vector_storage
-            .insert_vector(idx as PointOffsetType, vec.into())
+            .insert_vector(idx as PointOffsetType, vec.into(), &hw_counter)
             .unwrap();
     }
 

@@ -3,7 +3,7 @@ pub mod pyro {
 
     use pyroscope::pyroscope::PyroscopeAgentRunning;
     use pyroscope::{PyroscopeAgent, PyroscopeError};
-    use pyroscope_pprofrs::{pprof_backend, PprofConfig};
+    use pyroscope_pprofrs::{PprofConfig, pprof_backend};
 
     use crate::common::debugger::PyroscopeConfig;
 
@@ -43,7 +43,7 @@ pub mod pyro {
                             agent: Some(agent),
                         }),
                         Err(err) => {
-                            log::warn!("Pyroscope agent failed to start {}", err);
+                            log::warn!("Pyroscope agent failed to start {err}");
                             None
                         }
                     }
@@ -63,7 +63,7 @@ pub mod pyro {
                         return true;
                     }
                     Err(err) => {
-                        log::warn!("Pyroscope agent failed to stop {}", err);
+                        log::warn!("Pyroscope agent failed to stop {err}");
                         return false;
                     }
                 }

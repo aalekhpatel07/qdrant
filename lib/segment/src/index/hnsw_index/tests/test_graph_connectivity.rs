@@ -1,23 +1,20 @@
-use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
-use common::cpu::CpuPermit;
+use common::budget::ResourcePermit;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use rand::thread_rng;
+use rand::rng;
 use tempfile::Builder;
 
-use crate::data_types::vectors::{only_default_vector, DEFAULT_VECTOR_NAME};
+use crate::data_types::vectors::{DEFAULT_VECTOR_NAME, only_default_vector};
 use crate::entry::entry_point::SegmentEntry;
 use crate::fixtures::index_fixtures::random_vector;
-use crate::index::hnsw_index::graph_links::{GraphLinks, GraphLinksRam};
 use crate::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
 use crate::index::hnsw_index::num_rayon_threads;
-use crate::segment_constructor::build_segment;
-use crate::types::{
-    Distance, HnswConfig, Indexes, SegmentConfig, SeqNumberType, VectorDataConfig,
-    VectorStorageType,
-};
+use crate::segment_constructor::VectorIndexBuildArgs;
+use crate::segment_constructor::simple_segment_constructor::build_simple_segment;
+use crate::types::{Distance, HnswConfig, SeqNumberType};
 
 #[test]
 fn test_graph_connectivity() {
@@ -30,35 +27,25 @@ fn test_graph_connectivity() {
     let distance = Distance::Cosine;
     let full_scan_threshold = 10_000;
 
-    let mut rnd = thread_rng();
+    let mut rnd = rng();
 
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let hnsw_dir = Builder::new().prefix("hnsw_dir").tempdir().unwrap();
 
-    let config = SegmentConfig {
-        vector_data: HashMap::from([(
-            DEFAULT_VECTOR_NAME.to_owned(),
-            VectorDataConfig {
-                size: dim,
-                distance,
-                storage_type: VectorStorageType::Memory,
-                index: Indexes::Plain {},
-                quantization_config: None,
-                multivector_config: None,
-                datatype: None,
-            },
-        )]),
-        payload_storage_type: Default::default(),
-        sparse_vector_data: Default::default(),
-    };
+    let hw_counter = HardwareCounterCell::new();
 
-    let mut segment = build_segment(dir.path(), &config, true).unwrap();
+    let mut segment = build_simple_segment(dir.path(), dim, distance).unwrap();
     for n in 0..num_vectors {
         let idx = n.into();
         let vector = random_vector(&mut rnd, dim);
 
         segment
-            .upsert_point(n as SeqNumberType, idx, only_default_vector(&vector))
+            .upsert_point(
+                n as SeqNumberType,
+                idx,
+                only_default_vector(&vector),
+                &hw_counter,
+            )
             .unwrap();
     }
 
@@ -74,30 +61,36 @@ fn test_graph_connectivity() {
     };
 
     let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
-    let permit = Arc::new(CpuPermit::dummy(permit_cpu_count as u32));
+    let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
 
-    let hnsw_index = HNSWIndex::<GraphLinksRam>::open(HnswIndexOpenArgs {
-        path: hnsw_dir.path(),
-        id_tracker: segment.id_tracker.clone(),
-        vector_storage: segment.vector_data[DEFAULT_VECTOR_NAME]
-            .vector_storage
-            .clone(),
-        quantized_vectors: Default::default(),
-        payload_index: payload_index_ptr,
-        hnsw_config,
-        permit: Some(permit),
-        stopped: &stopped,
-    })
+    let hnsw_index = HNSWIndex::build(
+        HnswIndexOpenArgs {
+            path: hnsw_dir.path(),
+            id_tracker: segment.id_tracker.clone(),
+            vector_storage: segment.vector_data[DEFAULT_VECTOR_NAME]
+                .vector_storage
+                .clone(),
+            quantized_vectors: Default::default(),
+            payload_index: payload_index_ptr,
+            hnsw_config,
+        },
+        VectorIndexBuildArgs {
+            permit,
+            old_indices: &[],
+            gpu_device: None,
+            stopped: &stopped,
+        },
+    )
     .unwrap();
 
     let mut reverse_links = vec![vec![]; num_vectors as usize];
 
     for point_id in 0..num_vectors {
-        let links = hnsw_index
+        for link in hnsw_index
             .graph()
             .links
-            .links(point_id as PointOffsetType, 0);
-        for link in links {
+            .links(point_id as PointOffsetType, 0)
+        {
             reverse_links[link as usize].push(point_id);
         }
     }

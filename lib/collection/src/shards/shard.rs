@@ -2,12 +2,15 @@ use core::marker::{Send, Sync};
 use std::future::{self, Future};
 use std::path::Path;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::tar_ext;
 use common::types::TelemetryDetail;
-use segment::types::SnapshotFormat;
+use segment::index::field_index::CardinalityEstimation;
+use segment::types::{Filter, SnapshotFormat};
 
 use super::local_shard::clock_map::RecoveryPoint;
 use super::update_tracker::UpdateTracker;
+use crate::operations::operation_effect::{EstimateOperationEffectArea, OperationEffectArea};
 use crate::operations::types::{CollectionError, CollectionResult};
 use crate::shards::dummy_shard::DummyShard;
 use crate::shards::forward_proxy_shard::ForwardProxyShard;
@@ -130,6 +133,16 @@ impl Shard {
         }
     }
 
+    pub async fn on_strict_mode_config_update(&mut self) {
+        match self {
+            Shard::Local(local_shard) => local_shard.on_strict_mode_config_update().await,
+            Shard::Proxy(proxy_shard) => proxy_shard.on_strict_mode_config_update().await,
+            Shard::ForwardProxy(proxy_shard) => proxy_shard.on_strict_mode_config_update().await,
+            Shard::QueueProxy(proxy_shard) => proxy_shard.on_strict_mode_config_update().await,
+            Shard::Dummy(dummy_shard) => dummy_shard.on_strict_mode_config_update().await,
+        }
+    }
+
     pub fn trigger_optimizers(&self) {
         match self {
             Shard::Local(local_shard) => local_shard.trigger_optimizers(),
@@ -144,7 +157,7 @@ impl Shard {
 
     pub fn is_update_in_progress(&self) -> bool {
         self.update_tracker()
-            .map_or(false, UpdateTracker::is_update_in_progress)
+            .is_some_and(UpdateTracker::is_update_in_progress)
     }
 
     pub fn watch_for_update(&self) -> impl Future<Output = ()> {
@@ -248,6 +261,38 @@ impl Shard {
                     "Cannot get WAL version on {}",
                     self.variant_name(),
                 )))
+            }
+        }
+    }
+
+    pub fn estimate_cardinality(
+        &self,
+        filter: Option<&Filter>,
+        hw_counter: &HardwareCounterCell,
+    ) -> CollectionResult<CardinalityEstimation> {
+        match self {
+            Shard::Local(local_shard) => local_shard.estimate_cardinality(filter, hw_counter),
+            Shard::Proxy(proxy_shard) => proxy_shard.estimate_cardinality(filter, hw_counter),
+            Shard::ForwardProxy(forward_proxy_shard) => {
+                forward_proxy_shard.estimate_cardinality(filter, hw_counter)
+            }
+            Shard::QueueProxy(queue_proxy_shard) => {
+                queue_proxy_shard.estimate_cardinality(filter, hw_counter)
+            }
+            Shard::Dummy(dummy_shard) => dummy_shard.estimate_cardinality(filter),
+        }
+    }
+
+    pub fn estimate_request_cardinality(
+        &self,
+        operation: &impl EstimateOperationEffectArea,
+        hw_counter: &HardwareCounterCell,
+    ) -> CollectionResult<CardinalityEstimation> {
+        match operation.estimate_effect_area() {
+            OperationEffectArea::Empty => Ok(CardinalityEstimation::exact(0)),
+            OperationEffectArea::Points(vec) => Ok(CardinalityEstimation::exact(vec.len())),
+            OperationEffectArea::Filter(filter) => {
+                self.estimate_cardinality(Some(filter), hw_counter)
             }
         }
     }

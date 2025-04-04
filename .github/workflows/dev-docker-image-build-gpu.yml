@@ -1,0 +1,16 @@
+name: Build and push a branch gpu image to ghcr
+
+on:
+  workflow_dispatch:
+
+jobs:
+  branch-gpu-build-and-push:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+        - uses: actions/checkout@v4
+          with:
+            ref: ${{ github.ref.name }}
+        - uses: ./.github/workflows/actions/branch-build-and-push
+          env:
+            DOCKER_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+            ARCH: gpu

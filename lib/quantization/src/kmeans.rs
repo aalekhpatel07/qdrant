@@ -1,6 +1,8 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use rand::Rng;
-use rayon::prelude::*;
 use rayon::ThreadPool;
+use rayon::prelude::*;
 
 use crate::EncodingError;
 
@@ -11,7 +13,7 @@ pub fn kmeans(
     max_iterations: usize,
     max_threads: usize,
     accuracy: f32,
-    stop_condition: &impl Fn() -> bool,
+    stopped: &AtomicBool,
 ) -> Result<Vec<f32>, EncodingError> {
     let pool = rayon::ThreadPoolBuilder::new()
         .thread_name(|idx| format!("kmeans-{idx}"))
@@ -26,7 +28,7 @@ pub fn kmeans(
     let mut centroid_indexes = vec![0u32; data.len() / dim];
 
     for _ in 0..max_iterations {
-        if stop_condition() {
+        if stopped.load(Ordering::Relaxed) {
             return Err(EncodingError::Stopped);
         }
 
@@ -110,7 +112,7 @@ fn update_centroids(
     for (centroid_index, centroid_data) in counter.acc.chunks_exact_mut(dim).enumerate() {
         if counter.counter[centroid_index] == 0 {
             // the cluster is empty, so we take random vector as centroid
-            let data_index = rand::thread_rng().gen_range(0..centroid_indexes.len());
+            let data_index = rand::rng().random_range(0..centroid_indexes.len());
             let vector = &data[dim * data_index..dim * (data_index + 1)];
             centroid_data
                 .iter_mut()

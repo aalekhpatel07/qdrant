@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use parking_lot::RwLock;
 use rocksdb::DB;
 
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
-use crate::common::rocksdb_wrapper::{DatabaseColumnWrapper, DB_PAYLOAD_CF};
+use crate::common::rocksdb_wrapper::{DB_PAYLOAD_CF, DatabaseColumnWrapper};
 use crate::types::Payload;
 
 /// In-memory implementation of `PayloadStorage`.
@@ -41,15 +42,25 @@ impl SimplePayloadStorage {
         })
     }
 
-    pub(crate) fn update_storage(&self, point_id: PointOffsetType) -> OperationResult<()> {
+    pub(crate) fn update_storage(
+        &self,
+        point_id: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        let point_id_serialized = serde_cbor::to_vec(&point_id).unwrap();
+        hw_counter
+            .payload_io_write_counter()
+            .incr_delta(point_id_serialized.len());
+
         match self.payload.get(&point_id) {
-            None => self
-                .db_wrapper
-                .remove(serde_cbor::to_vec(&point_id).unwrap()),
-            Some(payload) => self.db_wrapper.put(
-                serde_cbor::to_vec(&point_id).unwrap(),
-                serde_cbor::to_vec(payload).unwrap(),
-            ),
+            None => self.db_wrapper.remove(point_id_serialized),
+            Some(payload) => {
+                let payload_serialized = serde_cbor::to_vec(payload).unwrap();
+                hw_counter
+                    .payload_io_write_counter()
+                    .incr_delta(payload_serialized.len());
+                self.db_wrapper.put(point_id_serialized, payload_serialized)
+            }
         }
     }
 

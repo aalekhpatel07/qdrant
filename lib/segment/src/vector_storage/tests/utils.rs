@@ -1,5 +1,6 @@
 use std::{error, result};
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::{PointOffsetType, ScoredPointOffset};
 use rand::seq::IteratorRandom;
 
@@ -11,7 +12,7 @@ pub type Result<T, E = Error> = result::Result<T, E>;
 pub type Error = Box<dyn error::Error>;
 
 pub fn sampler(rng: impl rand::Rng) -> impl Iterator<Item = f32> {
-    rng.sample_iter(rand::distributions::Standard)
+    rng.sample_iter(rand::distr::StandardUniform)
 }
 
 pub fn insert_distributed_vectors(
@@ -25,12 +26,14 @@ pub fn insert_distributed_vectors(
 
     let mut vector = vec![0.; dim];
 
+    let hw_counter = HardwareCounterCell::new();
+
     for offset in start..end {
         for (item, value) in vector.iter_mut().zip(&mut *sampler) {
             *item = value;
         }
 
-        storage.insert_vector(offset, vector.as_slice().into())?;
+        storage.insert_vector(offset, vector.as_slice().into(), &hw_counter)?;
     }
 
     Ok(())

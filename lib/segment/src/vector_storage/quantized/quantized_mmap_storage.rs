@@ -23,11 +23,7 @@ impl quantization::EncodedStorage for QuantizedMmapStorage {
         quantized_vector_size: usize,
         vectors_count: usize,
     ) -> std::io::Result<QuantizedMmapStorage> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(false)
-            .create(false)
-            .open(path)?;
+        let file = std::fs::OpenOptions::new().read(true).open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         madvise::madvise(&mmap, madvise::get_global())?;
 
@@ -48,6 +44,10 @@ impl quantization::EncodedStorage for QuantizedMmapStorage {
     fn save_to_file(&self, _path: &Path) -> std::io::Result<()> {
         // do nothing because mmap is already saved
         Ok(())
+    }
+
+    fn is_on_disk(&self) -> bool {
+        true
     }
 }
 

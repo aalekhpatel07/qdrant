@@ -1,32 +1,33 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::ops::Deref;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use atomic_refcell::AtomicRefCell;
-use common::cpu::CpuPermit;
+use common::budget::ResourcePermit;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::{ScoreType, ScoredPointOffset};
-use rand::rngs::StdRng;
 use rand::SeedableRng;
-use segment::data_types::vectors::{only_default_vector, QueryVector, DEFAULT_VECTOR_NAME};
+use rand::rngs::StdRng;
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, QueryVector, only_default_vector};
 use segment::entry::entry_point::SegmentEntry;
-use segment::fixtures::payload_fixtures::{random_vector, STR_KEY};
-use segment::index::hnsw_index::graph_links::GraphLinksRam;
+use segment::fixtures::payload_fixtures::{STR_KEY, random_vector};
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
 use segment::index::hnsw_index::num_rayon_threads;
 use segment::index::{VectorIndex, VectorIndexEnum};
 use segment::json_path::JsonPath;
+use segment::payload_json;
 use segment::segment::Segment;
-use segment::segment_constructor::build_segment;
+use segment::segment_constructor::VectorIndexBuildArgs;
 use segment::segment_constructor::segment_builder::SegmentBuilder;
+use segment::segment_constructor::simple_segment_constructor::build_simple_segment;
 use segment::types::PayloadSchemaType::Keyword;
 use segment::types::{
-    CompressionRatio, Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes, Payload,
+    CompressionRatio, Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes,
     ProductQuantizationConfig, QuantizationConfig, QuantizationSearchParams,
-    ScalarQuantizationConfig, SearchParams, SegmentConfig, VectorDataConfig, VectorStorageType,
+    ScalarQuantizationConfig, SearchParams,
 };
 use segment::vector_storage::quantized::quantized_vectors::QuantizedVectors;
-use serde_json::json;
 use tempfile::Builder;
 
 use crate::fixtures::segment::build_segment_1;
@@ -62,46 +63,33 @@ fn hnsw_quantized_search_test(
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let hnsw_dir = Builder::new().prefix("hnsw_dir").tempdir().unwrap();
 
-    let config = SegmentConfig {
-        vector_data: HashMap::from([(
-            DEFAULT_VECTOR_NAME.to_owned(),
-            VectorDataConfig {
-                size: dim,
-                distance,
-                storage_type: VectorStorageType::Memory,
-                index: Indexes::Plain {},
-                quantization_config: None,
-                multivector_config: None,
-                datatype: None,
-            },
-        )]),
-        sparse_vector_data: Default::default(),
-        payload_storage_type: Default::default(),
-    };
+    let hw_counter = HardwareCounterCell::new();
 
-    let mut segment = build_segment(dir.path(), &config, true).unwrap();
+    let mut segment = build_simple_segment(dir.path(), dim, distance).unwrap();
     for n in 0..num_vectors {
         let idx = n.into();
         let vector = random_vector(&mut rnd, dim);
         segment
-            .upsert_point(op_num, idx, only_default_vector(&vector))
+            .upsert_point(op_num, idx, only_default_vector(&vector), &hw_counter)
             .unwrap();
         op_num += 1;
     }
 
     segment
-        .create_field_index(op_num, &JsonPath::new(STR_KEY), Some(&Keyword.into()))
+        .create_field_index(
+            op_num,
+            &JsonPath::new(STR_KEY),
+            Some(&Keyword.into()),
+            &hw_counter,
+        )
         .unwrap();
     op_num += 1;
     for n in 0..payloads_count {
         let idx = n.into();
-        let payload: Payload = json!(
-            {
-                STR_KEY: STR_KEY,
-            }
-        )
-        .into();
-        segment.set_full_payload(op_num, idx, &payload).unwrap();
+        let payload = payload_json! {STR_KEY: STR_KEY};
+        segment
+            .set_full_payload(op_num, idx, &payload, &hw_counter)
+            .unwrap();
         op_num += 1;
     }
 
@@ -127,22 +115,28 @@ fn hnsw_quantized_search_test(
     };
 
     let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
-    let permit = Arc::new(CpuPermit::dummy(permit_cpu_count as u32));
+    let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
 
-    let hnsw_index = HNSWIndex::<GraphLinksRam>::open(HnswIndexOpenArgs {
-        path: hnsw_dir.path(),
-        id_tracker: segment.id_tracker.clone(),
-        vector_storage: segment.vector_data[DEFAULT_VECTOR_NAME]
-            .vector_storage
-            .clone(),
-        quantized_vectors: segment.vector_data[DEFAULT_VECTOR_NAME]
-            .quantized_vectors
-            .clone(),
-        payload_index: segment.payload_index.clone(),
-        hnsw_config,
-        permit: Some(permit),
-        stopped: &stopped,
-    })
+    let hnsw_index = HNSWIndex::build(
+        HnswIndexOpenArgs {
+            path: hnsw_dir.path(),
+            id_tracker: segment.id_tracker.clone(),
+            vector_storage: segment.vector_data[DEFAULT_VECTOR_NAME]
+                .vector_storage
+                .clone(),
+            quantized_vectors: segment.vector_data[DEFAULT_VECTOR_NAME]
+                .quantized_vectors
+                .clone(),
+            payload_index: segment.payload_index.clone(),
+            hnsw_config,
+        },
+        VectorIndexBuildArgs {
+            permit,
+            old_indices: &[],
+            gpu_device: None,
+            stopped: &stopped,
+        },
+    )
     .unwrap();
 
     let query_vectors = (0..attempts)
@@ -176,7 +170,7 @@ fn hnsw_quantized_search_test(
     for n in 0..num_vectors {
         let idx = n.into();
         segment
-            .upsert_point(op_num, idx, only_default_vector(&zero_vector))
+            .upsert_point(op_num, idx, only_default_vector(&zero_vector), &hw_counter)
             .unwrap();
         op_num += 1;
     }
@@ -187,7 +181,7 @@ fn hnsw_quantized_search_test(
 fn check_matches(
     query_vectors: &[QueryVector],
     segment: &Segment,
-    hnsw_index: &HNSWIndex<GraphLinksRam>,
+    hnsw_index: &HNSWIndex,
     filter: Option<&Filter>,
     ef: usize,
     top: usize,
@@ -227,7 +221,7 @@ fn check_matches(
 
 fn check_oversampling(
     query_vectors: &[QueryVector],
-    hnsw_index: &HNSWIndex<GraphLinksRam>,
+    hnsw_index: &HNSWIndex,
     filter: Option<&Filter>,
     ef: usize,
     top: usize,
@@ -286,7 +280,7 @@ fn check_oversampling(
 
 fn check_rescoring(
     query_vectors: &[QueryVector],
-    hnsw_index: &HNSWIndex<GraphLinksRam>,
+    hnsw_index: &HNSWIndex,
     filter: Option<&Filter>,
     ef: usize,
     top: usize,
@@ -423,24 +417,27 @@ fn test_build_hnsw_using_quantization() {
     });
 
     let permit_cpu_count = num_rayon_threads(0);
-    let permit = CpuPermit::dummy(permit_cpu_count as u32);
+    let permit = ResourcePermit::dummy(permit_cpu_count as u32);
+    let hw_counter = HardwareCounterCell::new();
 
     let mut builder = SegmentBuilder::new(dir.path(), temp_dir.path(), &config).unwrap();
 
     builder.update(&[&segment1], &stopped).unwrap();
 
-    let built_segment: Segment = builder.build(permit, &stopped).unwrap();
+    let built_segment: Segment = builder.build(permit, &stopped, &hw_counter).unwrap();
 
     // check if built segment has quantization and index
-    assert!(built_segment.vector_data[DEFAULT_VECTOR_NAME]
-        .quantized_vectors
-        .borrow()
-        .is_some());
+    assert!(
+        built_segment.vector_data[DEFAULT_VECTOR_NAME]
+            .quantized_vectors
+            .borrow()
+            .is_some(),
+    );
     let borrowed_index = built_segment.vector_data[DEFAULT_VECTOR_NAME]
         .vector_index
         .borrow();
     match borrowed_index.deref() {
-        VectorIndexEnum::HnswRam(hnsw_index) => {
+        VectorIndexEnum::Hnsw(hnsw_index) => {
             assert!(hnsw_index.get_quantized_vectors().borrow().is_some())
         }
         _ => panic!("unexpected vector index type"),

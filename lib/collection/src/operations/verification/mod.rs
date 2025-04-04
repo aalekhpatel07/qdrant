@@ -17,25 +17,25 @@ use crate::collection::Collection;
 
 // Creates a new `VerificationPass` without actually verifying anything.
 // This is useful in situations where we don't need to check for strict mode, but still
-// want to be able to access `TableOfContents` using `.toc()`.
+// want to be able to access `TableOfContent` using `.toc()`.
 // If you're not implementing a new point-api endpoint for which a strict mode check
 // is required, this is safe to use.
 pub fn new_unchecked_verification_pass() -> VerificationPass {
-    VerificationPass { inner: () }
+    VerificationPass { _inner: () }
 }
 
 /// A pass, created on successful verification.
 pub struct VerificationPass {
     // Private field, so we can't instantiate it from somewhere else.
-    #[allow(dead_code)]
-    inner: (),
+    _inner: (),
 }
 
 /// Trait to verify strict mode for requests.
 /// This trait ignores the `enabled` parameter in `StrictModeConfig`.
 pub trait StrictModeVerification {
     /// Implementing this method allows adding a custom check for request specific values.
-    fn check_custom(
+    #[allow(async_fn_in_trait)]
+    async fn check_custom(
         &self,
         _collection: &Collection,
         _strict_mode_config: &StrictModeConfig,
@@ -86,13 +86,14 @@ pub trait StrictModeVerification {
     }
 
     /// Checks search parameters.
-    fn check_search_params(
+    #[allow(async_fn_in_trait)]
+    async fn check_search_params(
         &self,
         collection: &Collection,
         strict_mode_config: &StrictModeConfig,
     ) -> Result<(), CollectionError> {
         if let Some(search_params) = self.request_search_params() {
-            search_params.check_strict_mode(collection, strict_mode_config)?;
+            Box::pin(search_params.check_strict_mode(collection, strict_mode_config)).await?;
         }
         Ok(())
     }
@@ -106,22 +107,29 @@ pub trait StrictModeVerification {
         let check_filter = |filter: Option<&Filter>,
                             allow_unindexed_filter: Option<bool>|
          -> Result<(), CollectionError> {
-            if let Some(read_filter) = filter {
-                if allow_unindexed_filter == Some(false) {
-                    if let Some((key, schemas)) = collection.one_unindexed_key(read_filter) {
-                        let possible_schemas_str = schemas
-                            .iter()
-                            .map(|schema| schema.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ");
+            let Some(filter) = filter else {
+                return Ok(());
+            };
 
-                        return Err(CollectionError::strict_mode(
-                            format!("Index required but not found for \"{key}\" of one of the following types: [{possible_schemas_str}]"),
-                            "Create an index for this key or use a different filter.",
-                        ));
-                    }
+            // Check for filter indices
+            if allow_unindexed_filter == Some(false) {
+                if let Some((key, schemas)) = collection.one_unindexed_key(filter) {
+                    let possible_schemas_str = schemas
+                        .iter()
+                        .map(|schema| schema.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+
+                    return Err(CollectionError::strict_mode(
+                        format!(
+                            "Index required but not found for \"{key}\" of one of the following types: [{possible_schemas_str}]",
+                        ),
+                        "Create an index for this key or use a different filter.",
+                    ));
                 }
             }
+
+            check_filter_limits(filter, strict_mode_config)?;
 
             Ok(())
         };
@@ -140,18 +148,55 @@ pub trait StrictModeVerification {
 
     /// Does the verification of all configured parameters. Only implement this function if you know what
     /// you are doing. In most cases implementing `check_custom` is sufficient.
-    fn check_strict_mode(
+    #[allow(async_fn_in_trait)]
+    async fn check_strict_mode(
         &self,
         collection: &Collection,
         strict_mode_config: &StrictModeConfig,
     ) -> Result<(), CollectionError> {
-        self.check_custom(collection, strict_mode_config)?;
+        self.check_custom(collection, strict_mode_config).await?;
         self.check_request_query_limit(strict_mode_config)?;
         self.check_request_filter(collection, strict_mode_config)?;
         self.check_request_exact(strict_mode_config)?;
-        self.check_search_params(collection, strict_mode_config)?;
+        self.check_search_params(collection, strict_mode_config)
+            .await?;
         Ok(())
     }
+}
+
+fn check_filter_limits(
+    filter: &Filter,
+    strict_mode_config: &StrictModeConfig,
+) -> Result<(), CollectionError> {
+    // Filter condition count limit
+    if let Some(filter_condition_limit) = strict_mode_config.filter_max_conditions {
+        let filter_conditions = filter.total_conditions_count();
+
+        if !check_custom(|| Some(filter_conditions), Some(filter_condition_limit)) {
+            return Err(CollectionError::strict_mode(
+                format!(
+                    "Filter condition limit reached ({filter_conditions} > {filter_condition_limit})",
+                ),
+                "Reduce the amount of conditions of your filter.",
+            ));
+        }
+    }
+
+    // Filter condition size limit
+    if let Some(max_condition_size) = strict_mode_config.condition_max_size {
+        let input_condition_size = filter.max_condition_input_size();
+
+        if !check_custom(|| Some(input_condition_size), Some(max_condition_size)) {
+            return Err(CollectionError::strict_mode(
+                format!(
+                    "Condition size limit reached ({input_condition_size} > {max_condition_size})"
+                ),
+                "Reduce the size of your condition.",
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 pub fn check_timeout(
@@ -185,6 +230,7 @@ pub(crate) fn check_limit_opt<T: PartialOrd + Display>(
     let (Some(limit), Some(value)) = (limit, value) else {
         return Ok(());
     };
+
     if value > limit {
         return Err(CollectionError::strict_mode(
             format!("Limit exceeded {value} > {limit} for \"{name}\""),
@@ -195,8 +241,23 @@ pub(crate) fn check_limit_opt<T: PartialOrd + Display>(
     Ok(())
 }
 
+pub(crate) fn check_custom<T: PartialOrd>(
+    value_fn: impl FnOnce() -> Option<T>,
+    limit: Option<T>,
+) -> bool {
+    let Some(limit) = limit else {
+        return true;
+    };
+
+    let Some(value) = value_fn() else {
+        return true;
+    };
+
+    value <= limit
+}
+
 impl StrictModeVerification for SearchParams {
-    fn check_custom(
+    async fn check_custom(
         &self,
         _collection: &Collection,
         strict_mode_config: &StrictModeConfig,
@@ -240,7 +301,8 @@ impl StrictModeVerification for SearchParams {
 mod test {
     use std::sync::Arc;
 
-    use common::cpu::CpuBudget;
+    use common::budget::ResourceBudget;
+    use common::counter::hardware_accumulator::HwMeasurementAcc;
     use segment::types::{
         Condition, FieldCondition, Filter, Match, PayloadFieldSchema, PayloadSchemaType,
         SearchParams, StrictModeConfig, ValueVariants,
@@ -338,6 +400,7 @@ mod test {
         let strict_mode_config = collection.strict_mode_config().await.unwrap();
         let error = request
             .check_strict_mode(collection, &strict_mode_config)
+            .await
             .expect_err("Expected strict mode error but got Ok() value");
         if !matches!(error, CollectionError::StrictMode { .. }) {
             panic!("Expected strict mode error but got {error:#}");
@@ -349,7 +412,9 @@ mod test {
         collection: &Collection,
     ) {
         let strict_mode_config = collection.strict_mode_config().await.unwrap();
-        let res = request.check_strict_mode(collection, &strict_mode_config);
+        let res = request
+            .check_strict_mode(collection, &strict_mode_config)
+            .await;
         if let Err(CollectionError::StrictMode { description }) = res {
             panic!("Strict mode check should've passed but failed with error: {description:?}");
         } else if res.is_err() {
@@ -400,6 +465,7 @@ mod test {
             search_max_hnsw_ef: Some(3),
             search_allow_exact: Some(false),
             search_max_oversampling: Some(0.2),
+            ..Default::default()
         };
 
         fixture_collection(&strict_mode_config).await
@@ -435,13 +501,14 @@ mod test {
             &config,
             storage_config.clone(),
             CollectionShardDistribution::all_local(None, 0),
+            None,
             ChannelService::default(),
             dummy_on_replica_failure(),
             dummy_request_shard_transfer(),
             dummy_abort_shard_transfer(),
             None,
             None,
-            CpuBudget::default(),
+            ResourceBudget::default(),
             None,
         )
         .await
@@ -451,6 +518,7 @@ mod test {
             .create_payload_index(
                 INDEXED_KEY.parse().unwrap(),
                 PayloadFieldSchema::FieldType(PayloadSchemaType::Integer),
+                HwMeasurementAcc::new(),
             )
             .await
             .expect("failed to create payload index");

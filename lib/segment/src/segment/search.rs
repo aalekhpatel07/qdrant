@@ -1,3 +1,4 @@
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::ScoredPointOffset;
 
 use super::Segment;
@@ -11,6 +12,8 @@ use crate::data_types::vectors::VectorStructInternal;
 #[cfg(feature = "testing")]
 use crate::entry::entry_point::SegmentEntry;
 #[cfg(feature = "testing")]
+use crate::types::VectorName;
+#[cfg(feature = "testing")]
 use crate::types::{Filter, SearchParams};
 use crate::types::{ScoredPoint, WithPayload, WithVector};
 
@@ -21,6 +24,7 @@ impl Segment {
         internal_result: Vec<ScoredPointOffset>,
         with_payload: &WithPayload,
         with_vector: &WithVector,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<Vec<ScoredPoint>> {
         let id_tracker = self.id_tracker.borrow();
         internal_result
@@ -32,8 +36,7 @@ impl Segment {
                     Some(point_id) => Some((point_id, scored_point_offset)),
                     None => {
                         log::warn!(
-                            "Point with internal ID {} not found in id tracker, skipping",
-                            point_offset
+                            "Point with internal ID {point_offset} not found in id tracker, skipping"
                         );
                         None
                     }
@@ -47,7 +50,8 @@ impl Segment {
                     ))
                 })?;
                 let payload = if with_payload.enable {
-                    let initial_payload = self.payload_by_offset(point_offset)?;
+                    let initial_payload = self.payload_by_offset(point_offset, hw_counter)?;
+
                     let processed_payload = if let Some(i) = &with_payload.payload_selector {
                         i.process(initial_payload)
                     } else {
@@ -91,7 +95,7 @@ impl Segment {
     #[cfg(feature = "testing")]
     pub fn search(
         &self,
-        vector_name: &str,
+        vector_name: &VectorName,
         vector: &QueryVector,
         with_payload: &WithPayload,
         with_vector: &WithVector,
@@ -112,11 +116,6 @@ impl Segment {
             params,
             &segment_query_context,
         )?;
-
-        // This function is only for testing and no measurements are needed.
-        segment_query_context
-            .take_hardware_counter()
-            .discard_results();
 
         Ok(result.into_iter().next().unwrap())
     }

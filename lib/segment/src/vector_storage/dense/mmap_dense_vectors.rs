@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use bitvec::prelude::BitSlice;
+use common::ext::BitSliceExt as _;
 use common::types::PointOffsetType;
 use memmap2::Mmap;
 use memory::madvise::{Advice, AdviceSetting};
@@ -79,7 +80,7 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
         // Advise kernel that we'll need this page soon so the kernel can prepare
         #[cfg(unix)]
         if let Err(err) = deleted_mmap.advise(memmap2::Advice::WillNeed) {
-            log::error!("Failed to advise MADV_WILLNEED for deleted flags: {}", err,);
+            log::error!("Failed to advise MADV_WILLNEED for deleted flags: {err}");
         }
 
         // Transform into mmap BitSlice
@@ -169,11 +170,10 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
         }
     }
 
+    /// Marks the key as deleted.
+    ///
+    /// Returns true if the key was not deleted before, and it is now deleted.
     pub fn delete(&mut self, key: PointOffsetType) -> bool {
-        if self.num_vectors <= key as usize {
-            return false;
-        }
-
         let is_deleted = !self.deleted.replace(key as usize, true);
         if is_deleted {
             self.deleted_count += 1;
@@ -182,7 +182,7 @@ impl<T: PrimitiveVectorElement> MmapDenseVectors<T> {
     }
 
     pub fn is_deleted_vector(&self, key: PointOffsetType) -> bool {
-        self.deleted.get(key as usize).map(|b| *b).unwrap_or(false)
+        self.deleted.get_bit(key as usize).unwrap_or(false)
     }
 
     /// Get [`BitSlice`] representation for deleted vectors with deletion flags

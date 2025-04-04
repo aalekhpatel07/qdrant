@@ -1,3 +1,4 @@
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use itertools::Itertools;
 use rand::prelude::StdRng;
 use rand::{Rng, SeedableRng};
@@ -32,11 +33,16 @@ impl IndexBuilder {
         }
     }
 
-    fn add_point(&mut self, id: PointOffsetType, payload: &[&Value]) -> OperationResult<()> {
+    fn add_point(
+        &mut self,
+        id: PointOffsetType,
+        payload: &[&Value],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
         match self {
-            IndexBuilder::Mutable(builder) => builder.add_point(id, payload),
-            IndexBuilder::Immutable(builder) => builder.add_point(id, payload),
-            IndexBuilder::Mmap(builder) => builder.add_point(id, payload),
+            IndexBuilder::Mutable(builder) => builder.add_point(id, payload, hw_counter),
+            IndexBuilder::Immutable(builder) => builder.add_point(id, payload, hw_counter),
+            IndexBuilder::Mmap(builder) => builder.add_point(id, payload, hw_counter),
         }
     }
 }
@@ -59,7 +65,10 @@ fn get_index_builder(index_type: IndexType) -> (TempDir, IndexBuilder) {
             db, COLUMN_NAME
         )),
         IndexType::Mmap => IndexBuilder::Mmap(
-            NumericIndex::<FloatPayloadType, FloatPayloadType>::builder_mmap(temp_dir.path()),
+            NumericIndex::<FloatPayloadType, FloatPayloadType>::builder_mmap(
+                temp_dir.path(),
+                false,
+            ),
         ),
     };
     match &mut builder {
@@ -78,13 +87,15 @@ fn random_index(
     let mut rng = StdRng::seed_from_u64(42);
     let (temp_dir, mut index_builder) = get_index_builder(index_type);
 
+    let hw_counter = HardwareCounterCell::new();
+
     for i in 0..num_points {
         let values = (0..values_per_point)
-            .map(|_| Value::from(rng.gen_range(0.0..100.0)))
+            .map(|_| Value::from(rng.random_range(0.0..100.0)))
             .collect_vec();
         let values = values.iter().collect_vec();
         index_builder
-            .add_point(i as PointOffsetType, &values)
+            .add_point(i as PointOffsetType, &values, &hw_counter)
             .unwrap();
     }
 
@@ -95,14 +106,20 @@ fn random_index(
 fn cardinality_request(
     index: &NumericIndex<FloatPayloadType, FloatPayloadType>,
     query: Range<FloatPayloadType>,
+    hw_acc: HwMeasurementAcc,
 ) -> CardinalityEstimation {
+    let hw_counter = hw_acc.get_counter_cell();
+
     let estimation = index
         .inner()
         .range_cardinality(&RangeInterface::Float(query.clone()));
 
     let result = index
         .inner()
-        .filter(&FieldCondition::new_range(JsonPath::new("unused"), query))
+        .filter(
+            &FieldCondition::new_range(JsonPath::new("unused"), query),
+            &hw_counter,
+        )
         .unwrap()
         .unique()
         .collect_vec();
@@ -124,8 +141,10 @@ fn test_set_empty_payload() {
 
     assert_ne!(values_count, 0);
 
+    let hw_counter = HardwareCounterCell::new();
+
     let payload = serde_json::json!(null);
-    index.add_point(point_id, &[&payload]).unwrap();
+    index.add_point(point_id, &[&payload], &hw_counter).unwrap();
 
     let values_count = index.inner().get_values(point_id).unwrap().count();
 
@@ -147,6 +166,7 @@ fn test_cardinality_exp(#[case] index_type: IndexType) {
             gte: Some(10.0),
             lte: None,
         },
+        HwMeasurementAcc::new(),
     );
     cardinality_request(
         &index,
@@ -156,6 +176,7 @@ fn test_cardinality_exp(#[case] index_type: IndexType) {
             gte: Some(10.0),
             lte: None,
         },
+        HwMeasurementAcc::new(),
     );
 
     let (_temp_dir, index) = random_index(1000, 2, index_type);
@@ -167,6 +188,7 @@ fn test_cardinality_exp(#[case] index_type: IndexType) {
             gte: Some(10.0),
             lte: None,
         },
+        HwMeasurementAcc::new(),
     );
     cardinality_request(
         &index,
@@ -176,6 +198,7 @@ fn test_cardinality_exp(#[case] index_type: IndexType) {
             gte: Some(10.0),
             lte: None,
         },
+        HwMeasurementAcc::new(),
     );
 
     cardinality_request(
@@ -186,6 +209,7 @@ fn test_cardinality_exp(#[case] index_type: IndexType) {
             gte: Some(10.0),
             lte: None,
         },
+        HwMeasurementAcc::new(),
     );
 
     cardinality_request(
@@ -196,6 +220,7 @@ fn test_cardinality_exp(#[case] index_type: IndexType) {
             gte: Some(110.0),
             lte: None,
         },
+        HwMeasurementAcc::new(),
     );
 }
 
@@ -257,11 +282,13 @@ fn test_payload_blocks_small(#[case] index_type: IndexType) {
         vec![2.0],
     ];
 
+    let hw_counter = HardwareCounterCell::new();
+
     values.into_iter().enumerate().for_each(|(idx, values)| {
         let values = values.iter().map(|v| Value::from(*v)).collect_vec();
         let values = values.iter().collect_vec();
         index_builder
-            .add_point(idx as PointOffsetType + 1, &values)
+            .add_point(idx as PointOffsetType + 1, &values, &hw_counter)
             .unwrap();
     });
     let index = index_builder.finalize().unwrap();
@@ -292,11 +319,13 @@ fn test_numeric_index_load_from_disk(#[case] index_type: IndexType) {
         vec![3.0],
     ];
 
+    let hw_counter = HardwareCounterCell::new();
+
     values.into_iter().enumerate().for_each(|(idx, values)| {
         let values = values.iter().map(|v| Value::from(*v)).collect_vec();
         let values = values.iter().collect_vec();
         index_builder
-            .add_point(idx as PointOffsetType + 1, &values)
+            .add_point(idx as PointOffsetType + 1, &values, &hw_counter)
             .unwrap();
     });
     let index = index_builder.finalize().unwrap();
@@ -316,7 +345,7 @@ fn test_numeric_index_load_from_disk(#[case] index_type: IndexType) {
             NumericIndexInner::<FloatPayloadType>::new_memory(db.unwrap(), COLUMN_NAME, true)
         }
         IndexType::Mmap => {
-            NumericIndexInner::<FloatPayloadType>::new_mmap(temp_dir.path()).unwrap()
+            NumericIndexInner::<FloatPayloadType>::new_mmap(temp_dir.path(), false).unwrap()
         }
     };
     new_index.load().unwrap();
@@ -352,11 +381,13 @@ fn test_numeric_index(#[case] index_type: IndexType) {
         vec![3.0],
     ];
 
+    let hw_counter = HardwareCounterCell::new();
+
     values.into_iter().enumerate().for_each(|(idx, values)| {
         let values = values.iter().map(|v| Value::from(*v)).collect_vec();
         let values = values.iter().collect_vec();
         index_builder
-            .add_point(idx as PointOffsetType + 1, &values)
+            .add_point(idx as PointOffsetType + 1, &values, &hw_counter)
             .unwrap();
     });
     let index = index_builder.finalize().unwrap();
@@ -423,7 +454,9 @@ fn test_cond<T: Encodable + Numericable + PartialOrd + Clone + MmapValue + Defau
     result: Vec<u32>,
 ) {
     let condition = FieldCondition::new_range(JsonPath::new("unused"), rng);
-    let offsets = index.filter(&condition).unwrap().collect_vec();
+    let hw_acc = HwMeasurementAcc::new();
+    let hw_counter = hw_acc.get_counter_cell();
+    let offsets = index.filter(&condition, &hw_counter).unwrap().collect_vec();
     assert_eq!(offsets, result);
 }
 
@@ -442,6 +475,7 @@ fn test_empty_cardinality(#[case] index_type: IndexType) {
             gte: Some(10.0),
             lte: None,
         },
+        HwMeasurementAcc::new(),
     );
 
     let (_temp_dir, index) = random_index(0, 0, index_type);
@@ -453,5 +487,6 @@ fn test_empty_cardinality(#[case] index_type: IndexType) {
             gte: Some(10.0),
             lte: None,
         },
+        HwMeasurementAcc::new(),
     );
 }

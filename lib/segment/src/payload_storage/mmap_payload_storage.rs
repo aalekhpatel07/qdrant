@@ -1,14 +1,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use blob_store::config::StorageOptions;
-use blob_store::{Blob, BlobStore};
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
+use gridstore::config::StorageOptions;
+use gridstore::{Blob, Gridstore};
 use parking_lot::RwLock;
 use serde_json::Value;
 
-use crate::common::operation_error::{OperationError, OperationResult};
 use crate::common::Flusher;
+use crate::common::operation_error::{OperationError, OperationResult};
 use crate::json_path::JsonPath;
 use crate::payload_storage::PayloadStorage;
 use crate::types::{Payload, PayloadKeyTypeRef};
@@ -27,7 +28,7 @@ impl Blob for Payload {
 
 #[derive(Debug)]
 pub struct MmapPayloadStorage {
-    storage: Arc<RwLock<BlobStore<Payload>>>,
+    storage: Arc<RwLock<Gridstore<Payload>>>,
 }
 
 impl MmapPayloadStorage {
@@ -45,7 +46,7 @@ impl MmapPayloadStorage {
     }
 
     fn open(path: PathBuf) -> OperationResult<Self> {
-        let storage = BlobStore::open(path).map_err(|err| {
+        let storage = Gridstore::open(path).map_err(|err| {
             OperationError::service_error(format!("Failed to open mmap payload storage: {err}"))
         })?;
         let storage = Arc::new(RwLock::new(storage));
@@ -53,7 +54,7 @@ impl MmapPayloadStorage {
     }
 
     fn new(path: PathBuf) -> OperationResult<Self> {
-        let storage = BlobStore::new(path, StorageOptions::default())
+        let storage = Gridstore::new(path, StorageOptions::default())
             .map_err(OperationError::service_error)?;
         let storage = Arc::new(RwLock::new(storage));
         Ok(Self { storage })
@@ -61,26 +62,40 @@ impl MmapPayloadStorage {
 }
 
 impl PayloadStorage for MmapPayloadStorage {
-    fn overwrite(&mut self, point_id: PointOffsetType, payload: &Payload) -> OperationResult<()> {
+    fn overwrite(
+        &mut self,
+        point_id: PointOffsetType,
+        payload: &Payload,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
         self.storage
             .write()
-            .put_value(point_id, payload)
+            .put_value(point_id, payload, hw_counter.ref_payload_io_write_counter())
             .map_err(OperationError::service_error)?;
         Ok(())
     }
 
-    fn set(&mut self, point_id: PointOffsetType, payload: &Payload) -> OperationResult<()> {
+    fn set(
+        &mut self,
+        point_id: PointOffsetType,
+        payload: &Payload,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
         let mut guard = self.storage.write();
-        match guard.get_value(point_id) {
+        match guard.get_value(point_id, hw_counter) {
             Some(mut point_payload) => {
                 point_payload.merge(payload);
                 guard
-                    .put_value(point_id, &point_payload)
+                    .put_value(
+                        point_id,
+                        &point_payload,
+                        hw_counter.ref_payload_io_write_counter(),
+                    )
                     .map_err(OperationError::service_error)?;
             }
             None => {
                 guard
-                    .put_value(point_id, payload)
+                    .put_value(point_id, payload, hw_counter.ref_payload_io_write_counter())
                     .map_err(OperationError::service_error)?;
             }
         }
@@ -92,28 +107,41 @@ impl PayloadStorage for MmapPayloadStorage {
         point_id: PointOffsetType,
         payload: &Payload,
         key: &JsonPath,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         let mut guard = self.storage.write();
-        match guard.get_value(point_id) {
+        match guard.get_value(point_id, hw_counter) {
             Some(mut point_payload) => {
                 point_payload.merge_by_key(payload, key);
                 guard
-                    .put_value(point_id, &point_payload)
+                    .put_value(
+                        point_id,
+                        &point_payload,
+                        hw_counter.ref_payload_io_write_counter(),
+                    )
                     .map_err(OperationError::service_error)?;
             }
             None => {
                 let mut dest_payload = Payload::default();
                 dest_payload.merge_by_key(payload, key);
                 guard
-                    .put_value(point_id, &dest_payload)
+                    .put_value(
+                        point_id,
+                        &dest_payload,
+                        hw_counter.ref_payload_io_write_counter(),
+                    )
                     .map_err(OperationError::service_error)?;
             }
         }
         Ok(())
     }
 
-    fn get(&self, point_id: PointOffsetType) -> OperationResult<Payload> {
-        match self.storage.read().get_value(point_id) {
+    fn get(
+        &self,
+        point_id: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Payload> {
+        match self.storage.read().get_value(point_id, hw_counter) {
             Some(payload) => Ok(payload),
             None => Ok(Default::default()),
         }
@@ -123,14 +151,19 @@ impl PayloadStorage for MmapPayloadStorage {
         &mut self,
         point_id: PointOffsetType,
         key: PayloadKeyTypeRef,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<Vec<Value>> {
         let mut guard = self.storage.write();
-        match guard.get_value(point_id) {
+        match guard.get_value(point_id, hw_counter) {
             Some(mut payload) => {
                 let res = payload.remove(key);
                 if !res.is_empty() {
                     guard
-                        .put_value(point_id, &payload)
+                        .put_value(
+                            point_id,
+                            &payload,
+                            hw_counter.ref_payload_io_write_counter(),
+                        )
                         .map_err(OperationError::service_error)?;
                 }
                 Ok(res)
@@ -139,12 +172,16 @@ impl PayloadStorage for MmapPayloadStorage {
         }
     }
 
-    fn clear(&mut self, point_id: PointOffsetType) -> OperationResult<Option<Payload>> {
+    fn clear(
+        &mut self,
+        point_id: PointOffsetType,
+        _: &HardwareCounterCell,
+    ) -> OperationResult<Option<Payload>> {
         let res = self.storage.write().delete_value(point_id);
         Ok(res)
     }
 
-    fn wipe(&mut self) -> OperationResult<()> {
+    fn wipe(&mut self, _: &HardwareCounterCell) -> OperationResult<()> {
         self.storage.write().wipe();
         Ok(())
     }
@@ -152,7 +189,7 @@ impl PayloadStorage for MmapPayloadStorage {
     fn flusher(&self) -> Flusher {
         let storage = self.storage.clone();
         Box::new(move || {
-            storage.write().flush().map_err(|err| {
+            storage.read().flush().map_err(|err| {
                 OperationError::service_error(format!(
                     "Failed to flush mmap payload storage: {err}"
                 ))
@@ -161,22 +198,29 @@ impl PayloadStorage for MmapPayloadStorage {
         })
     }
 
-    fn iter<F>(&self, mut callback: F) -> OperationResult<()>
+    fn iter<F>(&self, mut callback: F, hw_counter: &HardwareCounterCell) -> OperationResult<()>
     where
         F: FnMut(PointOffsetType, &Payload) -> OperationResult<bool>,
     {
-        self.storage.read().iter(|point_id, payload| {
-            callback(point_id, payload).map_err(|e|
+        self.storage.read().iter(
+            |point_id, payload| {
+                callback(point_id, payload).map_err(|e|
                     // TODO return proper error
                     std::io::Error::new(
                         std::io::ErrorKind::Other,
                         e.to_string(),
                     ))
-        })?;
+            },
+            hw_counter.ref_payload_io_read_counter(),
+        )?;
         Ok(())
     }
 
     fn files(&self) -> Vec<PathBuf> {
         self.storage.read().files()
+    }
+
+    fn get_storage_size_bytes(&self) -> OperationResult<usize> {
+        Ok(self.storage.read().get_storage_size_bytes())
     }
 }

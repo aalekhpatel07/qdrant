@@ -1,13 +1,17 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::collection::payload_index_schema::PayloadIndexSchema;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
+
 use crate::collection::Collection;
+use crate::collection::payload_index_schema::PayloadIndexSchema;
 use crate::collection_state::{ShardInfo, State};
 use crate::config::CollectionConfigInternal;
 use crate::operations::types::{CollectionError, CollectionResult};
 use crate::shards::replica_set::ShardReplicaSet;
+use crate::shards::resharding::ReshardState;
 use crate::shards::shard::{PeerId, ShardId};
-use crate::shards::shard_holder::{ShardKeyMapping, ShardTransferChange};
+use crate::shards::shard_holder::ShardTransferChange;
+use crate::shards::shard_holder::shard_mapping::ShardKeyMapping;
 use crate::shards::transfer::ShardTransfer;
 
 impl Collection {
@@ -28,12 +32,21 @@ impl Collection {
         this_peer_id: PeerId,
         abort_transfer: impl FnMut(ShardTransfer),
     ) -> CollectionResult<()> {
-        self.apply_config(state.config).await?;
-        self.apply_shard_transfers(state.transfers, this_peer_id, abort_transfer)
+        let State {
+            config,
+            shards,
+            resharding,
+            transfers,
+            shards_key_mapping,
+            payload_index_schema,
+        } = state;
+
+        self.apply_config(config).await?;
+        self.apply_shard_transfers(transfers, this_peer_id, abort_transfer)
             .await?;
-        self.apply_shard_info(state.shards, state.shards_key_mapping)
-            .await?;
-        self.apply_payload_index_schema(state.payload_index_schema)
+        self.apply_reshard_state(resharding).await?;
+        self.apply_shard_info(shards, shards_key_mapping).await?;
+        self.apply_payload_index_schema(payload_index_schema)
             .await?;
         Ok(())
     }
@@ -74,6 +87,19 @@ impl Collection {
         Ok(())
     }
 
+    async fn apply_reshard_state(&self, resharding: Option<ReshardState>) -> CollectionResult<()> {
+        // We don't have to explicitly abort resharding or bump shard replica states, because:
+        // - peers are not driving resharding themselves
+        // - ongoing (resharding) shard transfers are explicitly updated
+        // - shard replica set states are explicitly updated
+        self.shards_holder
+            .write()
+            .await
+            .resharding_state
+            .write(|state| *state = resharding)?;
+        Ok(())
+    }
+
     async fn apply_config(&self, new_config: CollectionConfigInternal) -> CollectionResult<()> {
         let recreate_optimizers;
 
@@ -85,9 +111,7 @@ impl Collection {
                     "collection {} UUID mismatch: \
                      UUID of existing collection is different from UUID of collection in Raft snapshot: \
                      existing collection UUID: {:?}, Raft snapshot collection UUID: {:?}",
-                    self.id,
-                    config.uuid,
-                    new_config.uuid,
+                    self.id, config.uuid, new_config.uuid,
                 )));
             }
 
@@ -166,25 +190,31 @@ impl Collection {
         // On the first state of the update, we update state of shards themselves
         // and create new shards if needed
 
+        let mut shards_holder = self.shards_holder.write().await;
+
         for (shard_id, shard_info) in shards {
-            match self.shards_holder.read().await.get_shard(shard_id) {
-                Some(replica_set) => replica_set.apply_state(shard_info.replicas).await?,
+            let shard_key = shards_key_mapping.shard_key(shard_id);
+            match shards_holder.get_shard_mut(shard_id) {
+                Some(replica_set) => {
+                    replica_set
+                        .apply_state(shard_info.replicas, shard_key)
+                        .await?;
+                }
                 None => {
                     let shard_replicas: Vec<_> = shard_info.replicas.keys().copied().collect();
-                    let replica_set = self
-                        .create_replica_set(shard_id, &shard_replicas, None)
+                    let mut replica_set = self
+                        .create_replica_set(shard_id, shard_key.clone(), &shard_replicas, None)
                         .await?;
-                    replica_set.apply_state(shard_info.replicas).await?;
+                    replica_set
+                        .apply_state(shard_info.replicas, shard_key)
+                        .await?;
                     extra_shards.insert(shard_id, replica_set);
                 }
             }
         }
 
         // On the second step, we register missing shards and remove extra shards
-
-        self.shards_holder
-            .write()
-            .await
+        shards_holder
             .apply_shards_state(shard_ids, shards_key_mapping, extra_shards)
             .await
     }
@@ -202,7 +232,9 @@ impl Collection {
         }
 
         for (field_name, field_schema) in payload_index_schema.schema {
-            self.create_payload_index(field_name, field_schema).await?;
+            // This function is only used in collection state recovery and thus an unmeasured internal operation.
+            self.create_payload_index(field_name, field_schema, HwMeasurementAcc::disposable())
+                .await?;
         }
         Ok(())
     }

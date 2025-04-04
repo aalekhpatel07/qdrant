@@ -3,11 +3,12 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::{error, result};
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use itertools::Itertools;
 use rand::rngs::StdRng;
 use rand::seq::IteratorRandom;
-use rand::{thread_rng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rng};
 use rstest::rstest;
 
 use super::utils::sampler;
@@ -26,7 +27,7 @@ use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
 use crate::vector_storage::query::{ContextPair, ContextQuery, DiscoveryQuery, RecoQuery};
 use crate::vector_storage::tests::utils::score;
 use crate::vector_storage::vector_storage_base::VectorStorage;
-use crate::vector_storage::{new_raw_scorer, VectorStorageEnum};
+use crate::vector_storage::{VectorStorageEnum, new_raw_scorer_for_test};
 
 const DIMS: usize = 128;
 const NUM_POINTS: usize = 600;
@@ -59,8 +60,8 @@ fn random_reco_query<R: Rng + ?Sized>(
     rnd: &mut R,
     sampler: &mut impl Iterator<Item = f32>,
 ) -> QueryVector {
-    let num_positives: usize = rnd.gen_range(0..MAX_EXAMPLES);
-    let num_negatives: usize = rnd.gen_range(1..MAX_EXAMPLES);
+    let num_positives: usize = rnd.random_range(0..MAX_EXAMPLES);
+    let num_negatives: usize = rnd.random_range(1..MAX_EXAMPLES);
 
     let positives = (0..num_positives)
         .map(|_| sampler.take(DIMS).collect_vec().into())
@@ -77,7 +78,7 @@ fn random_discovery_query<R: Rng + ?Sized>(
     rnd: &mut R,
     sampler: &mut impl Iterator<Item = f32>,
 ) -> QueryVector {
-    let num_pairs: usize = rnd.gen_range(0..MAX_EXAMPLES);
+    let num_pairs: usize = rnd.random_range(0..MAX_EXAMPLES);
 
     let target = sampler.take(DIMS).collect_vec().into();
 
@@ -96,7 +97,7 @@ fn random_context_query<R: Rng + ?Sized>(
     rnd: &mut R,
     sampler: &mut impl Iterator<Item = f32>,
 ) -> QueryVector {
-    let num_pairs: usize = rnd.gen_range(0..MAX_EXAMPLES);
+    let num_pairs: usize = rnd.random_range(0..MAX_EXAMPLES);
 
     let pairs = (0..num_pairs)
         .map(|_| {
@@ -149,8 +150,8 @@ fn product_x4() -> WithQuantization {
     .into();
 
     let sampler = {
-        let rng = thread_rng();
-        Box::new(rng.sample_iter(rand::distributions::Standard))
+        let rng = rng();
+        Box::new(rng.sample_iter(rand::distr::StandardUniform))
     };
 
     (config, sampler)
@@ -165,7 +166,7 @@ fn binary() -> WithQuantization {
     let sampler = {
         let rng = StdRng::seed_from_u64(SEED);
         Box::new(
-            rng.sample_iter(rand::distributions::Uniform::new_inclusive(-1.0, 1.0))
+            rng.sample_iter(rand::distr::Uniform::new_inclusive(-1.0, 1.0).unwrap())
                 .map(|x| f32::from(x as u8)),
         )
     };
@@ -242,7 +243,7 @@ fn scoring_equivalency(
     for i in 0..attempts {
         let query = random_query(&query_variant, &mut rng, &mut sampler);
 
-        let raw_scorer = new_raw_scorer(
+        let raw_scorer = new_raw_scorer_for_test(
             query.clone(),
             &raw_storage,
             id_tracker.deleted_point_bitslice(),
@@ -258,9 +259,10 @@ fn scoring_equivalency(
                     id_tracker.deleted_point_bitslice(),
                     other_storage.deleted_vector_bitslice(),
                     &is_stopped,
+                    HardwareCounterCell::new(),
                 )
                 .unwrap(),
-            None => new_raw_scorer(
+            None => new_raw_scorer_for_test(
                 query.clone(),
                 &other_storage,
                 id_tracker.deleted_point_bitslice(),
@@ -313,9 +315,6 @@ fn scoring_equivalency(
                 only {intersection} of {top} top results are shared",
             );
         }
-
-        raw_scorer.take_hardware_counter().discard_results();
-        other_scorer.take_hardware_counter().discard_results();
     }
 
     Ok(())

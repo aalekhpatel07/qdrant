@@ -10,18 +10,19 @@ use super::snapshot_stream::{SnapShotStreamLocalFS, SnapshotStream};
 use crate::common::file_utils::move_file;
 use crate::common::sha_256::hash_file;
 use crate::operations::snapshot_ops::{
-    get_checksum_path, get_snapshot_description, SnapshotDescription,
+    SnapshotDescription, get_checksum_path, get_snapshot_description,
 };
-use crate::operations::snapshot_storage_ops::{self};
+use crate::operations::snapshot_storage_ops;
 use crate::operations::types::{CollectionError, CollectionResult};
 
 #[derive(Clone, Deserialize, Debug, Default)]
-pub struct SnapShotsConfig {
+pub struct SnapshotsConfig {
     pub snapshots_storage: SnapshotsStorageConfig,
     pub s3_config: Option<S3Config>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SnapshotsStorageConfig {
     #[default]
     Local,
@@ -53,7 +54,7 @@ pub enum SnapshotStorageManager {
 }
 
 impl SnapshotStorageManager {
-    pub fn new(snapshots_config: &SnapShotsConfig) -> CollectionResult<Self> {
+    pub fn new(snapshots_config: &SnapshotsConfig) -> CollectionResult<Self> {
         match snapshots_config.snapshots_storage {
             SnapshotsStorageConfig::Local => {
                 Ok(SnapshotStorageManager::LocalFS(SnapshotStorageLocalFS))
@@ -246,7 +247,7 @@ impl SnapshotStorageLocalFS {
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
 
-            if !path.is_dir() && path.extension().map_or(false, |ext| ext == "snapshot") {
+            if !path.is_dir() && path.extension().is_some_and(|ext| ext == "snapshot") {
                 snapshots.push(get_snapshot_description(&path).await?);
             }
         }

@@ -1,9 +1,9 @@
 use std::convert::Infallible;
-use std::future::{ready, Ready};
+use std::future::{Ready, ready};
 use std::sync::Arc;
 
 use actix_web::body::{BoxBody, EitherBody};
-use actix_web::dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform};
+use actix_web::dev::{Service, ServiceRequest, ServiceResponse, Transform, forward_ready};
 use actix_web::{Error, FromRequest, HttpMessage, HttpResponse, ResponseError};
 use futures_util::future::LocalBoxFuture;
 use storage::rbac::Access;
@@ -109,7 +109,6 @@ where
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let path = req.path();
-
         if self.is_path_whitelisted(path) {
             return Box::pin(self.service.call(req));
         }
@@ -121,8 +120,9 @@ where
                 .validate_request(|key| req.headers().get(key).and_then(|val| val.to_str().ok()))
                 .await
             {
-                Ok(access) => {
+                Ok((access, inference_token)) => {
                     let previous = req.extensions_mut().insert::<Access>(access);
+                    req.extensions_mut().insert(inference_token);
                     debug_assert!(
                         previous.is_none(),
                         "Previous access object should not exist in the request"

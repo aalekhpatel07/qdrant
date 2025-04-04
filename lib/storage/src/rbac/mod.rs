@@ -42,6 +42,16 @@ pub struct CollectionAccess {
     pub payload: Option<PayloadConstraint>,
 }
 
+impl CollectionAccess {
+    fn view(&self) -> CollectionAccessView {
+        CollectionAccessView {
+            collection: &self.collection,
+            access: self.access,
+            payload: &self.payload,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Eq, PartialEq, Copy, Clone, Debug)]
 pub enum GlobalAccessMode {
     /// Read-only access
@@ -62,6 +72,11 @@ pub enum CollectionAccessMode {
     /// Read and write access to a collection, with some restrictions.
     #[serde(rename = "rw")]
     ReadWrite,
+
+    /// Points read and write - access to update and modify points in the collection,
+    /// but not snapshots or payload indexes.
+    #[serde(rename = "prw")]
+    PointsReadWrite,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
@@ -87,7 +102,9 @@ impl Access {
     ) -> Result<CollectionMultipass, StorageError> {
         match self {
             Access::Global(mode) => mode.meets_requirements(requirements)?,
-            _ => return Err(StorageError::forbidden("Global access is required")),
+            Access::Collection(_) => {
+                return Err(StorageError::forbidden("Global access is required"));
+            }
         }
         Ok(CollectionMultipass)
     }
@@ -122,11 +139,16 @@ impl CollectionAccessList {
                     "Access to collection {collection_name} is required"
                 ))
             })?;
-        Ok(CollectionAccessView {
-            collection: collection_name,
-            access: access.access,
-            payload: &access.payload,
-        })
+        Ok(access.view())
+    }
+
+    /// Lists the collections which fulfill the requirements.
+    pub fn meeting_requirements(&self, requirements: AccessRequirements) -> Vec<&String> {
+        self.0
+            .iter()
+            .filter(|access| access.view().meets_requirements(requirements).is_ok())
+            .map(|access| &access.collection)
+            .collect()
     }
 }
 
@@ -137,7 +159,7 @@ struct CollectionAccessView<'a> {
     pub payload: &'a Option<PayloadConstraint>,
 }
 
-impl<'a> CollectionAccessView<'a> {
+impl CollectionAccessView<'_> {
     pub(self) fn check_whole_access(&self) -> Result<(), StorageError> {
         if self.payload.is_some() {
             return incompatible_with_payload_constraint(self.collection);
@@ -150,16 +172,34 @@ impl<'a> CollectionAccessView<'a> {
             write,
             manage,
             whole,
+            extras,
         } = requirements;
+
+        if extras {
+            match self.access {
+                CollectionAccessMode::Read => {}      // Ok
+                CollectionAccessMode::ReadWrite => {} // Ok
+                CollectionAccessMode::PointsReadWrite => {
+                    return Err(StorageError::forbidden(format!(
+                        "Only points access is allowed for collection {}",
+                        self.collection,
+                    )));
+                }
+            }
+        }
+
         if write {
             match self.access {
                 CollectionAccessMode::Read => {
                     return Err(StorageError::forbidden(format!(
                         "Write access to collection {} is required",
                         self.collection,
-                    )))
+                    )));
                 }
                 CollectionAccessMode::ReadWrite => (),
+                CollectionAccessMode::PointsReadWrite => {
+                    // Extras are checked above.
+                }
             }
         }
         if manage {
@@ -213,6 +253,8 @@ pub struct AccessRequirements {
     pub manage: bool,
     /// If true, the access should be not limited by a payload restrictions.
     pub whole: bool,
+    /// Require access to collection extras, like snapshots, payload indexes, cluster info.
+    pub extras: bool,
 }
 
 impl AccessRequirements {
@@ -240,6 +282,13 @@ impl AccessRequirements {
             ..*self
         }
     }
+
+    pub fn extras(&self) -> Self {
+        Self {
+            extras: true,
+            ..*self
+        }
+    }
 }
 
 impl GlobalAccessMode {
@@ -248,11 +297,12 @@ impl GlobalAccessMode {
             write,
             manage,
             whole: _,
+            extras: _,
         } = requirements;
         if write || manage {
             match self {
                 GlobalAccessMode::Read => {
-                    return Err(StorageError::forbidden("Global manage access is required"))
+                    return Err(StorageError::forbidden("Global manage access is required"));
                 }
                 GlobalAccessMode::Manage => (),
             }

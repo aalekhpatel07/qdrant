@@ -1,20 +1,21 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::{Debug, Formatter};
 use std::iter;
 
 use api::rest::{
     DenseVector, MultiDenseVector, ShardKeySelector, VectorOutput, VectorStructOutput,
 };
 use common::validation::validate_multi_vector;
-use itertools::izip;
+use itertools::{Itertools, izip};
 use schemars::JsonSchema;
 use segment::common::operation_error::OperationError;
 use segment::common::utils::transpose_map_into_named_vector;
 use segment::data_types::named_vectors::NamedVectors;
 use segment::data_types::vectors::{
-    BatchVectorStructInternal, MultiDenseVectorInternal, VectorInternal, VectorStructInternal,
-    DEFAULT_VECTOR_NAME,
+    BatchVectorStructInternal, DEFAULT_VECTOR_NAME, MultiDenseVectorInternal, VectorInternal,
+    VectorStructInternal,
 };
-use segment::types::{Filter, Payload, PointIdType};
+use segment::types::{Filter, Payload, PointIdType, VectorNameBuf};
 use serde::{Deserialize, Serialize};
 use strum::{EnumDiscriminants, EnumIter};
 use validator::{Validate, ValidationErrors};
@@ -22,8 +23,8 @@ use validator::{Validate, ValidationErrors};
 use super::payload_ops::SetPayloadOp;
 use super::vector_ops::{PointVectorsPersisted, UpdateVectorsOp};
 use super::{
-    point_to_shards, split_iter_by_shard, CollectionUpdateOperations, OperationToShard,
-    SplitByShard,
+    CollectionUpdateOperations, OperationToShard, SplitByShard, point_to_shards,
+    split_iter_by_shard,
 };
 use crate::hash_ring::HashRingRouter;
 use crate::operations::{payload_ops, vector_ops};
@@ -47,14 +48,51 @@ pub enum WriteOrdering {
 }
 
 /// Single vector data, as it is persisted in WAL
-/// Unlike [`Vector`], this struct only stores raw vectors, inferenced or resolved.
+/// Unlike [`api::rest::Vector`], this struct only stores raw vectors, inferenced or resolved.
 /// Unlike [`VectorInternal`], is not optimized for search
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
 #[serde(untagged, rename_all = "snake_case")]
 pub enum VectorPersisted {
     Dense(DenseVector),
     Sparse(sparse::common::sparse_vector::SparseVector),
     MultiDense(MultiDenseVector),
+}
+
+impl Debug for VectorPersisted {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VectorPersisted::Dense(vector) => {
+                let first_elements = vector.iter().take(4).join(", ");
+                write!(f, "Dense([{}, ... x {}])", first_elements, vector.len())
+            }
+            VectorPersisted::Sparse(vector) => {
+                let first_elements = vector
+                    .indices
+                    .iter()
+                    .zip(vector.values.iter())
+                    .take(4)
+                    .map(|(k, v)| format!("{k}->{v}"))
+                    .join(", ");
+                write!(
+                    f,
+                    "Sparse([{}, ... x {})",
+                    first_elements,
+                    vector.indices.len()
+                )
+            }
+            VectorPersisted::MultiDense(vector) => {
+                let first_vectors = vector
+                    .iter()
+                    .take(4)
+                    .map(|v| {
+                        let first_elements = v.iter().take(4).join(", ");
+                        format!("[{}, ... x {}]", first_elements, v.len())
+                    })
+                    .join(", ");
+                write!(f, "MultiDense([{}, ... x {})", first_vectors, vector.len())
+            }
+        }
+    }
 }
 
 impl Validate for VectorPersisted {
@@ -149,12 +187,42 @@ impl From<VectorPersisted> for VectorInternal {
 //                              gPRC Response
 
 /// Data structure for point vectors, as it is persisted in WAL
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
 #[serde(untagged, rename_all = "snake_case")]
 pub enum VectorStructPersisted {
     Single(DenseVector),
     MultiDense(MultiDenseVector),
-    Named(HashMap<String, VectorPersisted>),
+    Named(HashMap<VectorNameBuf, VectorPersisted>),
+}
+
+impl Debug for VectorStructPersisted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VectorStructPersisted::Single(vector) => {
+                let first_elements = vector.iter().take(4).join(", ");
+                write!(f, "Single([{}, ... x {}])", first_elements, vector.len())
+            }
+            VectorStructPersisted::MultiDense(vector) => {
+                let first_vectors = vector
+                    .iter()
+                    .take(4)
+                    .map(|v| {
+                        let first_elements = v.iter().take(4).join(", ");
+                        format!("[{}, ... x {}]", first_elements, v.len())
+                    })
+                    .join(", ");
+                write!(f, "MultiDense([{}, ... x {})", first_vectors, vector.len())
+            }
+            VectorStructPersisted::Named(vectors) => write!(f, "Named(( ")
+                .and_then(|_| {
+                    for (name, vector) in vectors {
+                        write!(f, "{name}: {vector:?}, ")?;
+                    }
+                    Ok(())
+                })
+                .and_then(|_| write!(f, "))")),
+        }
+    }
 }
 
 impl VectorStructPersisted {
@@ -239,18 +307,18 @@ impl TryFrom<VectorStructPersisted> for VectorStructInternal {
     }
 }
 
-impl<'a> From<VectorStructPersisted> for NamedVectors<'a> {
+impl From<VectorStructPersisted> for NamedVectors<'_> {
     fn from(value: VectorStructPersisted) -> Self {
         match value {
             VectorStructPersisted::Single(vector) => {
-                NamedVectors::from_pairs([(DEFAULT_VECTOR_NAME.to_string(), vector)])
+                NamedVectors::from_pairs([(DEFAULT_VECTOR_NAME.to_owned(), vector)])
             }
             VectorStructPersisted::MultiDense(vector) => {
                 let mut named_vector = NamedVectors::default();
                 let multivec = MultiDenseVectorInternal::new_unchecked(vector);
 
                 named_vector.insert(
-                    DEFAULT_VECTOR_NAME.to_string(),
+                    DEFAULT_VECTOR_NAME.to_owned(),
                     segment::data_types::vectors::VectorInternal::from(multivec),
                 );
                 named_vector
@@ -285,11 +353,11 @@ impl PointStructPersisted {
         let mut named_vectors = NamedVectors::default();
         match &self.vector {
             VectorStructPersisted::Single(vector) => named_vectors.insert(
-                DEFAULT_VECTOR_NAME.to_string(),
+                DEFAULT_VECTOR_NAME.to_owned(),
                 VectorInternal::from(vector.clone()),
             ),
             VectorStructPersisted::MultiDense(vector) => named_vectors.insert(
-                DEFAULT_VECTOR_NAME.to_string(),
+                DEFAULT_VECTOR_NAME.to_owned(),
                 VectorInternal::from(MultiDenseVectorInternal::new_unchecked(vector.clone())),
             ),
             VectorStructPersisted::Named(vectors) => {
@@ -307,7 +375,7 @@ impl PointStructPersisted {
 pub enum BatchVectorStructPersisted {
     Single(Vec<DenseVector>),
     MultiDense(Vec<MultiDenseVector>),
-    Named(HashMap<String, Vec<VectorPersisted>>),
+    Named(HashMap<VectorNameBuf, Vec<VectorPersisted>>),
 }
 
 impl From<BatchVectorStructPersisted> for BatchVectorStructInternal {
@@ -633,12 +701,12 @@ impl PointOperations {
         }
     }
 
-    pub fn point_ids(&self) -> Vec<PointIdType> {
+    pub fn point_ids(&self) -> Option<Vec<PointIdType>> {
         match self {
-            Self::UpsertPoints(op) => op.point_ids(),
-            Self::DeletePoints { ids } => ids.clone(),
-            Self::DeletePointsByFilter(_) => Vec::new(),
-            Self::SyncPoints(op) => op.points.iter().map(|point| point.id).collect(),
+            Self::UpsertPoints(op) => Some(op.point_ids()),
+            Self::DeletePoints { ids } => Some(ids.clone()),
+            Self::DeletePointsByFilter(_) => None,
+            Self::SyncPoints(op) => Some(op.points.iter().map(|point| point.id).collect()),
         }
     }
 

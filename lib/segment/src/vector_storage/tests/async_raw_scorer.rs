@@ -1,12 +1,13 @@
 use std::sync::atomic::AtomicBool;
 
 use bitvec::slice::BitSlice;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use itertools::Itertools;
-use rand::seq::IteratorRandom as _;
 use rand::SeedableRng as _;
+use rand::seq::IteratorRandom as _;
 
-use super::utils::{delete_random_vectors, insert_distributed_vectors, sampler, score, Result};
+use super::utils::{Result, delete_random_vectors, insert_distributed_vectors, sampler, score};
 use crate::common::rocksdb_wrapper;
 use crate::data_types::vectors::QueryVector;
 use crate::fixtures::payload_context_fixture::FixtureIdTracker;
@@ -15,7 +16,7 @@ use crate::types::Distance;
 use crate::vector_storage::dense::memmap_dense_vector_storage::open_memmap_vector_storage_with_async_io;
 use crate::vector_storage::dense::simple_dense_vector_storage::open_simple_dense_vector_storage;
 use crate::vector_storage::vector_storage_base::VectorStorage;
-use crate::vector_storage::{async_raw_scorer, new_raw_scorer, VectorStorageEnum};
+use crate::vector_storage::{VectorStorageEnum, async_raw_scorer, new_raw_scorer_for_test};
 
 #[test]
 fn async_raw_scorer_cosine() -> Result<()> {
@@ -110,24 +111,27 @@ fn test_random_score(
 ) -> Result<()> {
     let query: QueryVector = sampler(&mut rng).take(dim).collect_vec().into();
 
-    let raw_scorer = new_raw_scorer(query.clone(), storage, deleted_points).unwrap();
+    let raw_scorer = new_raw_scorer_for_test(query.clone(), storage, deleted_points).unwrap();
 
     let is_stopped = AtomicBool::new(false);
     let async_raw_scorer = if let VectorStorageEnum::DenseMemmap(storage) = storage {
-        async_raw_scorer::new(query, storage, deleted_points, &is_stopped)?
+        async_raw_scorer::new(
+            query,
+            storage,
+            deleted_points,
+            &is_stopped,
+            HardwareCounterCell::new(),
+        )?
     } else {
         unreachable!();
     };
 
-    let points = rng.gen_range(1..storage.total_vector_count());
+    let points = rng.random_range(1..storage.total_vector_count());
     let points = (0..storage.total_vector_count() as _).choose_multiple(&mut rng, points);
 
     let res = score(&*raw_scorer, &points);
     let async_res = score(&*async_raw_scorer, &points);
 
     assert_eq!(res, async_res);
-
-    raw_scorer.take_hardware_counter().discard_results();
-    async_raw_scorer.take_hardware_counter().discard_results();
     Ok(())
 }

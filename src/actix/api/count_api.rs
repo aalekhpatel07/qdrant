@@ -1,4 +1,4 @@
-use actix_web::{post, web, Responder};
+use actix_web::{Responder, post, web};
 use actix_web_validator::{Json, Path, Query};
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::types::CountRequest;
@@ -10,7 +10,7 @@ use super::CollectionPath;
 use crate::actix::api::read_params::ReadParams;
 use crate::actix::auth::ActixAccess;
 use crate::actix::helpers::{self, get_request_hardware_counter, process_response_error};
-use crate::common::points::do_count_points;
+use crate::common::query::do_count_points;
 use crate::settings::ServiceConfig;
 
 #[post("/collections/{name}/points/count")]
@@ -49,6 +49,7 @@ async fn count_points(
         &dispatcher,
         collection.name.clone(),
         service_config.hardware_reporting(),
+        None,
     );
 
     let timing = Instant::now();

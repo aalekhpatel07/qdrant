@@ -7,7 +7,7 @@ use ash::vk;
 /// Debug messenger is used to handle Vulkan debug messages.
 /// If presented, vulkan instance will be created with validation layers and debug messenger.
 /// Validation layer has a large performance cost, so it should be used only for tests and debugging.
-pub trait DebugMessenger {
+pub trait DebugMessenger: Sync + Send {
     fn callback(&self) -> vk::PFN_vkDebugUtilsMessengerCallbackEXT;
 
     fn severity_flags(&self) -> vk::DebugUtilsMessageSeverityFlagsEXT;
@@ -43,7 +43,7 @@ unsafe extern "system" fn vulkan_debug_callback_log(
     p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
     _p_user_data: *mut c_void,
 ) -> vk::Bool32 {
-    let message = CStr::from_ptr((*p_callback_data).p_message);
+    let message = unsafe { CStr::from_ptr((*p_callback_data).p_message) };
     let message_type_str = match message_type {
         vk::DebugUtilsMessageTypeFlagsEXT::GENERAL => "[General]",
         vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE => "[Performance]",
@@ -52,18 +52,18 @@ unsafe extern "system" fn vulkan_debug_callback_log(
     };
     match message_severity {
         vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE => {
-            log::info!("{} {:?}", message_type_str, message)
+            log::info!("{message_type_str} {message:?}")
         }
         vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => {
-            log::warn!("{} {:?}", message_type_str, message)
+            log::warn!("{message_type_str} {message:?}")
         }
         vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => {
-            log::error!("{} {:?}", message_type_str, message)
+            log::error!("{message_type_str} {message:?}")
         }
         vk::DebugUtilsMessageSeverityFlagsEXT::INFO => {
-            log::info!("{} {:?}", message_type_str, message)
+            log::info!("{message_type_str} {message:?}")
         }
-        _ => log::info!("{} {:?}", message_type_str, message),
+        _ => log::info!("{message_type_str} {message:?}"),
     };
     vk::FALSE
 }
@@ -96,7 +96,7 @@ unsafe extern "system" fn vulkan_debug_callback_panic(
     if std::thread::panicking() {
         return vk::FALSE;
     }
-    let message = CStr::from_ptr((*p_callback_data).p_message);
+    let message = unsafe { CStr::from_ptr((*p_callback_data).p_message) };
     let message = message.to_str().unwrap();
     let message_type = match message_type {
         vk::DebugUtilsMessageTypeFlagsEXT::GENERAL => "General",
@@ -110,7 +110,8 @@ unsafe extern "system" fn vulkan_debug_callback_panic(
     };
     let backtrace = std::backtrace::Backtrace::force_capture().to_string();
     panic!(
-        "Vulkan panic ({} {}) \nWith message: {}, \nBackrace: {}",
-        message_type, severity, message, backtrace,
+        "Vulkan panic ({message_type} {severity}) \n\
+         With message: {message}, \n\
+         Backrace: {backtrace}",
     )
 }

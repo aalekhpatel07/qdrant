@@ -3,13 +3,15 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use bitvec::vec::BitVec;
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::ext::BitSliceExt as _;
 use common::types::PointOffsetType;
 use parking_lot::RwLock;
 use rocksdb::DB;
 
 use super::mutable_numeric_index::{InMemoryNumericIndex, MutableNumericIndex};
 use super::{
-    numeric_index_storage_cf_name, Encodable, HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION,
+    Encodable, HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION, numeric_index_storage_cf_name,
 };
 use crate::common::operation_error::OperationResult;
 use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
@@ -108,19 +110,13 @@ impl<T: Encodable + Numericable> NumericKeySortedVec<T> {
     }
 }
 
-impl<'a, T: Encodable + Numericable> Iterator for NumericKeySortedVecIterator<'a, T> {
+impl<T: Encodable + Numericable> Iterator for NumericKeySortedVecIterator<'_, T> {
     type Item = Point<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.start_index < self.end_index {
             let key = self.set.data[self.start_index].clone();
-            let deleted = self
-                .set
-                .deleted
-                .get(self.start_index)
-                .as_deref()
-                .copied()
-                .unwrap_or(true);
+            let deleted = self.set.deleted.get_bit(self.start_index).unwrap_or(true);
             self.start_index += 1;
             if deleted {
                 continue;
@@ -131,17 +127,11 @@ impl<'a, T: Encodable + Numericable> Iterator for NumericKeySortedVecIterator<'a
     }
 }
 
-impl<'a, T: Encodable + Numericable> DoubleEndedIterator for NumericKeySortedVecIterator<'a, T> {
+impl<T: Encodable + Numericable> DoubleEndedIterator for NumericKeySortedVecIterator<'_, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         while self.start_index < self.end_index {
             let key = self.set.data[self.end_index - 1].clone();
-            let deleted = self
-                .set
-                .deleted
-                .get(self.end_index - 1)
-                .as_deref()
-                .copied()
-                .unwrap_or(true);
+            let deleted = self.set.deleted.get_bit(self.end_index - 1).unwrap_or(true);
             self.end_index -= 1;
             if deleted {
                 continue;
@@ -181,8 +171,20 @@ impl<T: Encodable + Numericable + Default> ImmutableNumericIndex<T> {
         &self,
         idx: PointOffsetType,
         check_fn: impl Fn(&T) -> bool,
+        hw_counter: &HardwareCounterCell,
     ) -> bool {
-        self.point_to_values.check_values_any(idx, check_fn)
+        let mut call_counter = 0;
+
+        let res = self.point_to_values.check_values_any(idx, |v| {
+            call_counter += 1;
+            check_fn(v)
+        });
+
+        hw_counter
+            .payload_index_io_read_counter()
+            .incr_delta(call_counter);
+
+        res
     }
 
     pub fn get_values(&self, idx: PointOffsetType) -> Option<Box<dyn Iterator<Item = T> + '_>> {
@@ -210,13 +212,19 @@ impl<T: Encodable + Numericable + Default> ImmutableNumericIndex<T> {
         iterator.end_index - iterator.start_index
     }
 
-    pub(super) fn values_range(
-        &self,
+    pub(super) fn values_range<'a>(
+        &'a self,
         start_bound: Bound<Point<T>>,
         end_bound: Bound<Point<T>>,
-    ) -> impl Iterator<Item = PointOffsetType> + '_ {
+        hw_counter: &'a HardwareCounterCell,
+    ) -> impl Iterator<Item = PointOffsetType> + 'a {
         self.map
             .values_range(start_bound, end_bound)
+            .inspect(move |_| {
+                hw_counter
+                    .payload_io_read_counter()
+                    .incr_delta(size_of::<Point<T>>())
+            })
             .map(|Point { idx, .. }| idx)
     }
 

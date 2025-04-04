@@ -2,6 +2,7 @@ use std::fs::{create_dir_all, remove_dir};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use io::file_operations::{atomic_save_json, read_json};
 use memmap2::MmapMut;
@@ -10,11 +11,11 @@ use memory::mmap_ops::{self, create_and_ensure_length};
 use memory::mmap_type::{MmapBitSlice, MmapSlice};
 use serde::{Deserialize, Serialize};
 
-use super::mutable_numeric_index::InMemoryNumericIndex;
 use super::Encodable;
+use super::mutable_numeric_index::InMemoryNumericIndex;
+use crate::common::Flusher;
 use crate::common::mmap_bitslice_buffered_update_wrapper::MmapBitSliceBufferedUpdateWrapper;
 use crate::common::operation_error::OperationResult;
-use crate::common::Flusher;
 use crate::index::field_index::histogram::{Histogram, Numericable, Point};
 use crate::index::field_index::mmap_point_to_values::{MmapPointToValues, MmapValue};
 
@@ -45,7 +46,7 @@ pub(super) struct NumericIndexPairsIterator<'a, T: Encodable + Numericable> {
     end_index: usize,
 }
 
-impl<'a, T: Encodable + Numericable> Iterator for NumericIndexPairsIterator<'a, T> {
+impl<T: Encodable + Numericable> Iterator for NumericIndexPairsIterator<'_, T> {
     type Item = Point<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -62,7 +63,7 @@ impl<'a, T: Encodable + Numericable> Iterator for NumericIndexPairsIterator<'a, 
     }
 }
 
-impl<'a, T: Encodable + Numericable> DoubleEndedIterator for NumericIndexPairsIterator<'a, T> {
+impl<T: Encodable + Numericable> DoubleEndedIterator for NumericIndexPairsIterator<'_, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         while self.start_index < self.end_index {
             let key = self.pairs[self.end_index - 1].clone();
@@ -78,7 +79,11 @@ impl<'a, T: Encodable + Numericable> DoubleEndedIterator for NumericIndexPairsIt
 }
 
 impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
-    pub fn build(in_memory_index: InMemoryNumericIndex<T>, path: &Path) -> OperationResult<Self> {
+    pub fn build(
+        in_memory_index: InMemoryNumericIndex<T>,
+        path: &Path,
+        is_on_disk: bool,
+    ) -> OperationResult<Self> {
         create_dir_all(path)?;
 
         let pairs_path = path.join(PAIRS_PATH);
@@ -139,10 +144,10 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
             }
         }
 
-        Self::load(path)
+        Self::load(path, is_on_disk)
     }
 
-    pub fn load(path: &Path) -> OperationResult<Self> {
+    pub fn load(path: &Path, is_on_disk: bool) -> OperationResult<Self> {
         let pairs_path = path.join(PAIRS_PATH);
         let deleted_path = path.join(DELETED_PATH);
         let config_path = path.join(CONFIG_PATH);
@@ -152,11 +157,12 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
         let deleted = mmap_ops::open_write_mmap(&deleted_path, AdviceSetting::Global, false)?;
         let deleted = MmapBitSlice::from(deleted, 0);
         let deleted_count = deleted.count_ones();
+        let do_populate = !is_on_disk;
         let map = unsafe {
             MmapSlice::try_from(mmap_ops::open_write_mmap(
                 &pairs_path,
                 AdviceSetting::Global,
-                false,
+                do_populate,
             )?)?
         };
         let point_to_values = MmapPointToValues::open(path)?;
@@ -201,10 +207,14 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
         &self,
         idx: PointOffsetType,
         check_fn: impl Fn(&T) -> bool,
+        hw_counter: &HardwareCounterCell,
     ) -> bool {
         if self.deleted.get(idx as usize) == Some(false) {
-            self.point_to_values
-                .check_values_any(idx, |v| check_fn(T::from_referenced(&v)))
+            self.point_to_values.check_values_any(
+                idx,
+                |v| check_fn(T::from_referenced(&v)),
+                hw_counter,
+            )
         } else {
             false
         }
@@ -236,12 +246,18 @@ impl<T: Encodable + Numericable + Default + MmapValue> MmapNumericIndex<T> {
         self.pairs.len()
     }
 
-    pub(super) fn values_range(
-        &self,
+    pub(super) fn values_range<'a>(
+        &'a self,
         start_bound: Bound<Point<T>>,
         end_bound: Bound<Point<T>>,
-    ) -> impl Iterator<Item = PointOffsetType> + '_ {
+        hw_counter: &'a HardwareCounterCell,
+    ) -> impl Iterator<Item = PointOffsetType> + 'a {
         self.values_range_iterator(start_bound, end_bound)
+            .inspect(move |_| {
+                hw_counter
+                    .payload_index_io_read_counter()
+                    .incr_delta(size_of::<Point<T>>())
+            })
             .map(|Point { idx, .. }| idx)
     }
 

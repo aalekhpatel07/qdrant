@@ -7,8 +7,8 @@ echo $PWD
 cd "$(dirname "$0")/../../"
 
 QDRANT_HOST='localhost:6333'
-PREV_PATCH_QDRANT_VERSION='v1.9.2'
-PREV_MINOR_QDRANT_VERSION='v1.8.4'
+PREV_PATCH_QDRANT_VERSION='v1.13.5'
+PREV_MINOR_QDRANT_VERSION='v1.12.6'
 
 RETRY_LIMIT=30
 
@@ -55,6 +55,9 @@ function wait_for_server() {
 function test_version() {
   version=$1
   wget "https://storage.googleapis.com/qdrant-backward-compatibility/compatibility-${version}.tar" -O ./tests/storage-compat/compatibility.tar
+
+  # Delete existing storage to make sure we start fresh
+  rm -rf ./storage
 
   # Uncompress compatibility
   tar -xvf ./tests/storage-compat/compatibility.tar -C ./tests/storage-compat/
@@ -123,3 +126,9 @@ test_version $PREV_PATCH_QDRANT_VERSION
 
 # Test previous minor version
 test_version $PREV_MINOR_QDRANT_VERSION
+
+# Test gridstore storage generated manually with
+# export QDRANT__STORAGE__ON_DISK_PAYLOAD_USES_MMAP=true
+# export QDRANT__STORAGE__ON_DISK_SPARSE_VECTORS_USES_MMAP=true
+# in the gen_storage_compat_data.sh script
+test_version 'v1.12.6-blob-store'

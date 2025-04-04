@@ -1,14 +1,16 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::counter::hardware_counter::HardwareCounterCell;
+use io::file_operations::atomic_save_json;
 use serde::{Deserialize, Serialize};
 
+use crate::EncodingError;
 use crate::encoded_storage::{EncodedStorage, EncodedStorageBuilder};
 use crate::encoded_vectors::{
-    validate_vector_parameters, DistanceType, EncodedVectors, VectorParameters,
+    DistanceType, EncodedVectors, VectorParameters, validate_vector_parameters,
 };
 use crate::quantile::{find_min_max_from_iter, find_quantile_interval};
-use crate::EncodingError;
 
 pub const ALIGNMENT: usize = 16;
 
@@ -37,7 +39,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsU8<TStorage> {
         mut storage_builder: impl EncodedStorageBuilder<TStorage>,
         vector_parameters: &VectorParameters,
         quantile: Option<f32>,
-        stop_condition: impl Fn() -> bool,
+        stopped: &AtomicBool,
     ) -> Result<Self, EncodingError> {
         let actual_dim = Self::get_actual_dim(vector_parameters);
 
@@ -72,7 +74,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsU8<TStorage> {
         };
 
         for vector in orig_data {
-            if stop_condition() {
+            if stopped.load(Ordering::Relaxed) {
                 return Err(EncodingError::Stopped);
             }
 
@@ -250,21 +252,45 @@ impl<TStorage: EncodedStorage> EncodedVectorsU8<TStorage> {
         }
     }
 
+    pub fn get_quantized_vector(&self, i: u32) -> (f32, &[u8]) {
+        let (offset, v_ptr) = self.get_vec_ptr(i);
+        let vector_data_size = self.metadata.actual_dim;
+        (offset, unsafe {
+            std::slice::from_raw_parts(v_ptr, vector_data_size)
+        })
+    }
+
     pub fn get_quantized_vector_size(vector_parameters: &VectorParameters) -> usize {
         let actual_dim = Self::get_actual_dim(vector_parameters);
         actual_dim + std::mem::size_of::<f32>()
     }
 
+    pub fn get_multiplier(&self) -> f32 {
+        self.metadata.multiplier
+    }
+
+    pub fn get_diff(&self) -> f32 {
+        let diff = self.metadata.actual_dim as f32 * self.metadata.offset * self.metadata.offset;
+        if self.metadata.vector_parameters.invert {
+            -diff
+        } else {
+            diff
+        }
+    }
+
     pub fn get_actual_dim(vector_parameters: &VectorParameters) -> usize {
         vector_parameters.dim + (ALIGNMENT - vector_parameters.dim % ALIGNMENT) % ALIGNMENT
+    }
+
+    pub fn vectors_count(&self) -> usize {
+        self.metadata.vector_parameters.count
     }
 }
 
 impl<TStorage: EncodedStorage> EncodedVectors<EncodedQueryU8> for EncodedVectorsU8<TStorage> {
     fn save(&self, data_path: &Path, meta_path: &Path) -> std::io::Result<()> {
-        let metadata_bytes = serde_json::to_vec(&self.metadata)?;
         meta_path.parent().map(std::fs::create_dir_all);
-        std::fs::write(meta_path, metadata_bytes)?;
+        atomic_save_json(meta_path, &self.metadata)?;
 
         data_path.parent().map(std::fs::create_dir_all);
         self.encoded_vectors.save_to_file(data_path)?;
@@ -286,6 +312,10 @@ impl<TStorage: EncodedStorage> EncodedVectors<EncodedQueryU8> for EncodedVectors
             metadata,
         };
         Ok(result)
+    }
+
+    fn is_on_disk(&self) -> bool {
+        self.encoded_vectors.is_on_disk()
     }
 
     fn encode_query(&self, query: &[f32]) -> EncodedQueryU8 {
@@ -339,6 +369,10 @@ impl<TStorage: EncodedStorage> EncodedVectors<EncodedQueryU8> for EncodedVectors
 
         let q_ptr = query.encoded_query.as_ptr();
         let (vector_offset, v_ptr) = self.get_vec_ptr(i);
+
+        hw_counter
+            .vector_io_read()
+            .incr_delta(self.metadata.vector_parameters.dim);
 
         #[cfg(target_arch = "x86_64")]
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -395,6 +429,10 @@ impl<TStorage: EncodedStorage> EncodedVectors<EncodedQueryU8> for EncodedVectors
         hw_counter
             .cpu_counter()
             .incr_delta(self.metadata.vector_parameters.dim);
+
+        hw_counter
+            .vector_io_read()
+            .incr_delta(self.metadata.vector_parameters.dim * 2);
 
         let (query_offset, q_ptr) = self.get_vec_ptr(i);
         let (vector_offset, v_ptr) = self.get_vec_ptr(j);
@@ -486,7 +524,7 @@ fn impl_score_l1(q_ptr: *const u8, v_ptr: *const u8, actual_dim: usize) -> i32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-extern "C" {
+unsafe extern "C" {
     fn impl_score_dot_avx(query_ptr: *const u8, vector_ptr: *const u8, dim: u32) -> f32;
     fn impl_score_l1_avx(query_ptr: *const u8, vector_ptr: *const u8, dim: u32) -> f32;
 
@@ -495,7 +533,7 @@ extern "C" {
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-extern "C" {
+unsafe extern "C" {
     fn impl_score_dot_neon(query_ptr: *const u8, vector_ptr: *const u8, dim: u32) -> f32;
     fn impl_score_l1_neon(query_ptr: *const u8, vector_ptr: *const u8, dim: u32) -> f32;
 }

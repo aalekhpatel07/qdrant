@@ -1,4 +1,6 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use std::sync::atomic::AtomicBool;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 use permutation_iterator::Permutor;
 use quantization::encoded_vectors::{DistanceType, EncodedVectors, VectorParameters};
 use quantization::encoded_vectors_u8::EncodedVectorsU8;
@@ -9,10 +11,10 @@ fn encode_dot_bench(c: &mut Criterion) {
 
     let vectors_count = 100_000;
     let vector_dim = 1024;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut list: Vec<f32> = Vec::new();
     for _ in 0..vectors_count {
-        let vector: Vec<f32> = (0..vector_dim).map(|_| rng.gen()).collect();
+        let vector: Vec<f32> = (0..vector_dim).map(|_| rng.random()).collect();
         list.extend_from_slice(&vector);
     }
 
@@ -26,11 +28,11 @@ fn encode_dot_bench(c: &mut Criterion) {
             invert: false,
         },
         None,
-        || false,
+        &AtomicBool::new(false),
     )
     .unwrap();
 
-    let query: Vec<f32> = (0..vector_dim).map(|_| rng.gen()).collect();
+    let query: Vec<f32> = (0..vector_dim).map(|_| rng.random()).collect();
     let encoded_query = i8_encoded.encode_query(&query);
 
     #[cfg(target_arch = "x86_64")]
@@ -102,10 +104,10 @@ fn encode_l1_bench(c: &mut Criterion) {
 
     let vectors_count = 100_000;
     let vector_dim = 1024;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut list: Vec<f32> = Vec::new();
     for _ in 0..vectors_count {
-        let vector: Vec<f32> = (0..vector_dim).map(|_| rng.gen()).collect();
+        let vector: Vec<f32> = (0..vector_dim).map(|_| rng.random()).collect();
         list.extend_from_slice(&vector);
     }
 
@@ -119,11 +121,11 @@ fn encode_l1_bench(c: &mut Criterion) {
             invert: true,
         },
         None,
-        || false,
+        &AtomicBool::new(false),
     )
     .unwrap();
 
-    let query: Vec<f32> = (0..vector_dim).map(|_| rng.gen()).collect();
+    let query: Vec<f32> = (0..vector_dim).map(|_| rng.random()).collect();
     let encoded_query = i8_encoded.encode_query(&query);
 
     #[cfg(target_arch = "x86_64")]

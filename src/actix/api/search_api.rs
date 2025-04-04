@@ -1,4 +1,4 @@
-use actix_web::{post, web, HttpResponse, Responder};
+use actix_web::{HttpResponse, Responder, post, web};
 use actix_web_validator::{Json, Path, Query};
 use api::rest::{SearchMatrixOffsetsResponse, SearchMatrixPairsResponse, SearchMatrixRequest};
 use collection::collection::distance_matrix::CollectionSearchMatrixRequest;
@@ -13,13 +13,13 @@ use storage::content_manager::collection_verification::{
 use storage::dispatcher::Dispatcher;
 use tokio::time::Instant;
 
-use super::read_params::ReadParams;
 use super::CollectionPath;
+use super::read_params::ReadParams;
 use crate::actix::auth::ActixAccess;
 use crate::actix::helpers::{
     get_request_hardware_counter, process_response, process_response_error,
 };
-use crate::common::points::{
+use crate::common::query::{
     do_core_search_points, do_search_batch_points, do_search_point_groups, do_search_points_matrix,
 };
 use crate::settings::ServiceConfig;
@@ -60,6 +60,7 @@ async fn search_points(
         &dispatcher,
         collection.name.clone(),
         service_config.hardware_reporting(),
+        None,
     );
 
     let timing = Instant::now();
@@ -130,6 +131,7 @@ async fn batch_search_points(
         &dispatcher,
         collection.name.clone(),
         service_config.hardware_reporting(),
+        None,
     );
 
     let timing = Instant::now();
@@ -195,6 +197,7 @@ async fn search_point_groups(
         &dispatcher,
         collection.name.clone(),
         service_config.hardware_reporting(),
+        None,
     );
     let timing = Instant::now();
 
@@ -249,6 +252,7 @@ async fn search_points_matrix_pairs(
         &dispatcher,
         collection.name.clone(),
         service_config.hardware_reporting(),
+        None,
     );
     let timing = Instant::now();
 
@@ -304,6 +308,7 @@ async fn search_points_matrix_offsets(
         &dispatcher,
         collection.name.clone(),
         service_config.hardware_reporting(),
+        None,
     );
     let timing = Instant::now();
 

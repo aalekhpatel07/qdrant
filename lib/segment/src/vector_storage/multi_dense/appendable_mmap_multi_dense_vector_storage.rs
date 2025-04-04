@@ -4,11 +4,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use bitvec::prelude::BitSlice;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use memory::madvise::AdviceSetting;
 
-use crate::common::operation_error::{check_process_stopped, OperationError, OperationResult};
 use crate::common::Flusher;
+use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
 use crate::data_types::named_vectors::{CowMultiVector, CowVector};
 use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::{TypedMultiDenseVectorRef, VectorElementType, VectorRef};
@@ -47,15 +48,15 @@ pub struct AppendableMmapMultiDenseVectorStorage<
 }
 
 impl<
-        T: PrimitiveVectorElement,
-        S: ChunkedVectorStorage<T>,
-        O: ChunkedVectorStorage<MultivectorMmapOffset>,
-    > AppendableMmapMultiDenseVectorStorage<T, S, O>
+    T: PrimitiveVectorElement,
+    S: ChunkedVectorStorage<T>,
+    O: ChunkedVectorStorage<MultivectorMmapOffset>,
+> AppendableMmapMultiDenseVectorStorage<T, S, O>
 {
     /// Set deleted flag for given key. Returns previous deleted state.
     #[inline]
     fn set_deleted(&mut self, key: PointOffsetType, deleted: bool) -> OperationResult<bool> {
-        if self.vectors.len() <= key as usize {
+        if !deleted && self.vectors.len() <= key as usize {
             return Ok(false);
         }
 
@@ -73,10 +74,10 @@ impl<
 }
 
 impl<
-        T: PrimitiveVectorElement,
-        S: ChunkedVectorStorage<T> + Sync,
-        O: ChunkedVectorStorage<MultivectorMmapOffset> + Sync,
-    > MultiVectorStorage<T> for AppendableMmapMultiDenseVectorStorage<T, S, O>
+    T: PrimitiveVectorElement,
+    S: ChunkedVectorStorage<T> + Sync,
+    O: ChunkedVectorStorage<MultivectorMmapOffset> + Sync,
+> MultiVectorStorage<T> for AppendableMmapMultiDenseVectorStorage<T, S, O>
 {
     fn vector_dim(&self) -> usize {
         self.vectors.dim()
@@ -135,13 +136,23 @@ impl<
     fn multi_vector_config(&self) -> &MultiVectorConfig {
         &self.multi_vector_config
     }
+
+    fn size_of_available_vectors_in_bytes(&self) -> usize {
+        if self.total_vector_count() > 0 {
+            let total_size = self.vectors.len() * self.vector_dim() * std::mem::size_of::<T>();
+            (total_size as u128 * self.available_vector_count() as u128
+                / self.total_vector_count() as u128) as usize
+        } else {
+            0
+        }
+    }
 }
 
 impl<
-        T: PrimitiveVectorElement,
-        S: ChunkedVectorStorage<T> + Sync,
-        O: ChunkedVectorStorage<MultivectorMmapOffset> + Sync,
-    > VectorStorage for AppendableMmapMultiDenseVectorStorage<T, S, O>
+    T: PrimitiveVectorElement,
+    S: ChunkedVectorStorage<T> + Sync,
+    O: ChunkedVectorStorage<MultivectorMmapOffset> + Sync,
+> VectorStorage for AppendableMmapMultiDenseVectorStorage<T, S, O>
 {
     fn distance(&self) -> Distance {
         self.distance
@@ -159,16 +170,6 @@ impl<
         self.offsets.len()
     }
 
-    fn size_of_available_vectors_in_bytes(&self) -> usize {
-        if self.total_vector_count() > 0 {
-            let total_size = self.vectors.len() * self.vector_dim() * std::mem::size_of::<T>();
-            (total_size as u128 * self.available_vector_count() as u128
-                / self.total_vector_count() as u128) as usize
-        } else {
-            0
-        }
-    }
-
     fn get_vector(&self, key: PointOffsetType) -> CowVector {
         self.get_vector_opt(key).expect("vector not found")
     }
@@ -181,7 +182,12 @@ impl<
         })
     }
 
-    fn insert_vector(&mut self, key: PointOffsetType, vector: VectorRef) -> OperationResult<()> {
+    fn insert_vector(
+        &mut self,
+        key: PointOffsetType,
+        vector: VectorRef,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
         let multi_vector: TypedMultiDenseVectorRef<VectorElementType> = vector.try_into()?;
         let multi_vector = T::from_float_multivector(CowMultiVector::Borrowed(multi_vector));
         let multi_vector = multi_vector.as_vec_ref();
@@ -223,8 +229,10 @@ impl<
             offset.offset as VectorOffsetType,
             multi_vector.flattened_vectors,
             multi_vector.vectors_count(),
+            hw_counter,
         )?;
-        self.offsets.insert(key as VectorOffsetType, &[offset])?;
+        self.offsets
+            .insert(key as VectorOffsetType, &[offset], hw_counter)?;
         self.set_deleted(key, false)?;
 
         Ok(())
@@ -232,16 +240,17 @@ impl<
 
     fn update_from<'a>(
         &mut self,
-        other_ids: &'a mut impl Iterator<Item = (CowVector<'a>, bool)>,
+        other_vectors: &'a mut impl Iterator<Item = (CowVector<'a>, bool)>,
         stopped: &AtomicBool,
     ) -> OperationResult<Range<PointOffsetType>> {
         let start_index = self.offsets.len() as PointOffsetType;
-        for (other_vector, other_deleted) in other_ids {
+        let disposed_hw_counter = HardwareCounterCell::disposable(); // Internal operation
+        for (other_vector, other_deleted) in other_vectors {
             check_process_stopped(stopped)?;
             // Do not perform preprocessing - vectors should be already processed
             let other_vector: VectorRef = other_vector.as_vec_ref();
             let new_id = self.offsets.len() as PointOffsetType;
-            self.insert_vector(new_id, other_vector)?;
+            self.insert_vector(new_id, other_vector, &disposed_hw_counter)?;
             self.set_deleted(new_id, other_deleted)?;
         }
         let end_index = self.offsets.len() as PointOffsetType;
@@ -350,22 +359,24 @@ pub fn open_appendable_memmap_multi_vector_storage_impl<T: PrimitiveVectorElemen
     let offsets_path = path.join(OFFSETS_DIR_PATH);
     let deleted_path = path.join(DELETED_DIR_PATH);
 
+    let populate = false;
+
     let vectors = ChunkedMmapVectors::open(
         &vectors_path,
         dim,
         Some(false),
         AdviceSetting::Global,
-        Some(false),
+        Some(populate),
     )?;
     let offsets = ChunkedMmapVectors::open(
         &offsets_path,
         1,
         Some(false),
         AdviceSetting::Global,
-        Some(false),
+        Some(populate),
     )?;
 
-    let deleted: DynamicMmapFlags = DynamicMmapFlags::open(&deleted_path)?;
+    let deleted: DynamicMmapFlags = DynamicMmapFlags::open(&deleted_path, populate)?;
     let deleted_count = deleted.count_flags();
 
     Ok(AppendableMmapMultiDenseVectorStorage {
@@ -443,10 +454,12 @@ pub fn open_appendable_in_ram_multi_vector_storage_impl<T: PrimitiveVectorElemen
     let offsets_path = path.join(OFFSETS_DIR_PATH);
     let deleted_path = path.join(DELETED_DIR_PATH);
 
+    let populate = true;
+
     let vectors = InRamPersistedVectors::open(&vectors_path, dim)?;
     let offsets = InRamPersistedVectors::open(&offsets_path, 1)?;
 
-    let deleted: DynamicMmapFlags = DynamicMmapFlags::open(&deleted_path)?;
+    let deleted: DynamicMmapFlags = DynamicMmapFlags::open(&deleted_path, populate)?;
     let deleted_count = deleted.count_flags();
 
     Ok(AppendableMmapMultiDenseVectorStorage {

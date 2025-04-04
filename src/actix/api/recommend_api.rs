@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use actix_web::{post, web, Responder};
+use actix_web::{Responder, post, web};
 use actix_web_validator::{Json, Path, Query};
 use collection::operations::consistency_params::ReadConsistency;
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
@@ -19,8 +19,8 @@ use storage::dispatcher::Dispatcher;
 use storage::rbac::Access;
 use tokio::time::Instant;
 
-use super::read_params::ReadParams;
 use super::CollectionPath;
+use super::read_params::ReadParams;
 use crate::actix::auth::ActixAccess;
 use crate::actix::helpers::{self, get_request_hardware_counter, process_response_error};
 use crate::settings::ServiceConfig;
@@ -61,6 +61,7 @@ async fn recommend_points(
         &dispatcher,
         collection.name.clone(),
         service_config.hardware_reporting(),
+        None,
     );
 
     let timing = Instant::now();
@@ -94,7 +95,7 @@ async fn do_recommend_batch_points(
     read_consistency: Option<ReadConsistency>,
     access: Access,
     timeout: Option<Duration>,
-    hw_measurement_acc: &HwMeasurementAcc,
+    hw_measurement_acc: HwMeasurementAcc,
 ) -> Result<Vec<Vec<ScoredPoint>>, StorageError> {
     let requests = request
         .searches
@@ -146,6 +147,7 @@ async fn recommend_batch_points(
         &dispatcher,
         collection.name.clone(),
         service_config.hardware_reporting(),
+        None,
     );
     let timing = Instant::now();
 
@@ -210,10 +212,11 @@ async fn recommend_point_groups(
         &dispatcher,
         collection.name.clone(),
         service_config.hardware_reporting(),
+        None,
     );
     let timing = Instant::now();
 
-    let result = crate::common::points::do_recommend_point_groups(
+    let result = crate::common::query::do_recommend_point_groups(
         dispatcher.toc(&access, &pass),
         &collection.name,
         recommend_group_request,

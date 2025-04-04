@@ -4,7 +4,7 @@ use common::types::PointOffsetType;
 use ordered_float::OrderedFloat;
 
 use super::posting_list_common::{
-    PostingElement, PostingElementEx, PostingListIter, DEFAULT_MAX_NEXT_WEIGHT,
+    DEFAULT_MAX_NEXT_WEIGHT, PostingElement, PostingElementEx, PostingListIter,
 };
 use crate::common::types::DimWeight;
 
@@ -173,7 +173,7 @@ pub struct PostingListIterator<'a> {
     pub current_index: usize,
 }
 
-impl<'a> PostingListIter for PostingListIterator<'a> {
+impl PostingListIter for PostingListIterator<'_> {
     #[inline]
     fn peek(&mut self) -> Option<PostingElementEx> {
         self.elements.get(self.current_index).cloned()
@@ -182,6 +182,10 @@ impl<'a> PostingListIter for PostingListIterator<'a> {
     #[inline]
     fn last_id(&self) -> Option<PointOffsetType> {
         self.elements.last().map(|e| e.record_id)
+    }
+
+    fn element_size(&self) -> usize {
+        size_of::<DimWeight>()
     }
 
     #[inline]
@@ -476,23 +480,23 @@ mod tests {
 
     #[test]
     fn test_random_delete() {
-        use rand::seq::SliceRandom;
         use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::seq::SliceRandom;
+        let mut rng = rand::rng();
         for _ in 0..1000 {
             let mut ids = Vec::new();
             let mut cur_id = 0;
             for _ in 0..32 {
-                cur_id += rng.gen_range(1..10);
+                cur_id += rng.random_range(1..10);
                 ids.push(cur_id);
             }
             ids.shuffle(&mut rng);
-            let random_id = ids[rng.gen_range(0..ids.len())];
+            let random_id = ids[rng.random_range(0..ids.len())];
 
             let mut builder1 = PostingBuilder::new();
             let mut builder2 = PostingBuilder::new();
             for id in ids {
-                let val = rng.gen_range(0..100) as f32 / 10.0;
+                let val = rng.random_range(0..100) as f32 / 10.0;
                 builder1.add(id, val);
                 if id != random_id {
                     builder2.add(id, val);

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use schemars::JsonSchema;
+use segment::common::anonymize::Anonymize;
 use serde::{Deserialize, Serialize};
 
 use super::holders::segment_holder::SegmentId;
@@ -111,9 +112,10 @@ impl Tracker {
 }
 
 /// Tracker object used in telemetry
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Anonymize)]
 pub struct TrackerTelemetry {
     /// Name of the optimizer
+    #[anonymize(false)]
     pub name: String,
     /// Segment IDs being optimized
     pub segment_ids: Vec<SegmentId>,
@@ -166,12 +168,16 @@ impl TrackerState {
 }
 
 /// Represents the current state of the optimizer being tracked
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default, Eq, PartialEq, Hash)]
+#[derive(
+    Serialize, Deserialize, Clone, Debug, JsonSchema, Anonymize, Default, Eq, PartialEq, Hash,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum TrackerStatus {
     #[default]
     Optimizing,
     Done,
+    #[anonymize(false)]
     Cancelled(String),
+    #[anonymize(false)]
     Error(String),
 }

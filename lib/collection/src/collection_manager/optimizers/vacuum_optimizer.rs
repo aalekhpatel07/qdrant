@@ -209,16 +209,18 @@ impl SegmentOptimizer for VacuumOptimizer {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
-    use common::cpu::CpuPermit;
+    use common::budget::ResourceBudget;
+    use common::counter::hardware_counter::HardwareCounterCell;
     use itertools::Itertools;
     use parking_lot::RwLock;
     use segment::entry::entry_point::SegmentEntry;
     use segment::index::hnsw_index::num_rayon_threads;
-    use segment::types::{Distance, PayloadContainer, PayloadSchemaType};
-    use serde_json::{json, Value};
+    use segment::payload_json;
+    use segment::types::{Distance, PayloadContainer, PayloadSchemaType, VectorName};
+    use serde_json::Value;
     use tempfile::Builder;
 
     use super::*;
@@ -228,6 +230,9 @@ mod tests {
     use crate::operations::types::VectorsConfig;
     use crate::operations::vector_params_builder::VectorParamsBuilder;
 
+    const VECTOR1_NAME: &VectorName = "vector1";
+    const VECTOR2_NAME: &VectorName = "vector2";
+
     #[test]
     fn test_vacuum_conditions() {
         let temp_dir = Builder::new().prefix("segment_temp_dir").tempdir().unwrap();
@@ -236,6 +241,8 @@ mod tests {
         let segment_id = holder.add_new(random_segment(dir.path(), 100, 200, 4));
 
         let segment = holder.get(segment_id).unwrap();
+
+        let hw_counter = HardwareCounterCell::new();
 
         let original_segment_path = match segment {
             LockedSegment::Original(s) => s.read().current_path.clone(),
@@ -251,7 +258,11 @@ mod tests {
             .collect_vec();
 
         for &point_id in &segment_points_to_delete {
-            segment.get().write().delete_point(101, point_id).unwrap();
+            segment
+                .get()
+                .write()
+                .delete_point(101, point_id, &hw_counter)
+                .unwrap();
         }
 
         let segment_points_to_assign1 = segment
@@ -274,7 +285,13 @@ mod tests {
             segment
                 .get()
                 .write()
-                .set_payload(102, point_id, &json!({ "color": "red" }).into(), &None)
+                .set_payload(
+                    102,
+                    point_id,
+                    &payload_json! {"color": "red"},
+                    &None,
+                    &hw_counter,
+                )
                 .unwrap();
         }
 
@@ -282,7 +299,13 @@ mod tests {
             segment
                 .get()
                 .write()
-                .set_payload(102, point_id, &json!({"size": 0.42}).into(), &None)
+                .set_payload(
+                    102,
+                    point_id,
+                    &payload_json! {"size": 0.42},
+                    &None,
+                    &hw_counter,
+                )
                 .unwrap();
         }
 
@@ -313,13 +336,15 @@ mod tests {
         assert_eq!(suggested_to_optimize.len(), 1);
 
         let permit_cpu_count = num_rayon_threads(0);
-        let permit = CpuPermit::dummy(permit_cpu_count as u32);
+        let budget = ResourceBudget::new(permit_cpu_count, permit_cpu_count);
+        let permit = budget.try_acquire(0, permit_cpu_count).unwrap();
 
         vacuum_optimizer
             .optimize(
                 locked_holder.clone(),
                 suggested_to_optimize,
                 permit,
+                budget.clone(),
                 &AtomicBool::new(false),
             )
             .unwrap();
@@ -346,7 +371,7 @@ mod tests {
         // Check payload is preserved in optimized segment
         for &point_id in &segment_points_to_assign1 {
             assert!(segment_guard.has_point(point_id));
-            let payload = segment_guard.payload(point_id).unwrap();
+            let payload = segment_guard.payload(point_id, &hw_counter).unwrap();
             let payload_color = payload
                 .get_value(&"color".parse().unwrap())
                 .into_iter()
@@ -390,11 +415,11 @@ mod tests {
         let collection_params = CollectionParams {
             vectors: VectorsConfig::Multi(BTreeMap::from([
                 (
-                    "vector1".into(),
+                    VECTOR1_NAME.to_owned(),
                     VectorParamsBuilder::new(vector1_dim, Distance::Dot).build(),
                 ),
                 (
-                    "vector2".into(),
+                    VECTOR2_NAME.to_owned(),
                     VectorParamsBuilder::new(vector2_dim, Distance::Dot).build(),
                 ),
             ])),
@@ -414,11 +439,14 @@ mod tests {
             vector2_dim as usize,
         );
 
+        let hw_counter = HardwareCounterCell::new();
+
         segment
             .create_field_index(
                 101,
                 &"keyword".parse().unwrap(),
                 Some(&PayloadSchemaType::Keyword.into()),
+                &hw_counter,
             )
             .unwrap();
 
@@ -435,7 +463,8 @@ mod tests {
         };
 
         let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
-        let permit = CpuPermit::dummy(permit_cpu_count as u32);
+        let budget = ResourceBudget::new(permit_cpu_count, permit_cpu_count);
+        let permit = budget.try_acquire(0, permit_cpu_count).unwrap();
 
         // Optimizers used in test
         let index_optimizer = IndexingOptimizer::new(
@@ -464,6 +493,7 @@ mod tests {
                 locked_holder.clone(),
                 vec![segment_id],
                 permit,
+                budget.clone(),
                 &false.into(),
             )
             .unwrap();
@@ -509,13 +539,13 @@ mod tests {
                 .filter_map(|(i, point_id)| (i % 10 == 3).then_some(point_id))
                 .collect_vec();
             for &point_id in &segment_points_to_delete {
-                segment.delete_point(201, point_id).unwrap();
+                segment.delete_point(201, point_id, &hw_counter).unwrap();
             }
 
             // Delete 25% of vectors named vector1
             {
                 let id_tracker = segment.id_tracker.clone();
-                let vector1_data = segment.vector_data.get_mut("vector1").unwrap();
+                let vector1_data = segment.vector_data.get_mut(VECTOR1_NAME).unwrap();
                 let mut vector1_storage = vector1_data.vector_storage.borrow_mut();
 
                 let vector1_vecs_to_delete = id_tracker
@@ -533,7 +563,7 @@ mod tests {
             // Delete 10% of vectors named vector2
             {
                 let id_tracker = segment.id_tracker.clone();
-                let vector2_data = segment.vector_data.get_mut("vector2").unwrap();
+                let vector2_data = segment.vector_data.get_mut(VECTOR2_NAME).unwrap();
                 let mut vector2_storage = vector2_data.vector_storage.borrow_mut();
 
                 let vector2_vecs_to_delete = id_tracker
@@ -570,7 +600,7 @@ mod tests {
             });
 
         // Run vacuum index optimizer, make sure it optimizes properly
-        let permit = CpuPermit::dummy(permit_cpu_count as u32);
+        let permit = budget.try_acquire(0, permit_cpu_count).unwrap();
         let suggested_to_optimize =
             vacuum_optimizer.check_condition(locked_holder.clone(), &Default::default());
         assert_eq!(suggested_to_optimize.len(), 1);
@@ -579,6 +609,7 @@ mod tests {
                 locked_holder.clone(),
                 suggested_to_optimize,
                 permit,
+                budget.clone(),
                 &false.into(),
             )
             .unwrap();

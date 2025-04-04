@@ -2,10 +2,11 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{create_dir_all, remove_dir_all, rename};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use atomic_refcell::AtomicRefCell;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::{PointOffsetType, ScoredPointOffset, TelemetryDetail};
 use io::storage_version::{StorageVersion as _, VERSION_FILE};
 use itertools::Itertools;
@@ -14,12 +15,12 @@ use sparse::common::scores_memory_pool::ScoresMemoryPool;
 use sparse::common::sparse_vector::SparseVector;
 use sparse::common::types::DimId;
 use sparse::index::inverted_index::inverted_index_ram_builder::InvertedIndexBuilder;
-use sparse::index::inverted_index::{InvertedIndex, INDEX_FILE_NAME, OLD_INDEX_FILE_NAME};
+use sparse::index::inverted_index::{INDEX_FILE_NAME, InvertedIndex, OLD_INDEX_FILE_NAME};
 use sparse::index::search_context::SearchContext;
 
 use super::indices_tracker::IndicesTracker;
 use super::sparse_index_config::SparseIndexType;
-use crate::common::operation_error::{check_process_stopped, OperationError, OperationResult};
+use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
 use crate::common::operation_time_statistics::ScopeDurationMeasurer;
 use crate::data_types::named_vectors::CowVector;
 use crate::data_types::query_context::VectorQueryContext;
@@ -32,10 +33,10 @@ use crate::index::sparse_index::sparse_search_telemetry::SparseSearchesTelemetry
 use crate::index::struct_payload_index::StructPayloadIndex;
 use crate::index::{PayloadIndex, VectorIndex};
 use crate::telemetry::VectorIndexSearchesTelemetry;
-use crate::types::{Filter, SearchParams, DEFAULT_SPARSE_FULL_SCAN_THRESHOLD};
+use crate::types::{DEFAULT_SPARSE_FULL_SCAN_THRESHOLD, Filter, SearchParams};
 use crate::vector_storage::query::TransformInto;
 use crate::vector_storage::{
-    check_deleted_condition, new_stoppable_raw_scorer, VectorStorage, VectorStorageEnum,
+    VectorStorage, VectorStorageEnum, check_deleted_condition, new_stoppable_raw_scorer,
 };
 
 /// Whether to use the new compressed format.
@@ -176,6 +177,7 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
         // Simple migration mechanism for 0.1.0.
         let old_path = path.join(OLD_INDEX_FILE_NAME);
         if TInvertedIndex::Version::current() == Version::new(0, 1, 0) && old_path.exists() {
+            // Didn't have a version file, but uses 0.1.0 index. Create a version file.
             rename(old_path, path.join(INDEX_FILE_NAME))?;
             TInvertedIndex::Version::save(path)?;
             stored_version = Some(TInvertedIndex::Version::current());
@@ -219,7 +221,9 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
                     // the vector was lost in a crash but will be recovered by the WAL
                     let point_id = borrowed_id_tracker.external_id(id);
                     let point_version = borrowed_id_tracker.internal_version(id);
-                    log::debug!("Sparse vector with id {id} is not found, external_id: {point_id:?}, version: {point_version:?}")
+                    log::debug!(
+                        "Sparse vector with id {id} is not found, external_id: {point_id:?}, version: {point_version:?}",
+                    )
                 }
                 Some(vector) => {
                     let vector: &SparseVector = vector.as_vec_ref().try_into()?;
@@ -246,10 +250,13 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
     pub fn max_result_count(&self, query_vector: &SparseVector) -> usize {
         use sparse::index::posting_list_common::PostingListIter as _;
 
+        // For tests only
+        let hw_counter = HardwareCounterCell::disposable();
+
         let mut unique_record_ids = std::collections::HashSet::new();
         for dim_id in query_vector.indices.iter() {
             if let Some(dim_id) = self.indices_tracker.remap_index(*dim_id) {
-                if let Some(posting_list_iter) = self.inverted_index.get(&dim_id) {
+                if let Some(posting_list_iter) = self.inverted_index.get(dim_id, &hw_counter) {
                     for element in posting_list_iter.into_std_iter() {
                         unique_record_ids.insert(element.record_id);
                     }
@@ -259,12 +266,16 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
         unique_record_ids.len()
     }
 
-    fn get_query_cardinality(&self, filter: &Filter) -> CardinalityEstimation {
+    fn get_query_cardinality(
+        &self,
+        filter: &Filter,
+        hw_counter: &HardwareCounterCell,
+    ) -> CardinalityEstimation {
         let vector_storage = self.vector_storage.borrow();
         let id_tracker = self.id_tracker.borrow();
         let payload_index = self.payload_index.borrow();
         let available_vector_count = vector_storage.available_vector_count();
-        let query_point_cardinality = payload_index.estimate_cardinality(filter);
+        let query_point_cardinality = payload_index.estimate_cardinality(filter, hw_counter);
         adjust_to_available_vectors(
             query_point_cardinality,
             available_vector_count,
@@ -294,25 +305,25 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
             &vector_storage,
             deleted_point_bitslice,
             &is_stopped,
+            vector_query_context.hardware_counter(),
         )?;
+        let hw_counter = vector_query_context.hardware_counter();
         match filter {
             Some(filter) => {
                 let payload_index = self.payload_index.borrow();
                 let mut filtered_points = match prefiltered_points {
                     Some(filtered_points) => filtered_points.iter().copied(),
                     None => {
-                        let filtered_points = payload_index.query_points(filter);
+                        let filtered_points = payload_index.query_points(filter, &hw_counter);
                         *prefiltered_points = Some(filtered_points);
                         prefiltered_points.as_ref().unwrap().iter().copied()
                     }
                 };
                 let res = raw_scorer.peek_top_iter(&mut filtered_points, top);
-                vector_query_context.apply_hardware_counter(raw_scorer.take_hardware_counter());
                 Ok(res)
             }
             None => {
                 let res = raw_scorer.peek_top_all(top);
-                vector_query_context.apply_hardware_counter(raw_scorer.take_hardware_counter());
                 Ok(res)
             }
         }
@@ -337,10 +348,12 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
             .unwrap_or(id_tracker.deleted_point_bitslice());
         let deleted_vectors = vector_storage.deleted_vector_bitslice();
 
+        let hw_counter = vector_query_context.hardware_counter();
+
         let ids = match prefiltered_points {
             Some(filtered_points) => filtered_points.iter(),
             None => {
-                let filtered_points = payload_index.query_points(filter);
+                let filtered_points = payload_index.query_points(filter, &hw_counter);
                 *prefiltered_points = Some(filtered_points);
                 prefiltered_points.as_ref().unwrap().iter()
             }
@@ -351,15 +364,23 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
 
         let sparse_vector = self.indices_tracker.remap_vector(sparse_vector.clone());
         let memory_handle = self.scores_memory_pool.get();
+        let mut hw_counter = vector_query_context.hardware_counter();
+        let is_index_on_disk = self.config.index_type.is_on_disk();
+        if is_index_on_disk {
+            hw_counter.set_vector_io_read_multiplier(1);
+        } else {
+            hw_counter.set_vector_io_read_multiplier(0);
+        }
+
         let mut search_context = SearchContext::new(
             sparse_vector,
             top,
             &self.inverted_index,
             memory_handle,
             &is_stopped,
+            &hw_counter,
         );
         let search_result = search_context.plain_search(&ids);
-        vector_query_context.apply_hardware_counter(search_context.take_hardware_counter());
         Ok(search_result)
     }
 
@@ -386,30 +407,33 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
 
         let sparse_vector = self.indices_tracker.remap_vector(sparse_vector.clone());
         let memory_handle = self.scores_memory_pool.get();
+        let mut hw_counter = vector_query_context.hardware_counter();
+        let is_index_on_disk = self.config.index_type.is_on_disk();
+        if is_index_on_disk {
+            hw_counter.set_vector_io_read_multiplier(1);
+        } else {
+            hw_counter.set_vector_io_read_multiplier(0);
+        }
+
         let mut search_context = SearchContext::new(
             sparse_vector,
             top,
             &self.inverted_index,
             memory_handle,
             &is_stopped,
+            &hw_counter,
         );
 
         match filter {
             Some(filter) => {
                 let payload_index = self.payload_index.borrow();
-                let filter_context = payload_index.filter_context(filter);
+                let filter_context = payload_index.filter_context(filter, &hw_counter);
                 let matches_filter_condition = |idx: PointOffsetType| -> bool {
                     not_deleted_condition(idx) && filter_context.check(idx)
                 };
-                let res = search_context.search(&matches_filter_condition);
-                vector_query_context.apply_hardware_counter(search_context.take_hardware_counter());
-                res
+                search_context.search(&matches_filter_condition)
             }
-            None => {
-                let res = search_context.search(&not_deleted_condition);
-                vector_query_context.apply_hardware_counter(search_context.take_hardware_counter());
-                res
-            }
+            None => search_context.search(&not_deleted_condition),
         }
     }
 
@@ -428,7 +452,8 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
         match filter {
             Some(filter) => {
                 // if cardinality is small - use plain search
-                let query_cardinality = self.get_query_cardinality(filter);
+                let query_cardinality =
+                    self.get_query_cardinality(filter, &vector_query_context.hardware_counter());
                 let threshold = self
                     .config
                     .full_scan_threshold
@@ -494,11 +519,16 @@ impl<TInvertedIndex: InvertedIndex> SparseVectorIndex<TInvertedIndex> {
     }
 
     // Update statistics for idf-dot similarity
-    pub fn fill_idf_statistics(&self, idf: &mut HashMap<DimId, usize>) {
+    pub fn fill_idf_statistics(
+        &self,
+        idf: &mut HashMap<DimId, usize>,
+        hw_counter: &HardwareCounterCell,
+    ) {
         for (dim_id, count) in idf.iter_mut() {
             if let Some(remapped_dim_id) = self.indices_tracker.remap_index(*dim_id) {
-                if let Some(posting_list_len) =
-                    self.inverted_index.posting_list_len(&remapped_dim_id)
+                if let Some(posting_list_len) = self
+                    .inverted_index
+                    .posting_list_len(&remapped_dim_id, hw_counter)
                 {
                     *count += posting_list_len
                 }
@@ -570,23 +600,32 @@ impl<TInvertedIndex: InvertedIndex> VectorIndex for SparseVectorIndex<TInvertedI
         self.inverted_index.vector_count()
     }
 
+    fn size_of_searchable_vectors_in_bytes(&self) -> usize {
+        self.inverted_index.total_sparse_vectors_size()
+    }
+
     fn update_vector(
         &mut self,
         id: PointOffsetType,
         vector: Option<VectorRef>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         let (old_vector, new_vector) = {
             let mut vector_storage = self.vector_storage.borrow_mut();
             let old_vector = vector_storage.get_vector_opt(id).map(CowVector::to_owned);
             let new_vector = if let Some(vector) = vector {
-                vector_storage.insert_vector(id, vector)?;
+                vector_storage.insert_vector(id, vector, hw_counter)?;
                 vector.to_owned()
             } else {
                 let default_vector = vector_storage.default_vector();
                 if id as usize >= vector_storage.total_vector_count() {
                     // Vector doesn't exist in the storage
                     // Insert default vector to keep the sequence
-                    vector_storage.insert_vector(id, VectorRef::from(&default_vector))?;
+                    vector_storage.insert_vector(
+                        id,
+                        VectorRef::from(&default_vector),
+                        hw_counter,
+                    )?;
                 }
                 vector_storage.delete_vector(id)?;
                 default_vector

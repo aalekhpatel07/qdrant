@@ -100,6 +100,7 @@ message DeleteFieldIndexCollectionInternal {
 message PointsOperationResponseInternal {
   UpdateResultInternal result = 1;
   double time = 2; // Time spent to process
+  optional HardwareUsage usage = 3;
 }
 
 // Has to be backward compatible with `UpdateResult`!
@@ -244,6 +245,7 @@ message QueryShardPoints {
       Fusion fusion = 2; // One of the fusion methods
       OrderBy order_by = 3; // Order by a field
       Sample sample = 4; // Sample points
+      Formula formula = 5; // Use an arbitrary formula to rescore points
     }
   }
 
@@ -317,4 +319,5 @@ message FacetHitInternal {
 message FacetResponseInternal {
     repeated FacetHitInternal hits = 1;
     double time = 2; // Time spent to process
+    optional HardwareUsage usage = 3;
 }

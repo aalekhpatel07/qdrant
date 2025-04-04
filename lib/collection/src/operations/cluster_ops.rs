@@ -4,6 +4,7 @@ use common::validation::validate_shard_different_peers;
 use schemars::JsonSchema;
 use segment::types::ShardKey;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use validator::{Validate, ValidationErrors};
 
 use crate::shards::shard::{PeerId, ShardId};
@@ -28,22 +29,20 @@ pub enum ClusterOperations {
     RestartTransfer(RestartTransferOperation),
 
     /// Start resharding
-    #[schemars(skip)]
     StartResharding(StartReshardingOperation),
     /// Finish migrating points on specified shard, mark shard as `Active`
-    #[schemars(skip)]
+    #[schemars(skip)] // hide for internal use
     FinishMigratingPoints(FinishMigratingPointsOperation),
     /// Commit read hashring
-    #[schemars(skip)]
+    #[schemars(skip)] // hide for internal use
     CommitReadHashRing(CommitReadHashRingOperation),
     /// Commit write hashring
-    #[schemars(skip)]
+    #[schemars(skip)] // hide for internal use
     CommitWriteHashRing(CommitWriteHashRingOperation),
     /// Finish resharding
-    #[schemars(skip)]
+    #[schemars(skip)] // hide for internal use
     FinishResharding(FinishReshardingOperation),
     /// Abort resharding
-    #[schemars(skip)]
     AbortResharding(AbortReshardingOperation),
 }
 
@@ -71,6 +70,7 @@ pub struct CreateShardingKey {
     pub shard_key: ShardKey,
     /// How many shards to create for this key
     /// If not specified, will use the default value from config
+    #[serde(alias = "shard_number")]
     pub shards_number: Option<NonZeroU32>,
     /// How many replicas to create for each shard
     /// If not specified, will use the default value from config
@@ -92,7 +92,7 @@ pub struct DropShardingKey {
 pub struct RestartTransfer {
     pub shard_id: ShardId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(skip)] // TODO(resharding): expose once we release resharding
+    #[schemars(skip)] // hide for internal use
     pub to_shard_id: Option<ShardId>,
     pub from_peer_id: PeerId,
     pub to_peer_id: PeerId,
@@ -190,7 +190,7 @@ pub struct FinishReshardingOperation {
 pub struct ReplicateShard {
     pub shard_id: ShardId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(skip)] // TODO(resharding): expose once we release resharding
+    #[schemars(skip)] // hide for internal use
     pub to_shard_id: Option<ShardId>,
     pub to_peer_id: PeerId,
     pub from_peer_id: PeerId,
@@ -214,7 +214,7 @@ impl Validate for ReplicateShard {
 pub struct MoveShard {
     pub shard_id: ShardId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(skip)] // TODO(resharding): expose once we release resharding
+    #[schemars(skip)] // hide for internal use
     pub to_shard_id: Option<ShardId>,
     pub to_peer_id: PeerId,
     pub from_peer_id: PeerId,
@@ -256,7 +256,7 @@ pub struct Replica {
 pub struct AbortShardTransfer {
     pub shard_id: ShardId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(skip)] // TODO(resharding): expose once we release resharding
+    #[schemars(skip)] // hide for internal use
     pub to_shard_id: Option<ShardId>,
     pub to_peer_id: PeerId,
     pub from_peer_id: PeerId,
@@ -264,6 +264,8 @@ pub struct AbortShardTransfer {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, Validate)]
 pub struct StartResharding {
+    #[schemars(skip)]
+    pub uuid: Option<Uuid>,
     pub direction: ReshardingDirection,
     pub peer_id: Option<PeerId>,
     pub shard_key: Option<ShardKey>,

@@ -206,6 +206,8 @@ impl Validate for grpc::FieldCondition {
             geo_radius,
             geo_polygon,
             values_count,
+            is_empty,
+            is_null,
         } = self;
 
         let all_fields_none = r#match.is_none()
@@ -214,7 +216,9 @@ impl Validate for grpc::FieldCondition {
             && geo_bounding_box.is_none()
             && geo_radius.is_none()
             && geo_polygon.is_none()
-            && values_count.is_none();
+            && values_count.is_none()
+            && is_empty.is_none()
+            && is_null.is_none();
 
         if all_fields_none {
             let mut errors = ValidationErrors::new();
@@ -231,7 +235,18 @@ impl Validate for grpc::FieldCondition {
 
 impl Validate for grpc::Vector {
     fn validate(&self) -> Result<(), ValidationErrors> {
-        match (&self.indices, self.vectors_count) {
+        let grpc::Vector {
+            data,
+            indices,
+            vectors_count,
+            vector,
+        } = self;
+
+        if let Some(vector) = vector {
+            vector.validate()?;
+        }
+
+        match (indices, vectors_count) {
             (Some(_), Some(_)) => {
                 let mut errors = ValidationErrors::new();
                 errors.add(
@@ -240,15 +255,42 @@ impl Validate for grpc::Vector {
                 );
                 Err(errors)
             }
-            (Some(indices), None) => sparse::common::sparse_vector::validate_sparse_vector_impl(
-                &indices.data,
-                &self.data,
-            ),
+            (Some(indices), None) => {
+                sparse::common::sparse_vector::validate_sparse_vector_impl(&indices.data, data)
+            }
             (None, Some(vectors_count)) => {
-                common::validation::validate_multi_vector_len(vectors_count, &self.data)
+                common::validation::validate_multi_vector_len(*vectors_count, data)
             }
             (None, None) => Ok(()),
         }
+    }
+}
+
+impl Validate for grpc::vector::Vector {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            grpc::vector::Vector::Dense(_dense) => Ok(()),
+            grpc::vector::Vector::Sparse(sparse) => sparse.validate(),
+            grpc::vector::Vector::MultiDense(multi) => multi.validate(),
+            grpc::vector::Vector::Document(_document) => Ok(()),
+            grpc::vector::Vector::Image(_image) => Ok(()),
+            grpc::vector::Vector::Object(_obj) => Ok(()),
+        }
+    }
+}
+
+impl Validate for grpc::SparseVector {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        let grpc::SparseVector { indices, values } = self;
+        sparse::common::sparse_vector::validate_sparse_vector_impl(indices, values)
+    }
+}
+
+impl Validate for grpc::MultiDenseVector {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        let grpc::MultiDenseVector { vectors } = self;
+        let multivec_length: Vec<_> = vectors.iter().map(|v| v.data.len()).collect();
+        common::validation::validate_multi_vector_by_length(&multivec_length)
     }
 }
 
@@ -270,71 +312,6 @@ impl Validate for super::qdrant::query_enum::Query {
             super::qdrant::query_enum::Query::Context(q) => q.validate(),
         }
     }
-}
-
-/// Validate the value is in `[1, ]`.
-pub fn validate_u64_range_min_1(value: &u64) -> Result<(), ValidationError> {
-    validate_range_generic(value, Some(&1), None)
-}
-
-/// Validate the value is in `[2, ]`.
-pub fn validate_u64_range_min_2(value: &u64) -> Result<(), ValidationError> {
-    validate_range_generic(value, Some(&2), None)
-}
-
-/// Validate the value is in `[1, ]`.
-pub fn validate_u32_range_min_1(value: &u32) -> Result<(), ValidationError> {
-    validate_range_generic(value, Some(&1), None)
-}
-
-/// Validate the value is in `[100, ]`.
-pub fn validate_u64_range_min_100(value: &u64) -> Result<(), ValidationError> {
-    validate_range_generic(value, Some(&100), None)
-}
-
-/// Validate the value is in `[1000, ]`.
-pub fn validate_u64_range_min_1000(value: &u64) -> Result<(), ValidationError> {
-    validate_range_generic(value, Some(&1000), None)
-}
-
-/// Validate the value is in `[4, ]`.
-pub fn validate_u64_range_min_4(value: &u64) -> Result<(), ValidationError> {
-    validate_range_generic(value, Some(&4), None)
-}
-
-/// Validate the value is in `[4, 10000]`.
-pub fn validate_u64_range_min_4_max_10000(value: &u64) -> Result<(), ValidationError> {
-    validate_range_generic(value, Some(&4), Some(&10_000))
-}
-
-/// Validate the value is in `[0.5, 1.0]`.
-pub fn validate_f32_range_min_0_5_max_1(value: &f32) -> Result<(), ValidationError> {
-    validate_range_generic(value, Some(&0.5), Some(&1.0))
-}
-
-/// Validate the value is in `[0.0, 1.0]`.
-pub fn validate_f64_range_1(value: &f64) -> Result<(), ValidationError> {
-    validate_range_generic(value, Some(&0.0), Some(&1.0))
-}
-
-/// Validate the value is in `[1.0, ]`.
-pub fn validate_f64_range_min_1(value: &f64) -> Result<(), ValidationError> {
-    validate_range_generic(value, Some(&1.0), None)
-}
-
-/// Validate the list of named vectors is not empty.
-pub fn validate_named_vectors_not_empty(
-    value: &Option<grpc::NamedVectors>,
-) -> Result<(), ValidationError> {
-    // If length is non-zero, we're good
-    match value {
-        Some(vectors) if !vectors.vectors.is_empty() => return Ok(()),
-        Some(_) | None => {}
-    }
-
-    let mut err = ValidationError::new("length");
-    err.add_param(Cow::from("min"), &1);
-    Err(err)
 }
 
 /// Validate that GeoLineString has at least 4 points and is closed.

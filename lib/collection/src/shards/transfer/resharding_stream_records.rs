@@ -4,12 +4,13 @@ use common::counter::hardware_accumulator::HwMeasurementAcc;
 use parking_lot::Mutex;
 
 use super::transfer_tasks_pool::TransferTaskProgress;
+use crate::hash_ring::HashRingRouter;
 use crate::operations::types::{CollectionError, CollectionResult, CountRequestInternal};
+use crate::shards::CollectionId;
 use crate::shards::remote_shard::RemoteShard;
 use crate::shards::shard::ShardId;
 use crate::shards::shard_holder::LockedShardHolder;
 use crate::shards::transfer::stream_records::TRANSFER_BATCH_SIZE;
-use crate::shards::CollectionId;
 
 /// Orchestrate shard transfer by streaming records, but only the points that fall into the new
 /// shard.
@@ -64,15 +65,15 @@ pub(crate) async fn transfer_resharding_stream_records(
             .proxify_local(remote_shard.clone(), Some(hashring.clone()))
             .await?;
 
-        let hw_acc = HwMeasurementAcc::new();
+        let hw_acc = HwMeasurementAcc::disposable();
         let Some(count_result) = replica_set
             .count_local(
                 Arc::new(CountRequestInternal {
                     filter: None,
-                    exact: true,
+                    exact: false,
                 }),
                 None,
-                &hw_acc,
+                hw_acc,
             )
             .await?
         else {
@@ -80,8 +81,52 @@ pub(crate) async fn transfer_resharding_stream_records(
                 "Shard {shard_id} not found"
             )));
         };
-        progress.lock().points_total = count_result.count;
-        hw_acc.discard();
+
+        // Resharding up:
+        //
+        // - shards: 1 -> 2
+        //   points: 100 -> 50/50
+        //   transfer points of each shard: 50/1 = 50 -> 50/100 = 50%
+        //   transfer fraction to each shard: 1/new_shard_count = 1/2 = 0.5
+        // - shards: 2 -> 3
+        //   points: 50/50 -> 33/33/33
+        //   transfer points of each shard: 33/2 = 16.5 -> 16.5/50 = 33%
+        //   transfer fraction to each shard: 1/new_shard_count = 1/3 = 0.33
+        // - shards: 3 -> 4
+        //   points: 33/33/33 -> 25/25/25/25
+        //   transfer points of each shard: 25/3 = 8.3 -> 8.3/33 = 25%
+        //   transfer fraction to each shard: 1/new_shard_count = 1/4 = 0.25
+        //
+        // Resharding down:
+        //
+        // - shards: 2 -> 1
+        //   points: 50/50 -> 100
+        //   transfer points of each shard: 50/1 = 50 -> 50/50 = 100%
+        //   transfer fraction to each shard: 1/new_shard_count = 1/1 = 1.0
+        // - shards: 3 -> 2
+        //   points: 33/33/33 -> 50/50
+        //   transfer points of each shard: 33/2 = 16.5 -> 16.5/33 = 50%
+        //   transfer fraction to each shard: 1/new_shard_count = 1/2 = 0.5
+        // - shards: 4 -> 3
+        //   points: 25/25/25/25 -> 33/33/33
+        //   transfer points of each shard: 25/3 = 8.3 -> 8.3/25 = 33%
+        //   transfer fraction to each shard: 1/new_shard_count = 1/3 = 0.33
+        let new_shard_count = match &hashring {
+            HashRingRouter::Single(_) => {
+                return Err(CollectionError::service_error(format!(
+                    "Failed to do resharding transfer, hash ring for shard {shard_id} not in resharding state",
+                )));
+            }
+            HashRingRouter::Resharding { old, new } => {
+                debug_assert!(
+                    old.len().abs_diff(new.len()) <= 1,
+                    "expects resharding to only move up or down by one shard",
+                );
+                new.len()
+            }
+        };
+        let transfer_size = count_result.count / new_shard_count;
+        progress.lock().set(0, transfer_size);
 
         replica_set.transfer_indexes().await?;
 
@@ -105,17 +150,12 @@ pub(crate) async fn transfer_resharding_stream_records(
             )));
         };
 
-        offset = replica_set
+        let (new_offset, count) = replica_set
             .transfer_batch(offset, TRANSFER_BATCH_SIZE, Some(&hashring), true)
             .await?;
 
-        {
-            let mut progress = progress.lock();
-            let transferred =
-                (progress.points_transferred + TRANSFER_BATCH_SIZE).min(progress.points_total);
-            progress.points_transferred = transferred;
-            progress.eta.set_progress(transferred);
-        }
+        offset = new_offset;
+        progress.lock().add(count);
 
         // If this is the last batch, finalize
         if offset.is_none() {

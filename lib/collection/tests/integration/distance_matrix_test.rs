@@ -7,6 +7,7 @@ use common::counter::hardware_accumulator::HwMeasurementAcc;
 use itertools::Itertools;
 use rand::prelude::SmallRng;
 use rand::{Rng, SeedableRng};
+use segment::data_types::vectors::DEFAULT_VECTOR_NAME;
 use tempfile::Builder;
 
 use crate::common::simple_collection_fixture;
@@ -27,13 +28,12 @@ async fn distance_matrix_empty() {
         sample_size,
         limit_per_sample,
         filter: None,
-        using: "".to_string(), // default vector name
+        using: DEFAULT_VECTOR_NAME.to_owned(),
     };
     let matrix = collection
-        .search_points_matrix(request, ShardSelectorInternal::All, None, None, &hw_acc)
+        .search_points_matrix(request, ShardSelectorInternal::All, None, None, hw_acc)
         .await
         .unwrap();
-    hw_acc.discard();
 
     // assert all empty
     assert!(matrix.sample_ids.is_empty());
@@ -51,7 +51,7 @@ async fn distance_matrix_anonymous_vector() {
     let mut rng = SmallRng::seed_from_u64(SEED);
 
     let vectors = (0..point_count)
-        .map(|_| rng.gen::<[f32; 4]>().to_vec())
+        .map(|_| rng.random::<[f32; 4]>().to_vec())
         .collect_vec();
 
     let batch = BatchPersisted {
@@ -66,8 +66,9 @@ async fn distance_matrix_anonymous_vector() {
         ),
     );
 
+    let hw_counter = HwMeasurementAcc::new();
     collection
-        .update_from_client_simple(upsert_points, true, WriteOrdering::default())
+        .update_from_client_simple(upsert_points, true, WriteOrdering::default(), hw_counter)
         .await
         .unwrap();
 
@@ -78,13 +79,12 @@ async fn distance_matrix_anonymous_vector() {
         sample_size,
         limit_per_sample,
         filter: None,
-        using: "".to_string(), // default vector name
+        using: DEFAULT_VECTOR_NAME.to_owned(),
     };
     let matrix = collection
-        .search_points_matrix(request, ShardSelectorInternal::All, None, None, &hw_acc)
+        .search_points_matrix(request, ShardSelectorInternal::All, None, None, hw_acc)
         .await
         .unwrap();
-    hw_acc.discard();
 
     assert_eq!(matrix.sample_ids.len(), sample_size);
     // no duplicate sample ids

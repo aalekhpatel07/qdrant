@@ -283,7 +283,9 @@ mod tests {
             geo_bounding_box: None,
             geo_radius: None,
             values_count: None,
+            is_empty: None,
             geo_polygon: None,
+            is_null: None,
         })
     }
 
@@ -294,19 +296,19 @@ mod tests {
             Condition::CustomIdChecker(_) => panic!("unexpected CustomIdChecker"),
             Condition::Field(field) => match field.key.to_string().as_str() {
                 "color" => CardinalityEstimation {
-                    primary_clauses: vec![PrimaryCondition::Condition(field.clone())],
+                    primary_clauses: vec![PrimaryCondition::Condition(Box::new(field.clone()))],
                     min: 100,
                     exp: 200,
                     max: 300,
                 },
                 "size" => CardinalityEstimation {
-                    primary_clauses: vec![PrimaryCondition::Condition(field.clone())],
+                    primary_clauses: vec![PrimaryCondition::Condition(Box::new(field.clone()))],
                     min: 100,
                     exp: 100,
                     max: 100,
                 },
                 "price" => CardinalityEstimation {
-                    primary_clauses: vec![PrimaryCondition::Condition(field.clone())],
+                    primary_clauses: vec![PrimaryCondition::Condition(Box::new(field.clone()))],
                     min: 10,
                     exp: 15,
                     max: 20,
@@ -326,13 +328,17 @@ mod tests {
                 max: has_id.has_id.len(),
             },
             Condition::IsEmpty(condition) => CardinalityEstimation {
-                primary_clauses: vec![PrimaryCondition::IsEmpty(condition.to_owned())],
+                primary_clauses: vec![PrimaryCondition::Condition(Box::new(
+                    FieldCondition::new_is_empty(condition.is_empty.key.clone()),
+                ))],
                 min: 0,
                 exp: TOTAL / 2,
                 max: TOTAL,
             },
             Condition::IsNull(condition) => CardinalityEstimation {
-                primary_clauses: vec![PrimaryCondition::IsNull(condition.to_owned())],
+                primary_clauses: vec![PrimaryCondition::Condition(Box::new(
+                    FieldCondition::new_is_null(condition.is_null.key.clone()),
+                ))],
                 min: 0,
                 exp: TOTAL / 2,
                 max: TOTAL,

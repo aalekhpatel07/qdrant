@@ -30,7 +30,7 @@ impl EtaCalculator {
     }
 
     fn set_progress_raw(&mut self, now: Instant, current_progress: usize) {
-        if self.0.back().map_or(false, |(_, l)| current_progress < *l) {
+        if self.0.back().is_some_and(|(_, l)| current_progress < *l) {
             // Progress went backwards, reset the state.
             *self = Self::new();
         }
@@ -97,9 +97,10 @@ mod tests {
             max_relative = 0.02,
         );
         // Emulate a stall.
-        assert!(eta
-            .estimate_raw(now + Duration::from_secs(20), 100)
-            .is_none());
+        assert!(
+            eta.estimate_raw(now + Duration::from_secs(20), 100)
+                .is_none(),
+        );
 
         // Change the speed.
         let delta = Duration::from_millis(5000);

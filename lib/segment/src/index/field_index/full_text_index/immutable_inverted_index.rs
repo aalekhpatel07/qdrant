@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::mmap_hashmap::BUCKET_OFFSET_OVERHEAD;
 use common::types::PointOffsetType;
 
 use super::inverted_index::InvertedIndex;
@@ -10,7 +12,7 @@ use crate::index::field_index::full_text_index::mutable_inverted_index::MutableI
 use crate::index::field_index::full_text_index::postings_iterator::intersect_compressed_postings_iterator;
 
 #[cfg_attr(test, derive(Clone))]
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct ImmutableInvertedIndex {
     pub(in crate::index::field_index::full_text_index) postings: Vec<CompressedPostingList>,
     pub(in crate::index::field_index::full_text_index) vocab: HashMap<String, TokenId>,
@@ -27,6 +29,7 @@ impl InvertedIndex for ImmutableInvertedIndex {
         &mut self,
         _idx: PointOffsetType,
         _document: super::inverted_index::Document,
+        _hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         Err(OperationError::service_error(
             "Can't add values to immutable text index",
@@ -42,14 +45,21 @@ impl InvertedIndex for ImmutableInvertedIndex {
         true
     }
 
-    fn filter(&self, query: &ParsedQuery) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
+    fn filter<'a>(
+        &'a self,
+        query: ParsedQuery,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> Box<dyn Iterator<Item = PointOffsetType> + 'a> {
         let postings_opt: Option<Vec<_>> = query
             .tokens
             .iter()
             .map(|&token_id| match token_id {
                 None => None,
                 // if a ParsedQuery token was given an index, then it must exist in the vocabulary
-                Some(idx) => self.postings.get(idx as usize),
+                Some(idx) => {
+                    let postings = self.postings.get(idx as usize);
+                    postings
+                }
             })
             .collect();
 
@@ -59,7 +69,10 @@ impl InvertedIndex for ImmutableInvertedIndex {
             _ => return Box::new(vec![].into_iter()),
         };
 
-        let posting_readers: Vec<_> = postings.iter().map(|posting| posting.reader()).collect();
+        let posting_readers: Vec<_> = postings
+            .iter()
+            .map(|posting| posting.reader(hw_counter))
+            .collect();
 
         // in case of immutable index, deleted documents are still in the postings
         let filter =
@@ -68,8 +81,16 @@ impl InvertedIndex for ImmutableInvertedIndex {
         intersect_compressed_postings_iterator(posting_readers, filter)
     }
 
-    fn get_posting_len(&self, token_id: TokenId) -> Option<usize> {
-        self.postings.get(token_id as usize).map(|p| p.len())
+    fn get_posting_len(
+        &self,
+        token_id: TokenId,
+        hw_counter: &HardwareCounterCell,
+    ) -> Option<usize> {
+        let len = self.postings.get(token_id as usize).map(|p| p.len());
+        hw_counter
+            .payload_index_io_read_counter()
+            .incr_delta(size_of::<Option<CompressedPostingList>>());
+        len
     }
 
     fn vocab_with_postings_len_iter(&self) -> impl Iterator<Item = (&str, usize)> + '_ {
@@ -80,7 +101,12 @@ impl InvertedIndex for ImmutableInvertedIndex {
         })
     }
 
-    fn check_match(&self, parsed_query: &ParsedQuery, point_id: PointOffsetType) -> bool {
+    fn check_match(
+        &self,
+        parsed_query: &ParsedQuery,
+        point_id: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> bool {
         if parsed_query.tokens.contains(&None) {
             return false;
         }
@@ -93,13 +119,16 @@ impl InvertedIndex for ImmutableInvertedIndex {
             .tokens
             .iter()
             // unwrap crash safety: all tokens exist in the vocabulary if it passes the above check
-            .all(|query_token| self.postings[query_token.unwrap() as usize].contains(point_id))
+            .all(|query_token| {
+                let postings = &self.postings[query_token.unwrap() as usize];
+                postings.reader(hw_counter).contains(point_id)
+            })
     }
 
     fn values_is_empty(&self, point_id: PointOffsetType) -> bool {
         self.point_to_tokens_count
             .get(point_id as usize)
-            .map_or(true, |count| count.is_none())
+            .is_none_or(|count| count.is_none())
     }
 
     fn values_count(&self, point_id: PointOffsetType) -> usize {
@@ -113,7 +142,10 @@ impl InvertedIndex for ImmutableInvertedIndex {
         self.points_count
     }
 
-    fn get_token_id(&self, token: &str) -> Option<TokenId> {
+    fn get_token_id(&self, token: &str, hw_counter: &HardwareCounterCell) -> Option<TokenId> {
+        hw_counter
+            .payload_index_io_read_counter()
+            .incr_delta(BUCKET_OFFSET_OVERHEAD + size_of::<TokenId>());
         self.vocab.get(token).copied()
     }
 }

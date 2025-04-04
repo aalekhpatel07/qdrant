@@ -1,4 +1,3 @@
-use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::{PointOffsetType, ScoreType};
 
 use crate::data_types::primitive::PrimitiveVectorElement;
@@ -24,12 +23,10 @@ pub trait QueryScorer<TVector: ?Sized> {
     fn score(&self, v2: &TVector) -> ScoreType;
 
     fn score_internal(&self, point_a: PointOffsetType, point_b: PointOffsetType) -> ScoreType;
-
-    fn take_hardware_counter(&self) -> HardwareCounterCell;
 }
 
 /// Colbert MaxSim metric, metric for multi-dense vectors
-/// https://arxiv.org/pdf/2112.01488.pdf, figure 1
+/// <https://arxiv.org/pdf/2112.01488.pdf>, figure 1
 /// This metric is also implemented in `QuantizedMultivectorStorage` structure for quantized data.
 pub fn score_max_similarity<T: PrimitiveVectorElement, TMetric: Metric<T>>(
     multi_dense_a: TypedMultiDenseVectorRef<T>,

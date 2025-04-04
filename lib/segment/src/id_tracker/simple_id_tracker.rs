@@ -10,12 +10,12 @@ use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::common::Flusher;
 use crate::common::operation_error::OperationResult;
 use crate::common::rocksdb_buffered_update_wrapper::DatabaseColumnScheduledUpdateWrapper;
-use crate::common::rocksdb_wrapper::{DatabaseColumnWrapper, DB_MAPPING_CF, DB_VERSIONS_CF};
-use crate::common::Flusher;
-use crate::id_tracker::point_mappings::PointMappings;
+use crate::common::rocksdb_wrapper::{DB_MAPPING_CF, DB_VERSIONS_CF, DatabaseColumnWrapper};
 use crate::id_tracker::IdTracker;
+use crate::id_tracker::point_mappings::PointMappings;
 use crate::types::{ExtendedPointId, PointIdType, SeqNumberType};
 
 /// Point Id type used for storing ids internally
@@ -121,9 +121,7 @@ impl SimpleIdTracker {
                 // This should not happen in normal operation, but it can happen if
                 // the database is corrupted.
                 log::warn!(
-                    "removing duplicated external id {} in internal id {}",
-                    external_id,
-                    replaced_id
+                    "removing duplicated external id {external_id} in internal id {replaced_id}",
                 );
                 match replaced_id {
                     PointIdType::NumId(idx) => {
@@ -146,7 +144,8 @@ impl SimpleIdTracker {
             }
         }
 
-        let mut internal_to_version: Vec<SeqNumberType> = Default::default();
+        let mut internal_to_version: Vec<SeqNumberType> =
+            Vec::with_capacity(internal_to_external.len());
         let versions_db_wrapper = DatabaseColumnScheduledUpdateWrapper::new(
             DatabaseColumnWrapper::new(store, DB_VERSIONS_CF),
         );
@@ -164,28 +163,20 @@ impl SimpleIdTracker {
                 internal_to_version[internal_id as usize] = version;
             } else {
                 log::debug!(
-                    "Found version without internal id, external id: {}",
-                    external_id
+                    "Found version: {version} without internal id, external id: {external_id}"
                 );
             }
         }
-        #[cfg(debug_assertions)]
-        {
-            for (idx, id) in external_to_internal_num.iter() {
-                debug_assert!(
-                    internal_to_external[*id as usize] == PointIdType::NumId(*idx),
-                    "Internal id {id} is mapped to external id {}, but should be {}",
-                    internal_to_external[*id as usize],
-                    PointIdType::NumId(*idx)
-                );
-            }
-        }
+
         let mappings = PointMappings::new(
             deleted,
             internal_to_external,
             external_to_internal_num,
             external_to_internal_uuid,
         );
+
+        #[cfg(debug_assertions)]
+        mappings.assert_mappings();
 
         Ok(SimpleIdTracker {
             internal_to_version,
@@ -212,7 +203,11 @@ impl SimpleIdTracker {
         Ok(())
     }
 
-    fn persist_key(&self, external_id: &PointIdType, internal_id: usize) -> OperationResult<()> {
+    fn persist_key(
+        &self,
+        external_id: &PointIdType,
+        internal_id: PointOffsetType,
+    ) -> OperationResult<()> {
         self.mapping_db_wrapper.put(
             Self::store_key(external_id),
             bincode::serialize(&internal_id).unwrap(),
@@ -232,6 +227,16 @@ impl IdTracker for SimpleIdTracker {
     ) -> OperationResult<()> {
         if let Some(external_id) = self.external_id(internal_id) {
             if internal_id as usize >= self.internal_to_version.len() {
+                #[cfg(debug_assertions)]
+                {
+                    if internal_id as usize > self.internal_to_version.len() + 1 {
+                        log::info!(
+                            "Resizing versions is initializing larger range {} -> {}",
+                            self.internal_to_version.len(),
+                            internal_id + 1,
+                        );
+                    }
+                }
                 self.internal_to_version.resize(internal_id as usize + 1, 0);
             }
             self.internal_to_version[internal_id as usize] = version;
@@ -337,9 +342,9 @@ impl IdTracker for SimpleIdTracker {
         }
         for external_id in to_remove {
             self.drop(external_id)?;
-            #[cfg(debug_assertions)] // Only for dev builds
+            #[cfg(debug_assertions)]
             {
-                log::debug!("dropped version for point {} without version", external_id);
+                log::debug!("dropped version for point {external_id} without version");
             }
         }
         Ok(())
@@ -361,7 +366,7 @@ mod tests {
     use tempfile::Builder;
 
     use super::*;
-    use crate::common::rocksdb_wrapper::{open_db, DB_VECTOR_CF};
+    use crate::common::rocksdb_wrapper::{DB_VECTOR_CF, open_db};
 
     fn check_bincode_serialization<
         T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,

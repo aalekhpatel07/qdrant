@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::{max, min};
 use std::collections::BinaryHeap;
 use std::path::Path;
@@ -6,15 +7,17 @@ use std::sync::atomic::AtomicUsize;
 use bitvec::prelude::BitVec;
 use common::fixed_length_priority_queue::FixedLengthPriorityQueue;
 use common::types::{PointOffsetType, ScoreType, ScoredPointOffset};
+use io::file_operations::atomic_save_bin;
 use parking_lot::{Mutex, MutexGuard, RwLock};
-use rand::distributions::Uniform;
 use rand::Rng;
+use rand::distr::Uniform;
 
-use super::graph_links::GraphLinks;
+use super::graph_layers::GraphLayerData;
+use super::graph_links::{GraphLinks, GraphLinksFormat};
 use crate::common::operation_error::OperationResult;
 use crate::index::hnsw_index::entry_points::EntryPoints;
 use crate::index::hnsw_index::graph_layers::{GraphLayers, GraphLayersBase, LinkContainer};
-use crate::index::hnsw_index::graph_links::GraphLinksConverter;
+use crate::index::hnsw_index::graph_links::GraphLinksSerializer;
 use crate::index::hnsw_index::point_scorer::FilteredScorer;
 use crate::index::hnsw_index::search_context::SearchContext;
 use crate::index::visited_pool::{VisitedListHandle, VisitedPool};
@@ -62,11 +65,7 @@ impl GraphLayersBase for GraphLayersBuilder {
     }
 
     fn get_m(&self, level: usize) -> usize {
-        if level == 0 {
-            self.m0
-        } else {
-            self.m
-        }
+        if level == 0 { self.m0 } else { self.m }
     }
 }
 
@@ -75,30 +74,92 @@ impl GraphLayersBuilder {
         self.entry_points.lock()
     }
 
-    pub fn into_graph_layers<TGraphLinks: GraphLinks>(
+    pub fn into_graph_layers(
         self,
-        path: Option<&Path>,
-    ) -> OperationResult<GraphLayers<TGraphLinks>> {
-        let unlocker_links_layers = self
-            .links_layers
-            .into_iter()
-            .map(|l| l.into_iter().map(|l| l.into_inner()).collect())
-            .collect();
+        path: &Path,
+        format: GraphLinksFormat,
+        on_disk: bool,
+    ) -> OperationResult<GraphLayers> {
+        let links_path = GraphLayers::get_links_path(path, format);
 
-        let mut links_converter = GraphLinksConverter::new(unlocker_links_layers);
-        if let Some(path) = path {
-            links_converter.save_as(path)?;
-        }
+        let serializer =
+            Self::links_layers_to_serializer(self.links_layers, format, self.m, self.m0);
+        serializer.save_as(&links_path)?;
 
-        let links = TGraphLinks::from_converter(links_converter)?;
-        Ok(GraphLayers {
+        let links = if on_disk {
+            GraphLinks::load_from_file(&links_path, true, format)?
+        } else {
+            serializer.to_graph_links_ram()
+        };
+
+        let entry_points = self.entry_points.into_inner();
+
+        let data = GraphLayerData {
             m: self.m,
             m0: self.m0,
             ef_construct: self.ef_construct,
+            entry_points: Cow::Borrowed(&entry_points),
+        };
+        atomic_save_bin(&GraphLayers::get_path(path), &data)?;
+
+        Ok(GraphLayers {
+            m: self.m,
+            m0: self.m0,
             links,
-            entry_points: self.entry_points.into_inner(),
+            entry_points,
             visited_pool: self.visited_pool,
         })
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn into_graph_layers_ram(self, format: GraphLinksFormat) -> GraphLayers {
+        GraphLayers {
+            m: self.m,
+            m0: self.m0,
+            links: Self::links_layers_to_serializer(self.links_layers, format, self.m, self.m0)
+                .to_graph_links_ram(),
+            entry_points: self.entry_points.into_inner(),
+            visited_pool: self.visited_pool,
+        }
+    }
+
+    fn links_layers_to_serializer(
+        link_layers: Vec<LockedLayersContainer>,
+        format: GraphLinksFormat,
+        m: usize,
+        m0: usize,
+    ) -> GraphLinksSerializer {
+        let edges = link_layers
+            .into_iter()
+            .map(|l| l.into_iter().map(|l| l.into_inner()).collect())
+            .collect();
+        GraphLinksSerializer::new(edges, format, m, m0)
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn m(&self) -> usize {
+        self.m
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn m0(&self) -> usize {
+        self.m0
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn ef_construct(&self) -> usize {
+        self.ef_construct
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn links_layers(&self) -> &[LockedLayersContainer] {
+        &self.links_layers
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn clear_ready_list(&mut self) {
+        let num_vectors = self.num_points();
+        self.ready_list = RwLock::new(BitVec::repeat(true, num_vectors));
     }
 
     pub fn new_with_params(
@@ -200,13 +261,13 @@ impl GraphLayersBuilder {
     where
         R: Rng + ?Sized,
     {
-        let distribution = Uniform::new(0.0, 1.0);
+        let distribution = Uniform::new(0.0, 1.0).unwrap();
         let sample: f64 = rng.sample(distribution);
         let picked_level = -sample.ln() * self.level_factor;
         picked_level.round() as usize
     }
 
-    fn get_point_level(&self, point_id: PointOffsetType) -> usize {
+    pub(crate) fn get_point_level(&self, point_id: PointOffsetType) -> usize {
         self.links_layers[point_id as usize].len() - 1
     }
 
@@ -286,7 +347,7 @@ impl GraphLayersBuilder {
     }
 
     /// <https://github.com/nmslib/hnswlib/issues/99>
-    fn select_candidates_with_heuristic<F>(
+    pub(crate) fn select_candidates_with_heuristic<F>(
         candidates: FixedLengthPriorityQueue<ScoredPointOffset>,
         m: usize,
         score_internal: F,
@@ -294,7 +355,7 @@ impl GraphLayersBuilder {
     where
         F: FnMut(PointOffsetType, PointOffsetType) -> ScoreType,
     {
-        let closest_iter = candidates.into_iter();
+        let closest_iter = candidates.into_iter_sorted();
         Self::select_candidate_with_heuristic_from_sorted(closest_iter, m, score_internal)
     }
 
@@ -309,143 +370,38 @@ impl GraphLayersBuilder {
             .entry_points
             .lock()
             .get_entry_point(|point_id| points_scorer.check_vector(point_id));
-        match entry_point_opt {
+        if let Some(entry_point) = entry_point_opt {
+            let mut level_entry = if entry_point.level > level {
+                // The entry point is higher than a new point
+                // Let's find closest one on same level
+
+                // greedy search for a single closest point
+                self.search_entry(
+                    entry_point.point_id,
+                    entry_point.level,
+                    level,
+                    &mut points_scorer,
+                )
+            } else {
+                ScoredPointOffset {
+                    idx: entry_point.point_id,
+                    score: points_scorer.score_internal(point_id, entry_point.point_id),
+                }
+            };
+            // minimal common level for entry points
+            let linking_level = min(level, entry_point.level);
+
+            for curr_level in (0..=linking_level).rev() {
+                level_entry = self.link_new_point_on_level(
+                    point_id,
+                    curr_level,
+                    &mut points_scorer,
+                    level_entry,
+                );
+            }
+        } else {
             // New point is a new empty entry (for this filter, at least)
             // We can't do much here, so just quit
-            None => {}
-
-            // Entry point found.
-            Some(entry_point) => {
-                let mut level_entry = if entry_point.level > level {
-                    // The entry point is higher than a new point
-                    // Let's find closest one on same level
-
-                    // greedy search for a single closest point
-                    self.search_entry(
-                        entry_point.point_id,
-                        entry_point.level,
-                        level,
-                        &mut points_scorer,
-                    )
-                } else {
-                    ScoredPointOffset {
-                        idx: entry_point.point_id,
-                        score: points_scorer.score_internal(point_id, entry_point.point_id),
-                    }
-                };
-                // minimal common level for entry points
-                let linking_level = min(level, entry_point.level);
-
-                for curr_level in (0..=linking_level).rev() {
-                    let level_m = self.get_m(curr_level);
-                    let mut visited_list = self.get_visited_list_from_pool();
-
-                    visited_list.check_and_update_visited(level_entry.idx);
-
-                    let mut search_context = SearchContext::new(level_entry, self.ef_construct);
-
-                    self._search_on_level(
-                        &mut search_context,
-                        curr_level,
-                        &mut visited_list,
-                        &mut points_scorer,
-                    );
-
-                    if let Some(the_nearest) = search_context.nearest.iter().max() {
-                        level_entry = *the_nearest;
-                    }
-
-                    let scorer = |a, b| points_scorer.score_internal(a, b);
-
-                    if self.use_heuristic {
-                        let selected_nearest = {
-                            let mut existing_links =
-                                self.links_layers[point_id as usize][curr_level].write();
-                            {
-                                let ready_list = self.ready_list.read();
-                                for &existing_link in existing_links.iter() {
-                                    if !visited_list.check(existing_link)
-                                        && ready_list[existing_link as usize]
-                                    {
-                                        search_context.process_candidate(ScoredPointOffset {
-                                            idx: existing_link,
-                                            score: points_scorer.score_point(existing_link),
-                                        });
-                                    }
-                                }
-                            }
-
-                            let selected_nearest = Self::select_candidates_with_heuristic(
-                                search_context.nearest,
-                                level_m,
-                                scorer,
-                            );
-                            existing_links.clone_from(&selected_nearest);
-                            selected_nearest
-                        };
-
-                        for &other_point in &selected_nearest {
-                            let mut other_point_links =
-                                self.links_layers[other_point as usize][curr_level].write();
-                            if other_point_links.len() < level_m {
-                                // If linked point is lack of neighbours
-                                other_point_links.push(point_id);
-                            } else {
-                                let mut candidates = BinaryHeap::with_capacity(level_m + 1);
-                                candidates.push(ScoredPointOffset {
-                                    idx: point_id,
-                                    score: scorer(point_id, other_point),
-                                });
-                                for other_point_link in
-                                    other_point_links.iter().take(level_m).copied()
-                                {
-                                    candidates.push(ScoredPointOffset {
-                                        idx: other_point_link,
-                                        score: scorer(other_point_link, other_point),
-                                    });
-                                }
-                                let selected_candidates =
-                                    Self::select_candidate_with_heuristic_from_sorted(
-                                        candidates.into_sorted_vec().into_iter().rev(),
-                                        level_m,
-                                        scorer,
-                                    );
-                                other_point_links.clear(); // this do not free memory, which is good
-                                for selected in selected_candidates.iter().copied() {
-                                    other_point_links.push(selected);
-                                }
-                            }
-                        }
-                    } else {
-                        for nearest_point in &search_context.nearest {
-                            {
-                                let mut links =
-                                    self.links_layers[point_id as usize][curr_level].write();
-                                Self::connect_new_point(
-                                    &mut links,
-                                    nearest_point.idx,
-                                    point_id,
-                                    level_m,
-                                    scorer,
-                                );
-                            }
-
-                            {
-                                let mut links = self.links_layers[nearest_point.idx as usize]
-                                    [curr_level]
-                                    .write();
-                                Self::connect_new_point(
-                                    &mut links,
-                                    point_id,
-                                    nearest_point.idx,
-                                    level_m,
-                                    scorer,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
         }
         self.ready_list.write().set(point_id as usize, true);
         self.entry_points
@@ -453,6 +409,130 @@ impl GraphLayersBuilder {
             .new_point(point_id, level, |point_id| {
                 points_scorer.check_vector(point_id)
             });
+    }
+
+    /// Link a new point on a specific level.
+    /// Returns an entry point for the level below.
+    fn link_new_point_on_level(
+        &self,
+        point_id: PointOffsetType,
+        curr_level: usize,
+        points_scorer: &mut FilteredScorer,
+        mut level_entry: ScoredPointOffset,
+    ) -> ScoredPointOffset {
+        let mut visited_list = self.get_visited_list_from_pool();
+
+        visited_list.check_and_update_visited(level_entry.idx);
+
+        let mut search_context = SearchContext::new(level_entry, self.ef_construct);
+
+        self._search_on_level(
+            &mut search_context,
+            curr_level,
+            &mut visited_list,
+            points_scorer,
+        );
+
+        if let Some(the_nearest) = search_context.nearest.iter_unsorted().max() {
+            level_entry = *the_nearest;
+        }
+
+        if self.use_heuristic {
+            self.link_with_heuristic(
+                point_id,
+                curr_level,
+                &visited_list,
+                points_scorer,
+                search_context,
+            );
+        } else {
+            self.link_without_heuristic(point_id, curr_level, points_scorer, search_context);
+        }
+
+        level_entry
+    }
+
+    fn link_with_heuristic(
+        &self,
+        point_id: PointOffsetType,
+        curr_level: usize,
+        visited_list: &VisitedListHandle,
+        points_scorer: &FilteredScorer,
+        mut search_context: SearchContext,
+    ) {
+        let level_m = self.get_m(curr_level);
+        let scorer = |a, b| points_scorer.score_internal(a, b);
+
+        let selected_nearest = {
+            let mut existing_links = self.links_layers[point_id as usize][curr_level].write();
+            {
+                let ready_list = self.ready_list.read();
+                for &existing_link in existing_links.iter() {
+                    if !visited_list.check(existing_link) && ready_list[existing_link as usize] {
+                        search_context.process_candidate(ScoredPointOffset {
+                            idx: existing_link,
+                            score: points_scorer.score_point(existing_link),
+                        });
+                    }
+                }
+            }
+
+            let selected_nearest =
+                Self::select_candidates_with_heuristic(search_context.nearest, level_m, scorer);
+            existing_links.clone_from(&selected_nearest);
+            selected_nearest
+        };
+
+        for &other_point in &selected_nearest {
+            let mut other_point_links = self.links_layers[other_point as usize][curr_level].write();
+            if other_point_links.len() < level_m {
+                // If linked point is lack of neighbours
+                other_point_links.push(point_id);
+            } else {
+                let mut candidates = BinaryHeap::with_capacity(level_m + 1);
+                candidates.push(ScoredPointOffset {
+                    idx: point_id,
+                    score: points_scorer.score_internal(point_id, other_point),
+                });
+                for other_point_link in other_point_links.iter().take(level_m).copied() {
+                    candidates.push(ScoredPointOffset {
+                        idx: other_point_link,
+                        score: points_scorer.score_internal(other_point_link, other_point),
+                    });
+                }
+                let selected_candidates = Self::select_candidate_with_heuristic_from_sorted(
+                    candidates.into_sorted_vec().into_iter().rev(),
+                    level_m,
+                    scorer,
+                );
+                other_point_links.clear(); // this do not free memory, which is good
+                for selected in selected_candidates.iter().copied() {
+                    other_point_links.push(selected);
+                }
+            }
+        }
+    }
+
+    fn link_without_heuristic(
+        &self,
+        point_id: PointOffsetType,
+        curr_level: usize,
+        points_scorer: &FilteredScorer,
+        search_context: SearchContext,
+    ) {
+        let level_m = self.get_m(curr_level);
+        let scorer = |a, b| points_scorer.score_internal(a, b);
+        for nearest_point in search_context.nearest.iter_unsorted() {
+            {
+                let mut links = self.links_layers[point_id as usize][curr_level].write();
+                Self::connect_new_point(&mut links, nearest_point.idx, point_id, level_m, scorer);
+            }
+
+            {
+                let mut links = self.links_layers[nearest_point.idx as usize][curr_level].write();
+                Self::connect_new_point(&mut links, point_id, nearest_point.idx, level_m, scorer);
+            }
+        }
     }
 
     /// This function returns average number of links per node in HNSW graph
@@ -482,16 +562,17 @@ impl GraphLayersBuilder {
 #[cfg(test)]
 mod tests {
     use itertools::Itertools;
+    use rand::SeedableRng;
     use rand::prelude::StdRng;
     use rand::seq::SliceRandom;
-    use rand::SeedableRng;
+    use rstest::rstest;
 
     use super::*;
     use crate::data_types::vectors::{DenseVector, VectorElementType};
     use crate::fixtures::index_fixtures::{
-        random_vector, FakeFilterContext, TestRawScorerProducer,
+        FakeFilterContext, TestRawScorerProducer, random_vector,
     };
-    use crate::index::hnsw_index::graph_links::GraphLinksRam;
+    use crate::index::hnsw_index::graph_links::normalize_links;
     use crate::index::hnsw_index::tests::create_graph_layer_fixture;
     use crate::spaces::metric::Metric;
     use crate::spaces::simple::{CosineMetric, EuclidMetric};
@@ -544,7 +625,6 @@ mod tests {
                     let scorer =
                         FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
                     graph_layers.link_new_point(idx, scorer);
-                    raw_scorer.take_hardware_counter().discard_results();
                 });
         });
 
@@ -586,15 +666,16 @@ mod tests {
             let raw_scorer = vector_holder.get_raw_scorer(added_vector.clone()).unwrap();
             let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
             graph_layers.link_new_point(idx, scorer);
-            raw_scorer.take_hardware_counter().discard_results();
         }
 
         (vector_holder, graph_layers)
     }
 
     #[cfg(not(windows))] // https://github.com/qdrant/qdrant/issues/1452
-    #[test]
-    fn test_parallel_graph_build() {
+    #[rstest]
+    #[case::uncompressed(GraphLinksFormat::Plain)]
+    #[case::compressed(GraphLinksFormat::Compressed)]
+    fn test_parallel_graph_build(#[case] format: GraphLinksFormat) {
         let num_vectors = 1000;
         let dim = 8;
 
@@ -648,9 +729,7 @@ mod tests {
             });
         }
 
-        let graph = graph_layers_builder
-            .into_graph_layers::<GraphLinksRam>(None)
-            .unwrap();
+        let graph = graph_layers_builder.into_graph_layers_ram(format);
 
         let fake_filter_context = FakeFilterContext {};
         let raw_scorer = vector_holder.get_raw_scorer(query).unwrap();
@@ -658,12 +737,13 @@ mod tests {
         let ef = 16;
         let graph_search = graph.search(top, ef, scorer, None);
 
-        raw_scorer.take_hardware_counter().discard_results();
-        assert_eq!(reference_top.into_vec(), graph_search);
+        assert_eq!(reference_top.into_sorted_vec(), graph_search);
     }
 
-    #[test]
-    fn test_add_points() {
+    #[rstest]
+    #[case::uncompressed(GraphLinksFormat::Plain)]
+    #[case::compressed(GraphLinksFormat::Compressed)]
+    fn test_add_points(#[case] format: GraphLinksFormat) {
         let num_vectors = 1000;
         let dim = 8;
 
@@ -676,7 +756,7 @@ mod tests {
             create_graph_layer::<M, _>(num_vectors, dim, false, &mut rng);
 
         let (_vector_holder_orig, graph_layers_orig) =
-            create_graph_layer_fixture::<M, _>(num_vectors, M, dim, false, &mut rng2, None);
+            create_graph_layer_fixture::<M, _>(num_vectors, M, dim, format, false, &mut rng2);
 
         // check is graph_layers_builder links are equal to graph_layers_orig
         let orig_len = graph_layers_orig.links.num_points();
@@ -691,7 +771,14 @@ mod tests {
                 .collect_vec();
             let links_builder = graph_layers_builder.links_layers[idx][0].read();
             let link_container_from_builder = links_builder.iter().copied().collect::<Vec<_>>();
-            assert_eq!(links_orig, &link_container_from_builder);
+            let m = match format {
+                GraphLinksFormat::Plain => 0,
+                GraphLinksFormat::Compressed => M * 2,
+            };
+            assert_eq!(
+                normalize_links(m, links_orig.clone()),
+                normalize_links(m, link_container_from_builder),
+            );
         }
 
         let main_entry = graph_layers_builder
@@ -735,22 +822,20 @@ mod tests {
             });
         }
 
-        let graph = graph_layers_builder
-            .into_graph_layers::<GraphLinksRam>(None)
-            .unwrap();
+        let graph = graph_layers_builder.into_graph_layers_ram(format);
 
         let fake_filter_context = FakeFilterContext {};
         let raw_scorer = vector_holder.get_raw_scorer(query).unwrap();
         let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
         let ef = 16;
         let graph_search = graph.search(top, ef, scorer, None);
-        raw_scorer.take_hardware_counter().discard_results();
-        assert_eq!(reference_top.into_vec(), graph_search);
+        assert_eq!(reference_top.into_sorted_vec(), graph_search);
     }
 
-    #[test]
-    #[ignore]
-    fn test_hnsw_graph_properties() {
+    #[rstest]
+    #[case::uncompressed(GraphLinksFormat::Plain)]
+    #[case::compressed(GraphLinksFormat::Compressed)]
+    fn test_hnsw_graph_properties(#[case] format: GraphLinksFormat) {
         const NUM_VECTORS: usize = 5_000;
         const DIM: usize = 16;
         const M: usize = 16;
@@ -770,11 +855,8 @@ mod tests {
             let level = graph_layers_builder.get_random_layer(&mut rng);
             graph_layers_builder.set_levels(idx, level);
             graph_layers_builder.link_new_point(idx, scorer);
-            raw_scorer.take_hardware_counter().discard_results();
         }
-        let graph_layers = graph_layers_builder
-            .into_graph_layers::<GraphLinksRam>(None)
-            .unwrap();
+        let graph_layers = graph_layers_builder.into_graph_layers_ram(format);
 
         let num_points = graph_layers.links.num_points();
         eprintln!("number_points = {num_points:#?}");
@@ -787,12 +869,12 @@ mod tests {
 
         let layers910 = graph_layers.links.point_level(910);
         let links910 = (0..layers910 + 1)
-            .map(|i| graph_layers.links.links(910, i).collect_vec())
-            .collect::<Vec<_>>();
+            .map(|i| graph_layers.links.links(910, i).collect())
+            .collect::<Vec<Vec<_>>>();
         eprintln!("graph_layers.links_layers[910] = {links910:#?}",);
 
         let total_edges: usize = (0..NUM_VECTORS)
-            .map(|i| graph_layers.links.links(i as PointOffsetType, 0).count())
+            .map(|i| graph_layers.links.links(i as PointOffsetType, 0).len())
             .sum();
         let avg_connectivity = total_edges as f64 / NUM_VECTORS as f64;
         eprintln!("avg_connectivity = {avg_connectivity:#?}");
@@ -823,7 +905,7 @@ mod tests {
             });
         }
 
-        let sorted_candidates = candidates.into_vec();
+        let sorted_candidates = candidates.into_sorted_vec();
 
         for x in sorted_candidates.iter().take(M) {
             eprintln!("sorted_candidates = ({}, {})", x.idx, x.score);
@@ -838,8 +920,6 @@ mod tests {
         for x in selected_candidates.iter() {
             eprintln!("selected_candidates = {x}");
         }
-
-        scorer.take_hardware_counter().discard_results();
     }
 
     #[test]

@@ -6,9 +6,9 @@ use protobuf::Message as _;
 use raft::eraftpb::Entry as RaftEntry;
 use wal::Wal;
 
+use crate::StorageError;
 use crate::content_manager::consensus_manager;
 use crate::content_manager::consensus_ops::ConsensusOperations;
-use crate::StorageError;
 
 const COLLECTIONS_META_WAL_DIR: &str = "collections_meta_wal";
 
@@ -294,9 +294,7 @@ impl ConsensusOpWal {
         );
 
         log::debug!(
-            "Compacting WAL until Raft index {}, WAL index {}",
-            until_raft_index,
-            compact_until_wal_index,
+            "Compacting WAL until Raft index {until_raft_index}, WAL index {compact_until_wal_index}",
         );
 
         // Compact WAL

@@ -1,18 +1,19 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use parking_lot::RwLock;
-use rand::rngs::ThreadRng;
 use rand::Rng;
+use rand::rngs::ThreadRng;
 use segment::data_types::named_vectors::NamedVectors;
 use segment::data_types::vectors::only_default_vector;
 use segment::entry::entry_point::SegmentEntry;
+use segment::payload_json;
 use segment::segment::Segment;
 use segment::segment_constructor::simple_segment_constructor::{
-    build_multivec_segment, build_simple_segment,
+    VECTOR1_NAME, VECTOR2_NAME, build_multivec_segment, build_simple_segment,
 };
 use segment::types::{Distance, Payload, PointIdType, SeqNumberType};
-use serde_json::json;
 
 use crate::collection_manager::holders::segment_holder::SegmentHolder;
 use crate::collection_manager::optimizers::indexing_optimizer::IndexingOptimizer;
@@ -36,7 +37,7 @@ pub(crate) struct PointIdGenerator {
 impl PointIdGenerator {
     #[inline]
     pub fn random(&mut self) -> PointIdType {
-        self.thread_rng.gen_range(1..u64::MAX).into()
+        self.thread_rng.random_range(1..u64::MAX).into()
     }
 
     #[inline]
@@ -62,24 +63,27 @@ pub fn random_multi_vec_segment(
 ) -> Segment {
     let mut id_gen = PointIdGenerator::default();
     let mut segment = build_multivec_segment(path, dim1, dim2, Distance::Dot).unwrap();
-    let mut rnd = rand::thread_rng();
+    let mut rnd = rand::rng();
     let payload_key = "number";
     let keyword_key = "keyword";
+    let hw_counter = HardwareCounterCell::new();
     for _ in 0..num_vectors {
-        let random_vector1: Vec<_> = (0..dim1).map(|_| rnd.gen_range(0.0..1.0)).collect();
-        let random_vector2: Vec<_> = (0..dim2).map(|_| rnd.gen_range(0.0..1.0)).collect();
+        let random_vector1: Vec<_> = (0..dim1).map(|_| rnd.random_range(0.0..1.0)).collect();
+        let random_vector2: Vec<_> = (0..dim2).map(|_| rnd.random_range(0.0..1.0)).collect();
         let mut vectors = NamedVectors::default();
-        vectors.insert("vector1".to_owned(), random_vector1.into());
-        vectors.insert("vector2".to_owned(), random_vector2.into());
+        vectors.insert(VECTOR1_NAME.to_owned(), random_vector1.into());
+        vectors.insert(VECTOR2_NAME.to_owned(), random_vector2.into());
 
         let point_id: PointIdType = id_gen.unique();
-        let payload_value = rnd.gen_range(1..1_000);
-        let random_keyword = format!("keyword_{}", rnd.gen_range(1..10));
+        let payload_value = rnd.random_range(1..1_000);
+        let random_keyword = format!("keyword_{}", rnd.random_range(1..10));
         let payload: Payload =
-            json!({ payload_key: vec![payload_value], keyword_key: random_keyword}).into();
-        segment.upsert_point(opnum, point_id, vectors).unwrap();
+            payload_json! {payload_key: vec![payload_value], keyword_key: random_keyword};
         segment
-            .set_payload(opnum, point_id, &payload, &None)
+            .upsert_point(opnum, point_id, vectors, &hw_counter)
+            .unwrap();
+        segment
+            .set_payload(opnum, point_id, &payload, &None, &hw_counter)
             .unwrap();
     }
     segment
@@ -88,18 +92,24 @@ pub fn random_multi_vec_segment(
 pub fn random_segment(path: &Path, opnum: SeqNumberType, num_vectors: u64, dim: usize) -> Segment {
     let mut id_gen = PointIdGenerator::default();
     let mut segment = build_simple_segment(path, dim, Distance::Dot).unwrap();
-    let mut rnd = rand::thread_rng();
+    let mut rnd = rand::rng();
     let payload_key = "number";
+    let hw_counter = HardwareCounterCell::new();
     for _ in 0..num_vectors {
-        let random_vector: Vec<_> = (0..dim).map(|_| rnd.gen_range(0.0..1.0)).collect();
+        let random_vector: Vec<_> = (0..dim).map(|_| rnd.random_range(0.0..1.0)).collect();
         let point_id: PointIdType = id_gen.unique();
-        let payload_value = rnd.gen_range(1..1_000);
-        let payload: Payload = json!({ payload_key: vec![payload_value] }).into();
+        let payload_value = rnd.random_range(1..1_000);
+        let payload: Payload = payload_json! {payload_key: vec![payload_value]};
         segment
-            .upsert_point(opnum, point_id, only_default_vector(&random_vector))
+            .upsert_point(
+                opnum,
+                point_id,
+                only_default_vector(&random_vector),
+                &hw_counter,
+            )
             .unwrap();
         segment
-            .set_payload(opnum, point_id, &payload, &None)
+            .set_payload(opnum, point_id, &payload, &None, &hw_counter)
             .unwrap();
     }
     segment
@@ -114,43 +124,44 @@ pub fn build_segment_1(path: &Path) -> Segment {
     let vec4 = vec![1.0, 1.0, 0.0, 1.0];
     let vec5 = vec![1.0, 0.0, 0.0, 0.0];
 
+    let hw_counter = HardwareCounterCell::new();
+
     segment1
-        .upsert_point(1, 1.into(), only_default_vector(&vec1))
+        .upsert_point(1, 1.into(), only_default_vector(&vec1), &hw_counter)
         .unwrap();
     segment1
-        .upsert_point(2, 2.into(), only_default_vector(&vec2))
+        .upsert_point(2, 2.into(), only_default_vector(&vec2), &hw_counter)
         .unwrap();
     segment1
-        .upsert_point(3, 3.into(), only_default_vector(&vec3))
+        .upsert_point(3, 3.into(), only_default_vector(&vec3), &hw_counter)
         .unwrap();
     segment1
-        .upsert_point(4, 4.into(), only_default_vector(&vec4))
+        .upsert_point(4, 4.into(), only_default_vector(&vec4), &hw_counter)
         .unwrap();
     segment1
-        .upsert_point(5, 5.into(), only_default_vector(&vec5))
+        .upsert_point(5, 5.into(), only_default_vector(&vec5), &hw_counter)
         .unwrap();
 
     let payload_key = "color";
 
-    let payload_option1: Payload = json!({ payload_key: vec!["red".to_owned()] }).into();
-    let payload_option2: Payload =
-        json!({ payload_key: vec!["red".to_owned(), "blue".to_owned()] }).into();
-    let payload_option3: Payload = json!({ payload_key: vec!["blue".to_owned()] }).into();
+    let payload_option1 = payload_json! {payload_key: vec!["red".to_owned()]};
+    let payload_option2 = payload_json! {payload_key: vec!["red".to_owned(), "blue".to_owned()]};
+    let payload_option3 = payload_json! {payload_key: vec!["blue".to_owned()]};
 
     segment1
-        .set_payload(6, 1.into(), &payload_option1, &None)
+        .set_payload(6, 1.into(), &payload_option1, &None, &hw_counter)
         .unwrap();
     segment1
-        .set_payload(6, 2.into(), &payload_option1, &None)
+        .set_payload(6, 2.into(), &payload_option1, &None, &hw_counter)
         .unwrap();
     segment1
-        .set_payload(6, 3.into(), &payload_option3, &None)
+        .set_payload(6, 3.into(), &payload_option3, &None, &hw_counter)
         .unwrap();
     segment1
-        .set_payload(6, 4.into(), &payload_option2, &None)
+        .set_payload(6, 4.into(), &payload_option2, &None, &hw_counter)
         .unwrap();
     segment1
-        .set_payload(6, 5.into(), &payload_option2, &None)
+        .set_payload(6, 5.into(), &payload_option2, &None, &hw_counter)
         .unwrap();
 
     segment1
@@ -168,27 +179,29 @@ pub fn build_segment_2(path: &Path) -> Segment {
     let vec14 = vec![1.0, 0.0, 0.0, 1.0];
     let vec15 = vec![1.0, 1.0, 0.0, 0.0];
 
+    let hw_counter = HardwareCounterCell::new();
+
     segment2
-        .upsert_point(7, 4.into(), only_default_vector(&vec4))
+        .upsert_point(7, 4.into(), only_default_vector(&vec4), &hw_counter)
         .unwrap();
     segment2
-        .upsert_point(8, 5.into(), only_default_vector(&vec5))
+        .upsert_point(8, 5.into(), only_default_vector(&vec5), &hw_counter)
         .unwrap();
 
     segment2
-        .upsert_point(11, 11.into(), only_default_vector(&vec11))
+        .upsert_point(11, 11.into(), only_default_vector(&vec11), &hw_counter)
         .unwrap();
     segment2
-        .upsert_point(12, 12.into(), only_default_vector(&vec12))
+        .upsert_point(12, 12.into(), only_default_vector(&vec12), &hw_counter)
         .unwrap();
     segment2
-        .upsert_point(13, 13.into(), only_default_vector(&vec13))
+        .upsert_point(13, 13.into(), only_default_vector(&vec13), &hw_counter)
         .unwrap();
     segment2
-        .upsert_point(14, 14.into(), only_default_vector(&vec14))
+        .upsert_point(14, 14.into(), only_default_vector(&vec14), &hw_counter)
         .unwrap();
     segment2
-        .upsert_point(15, 15.into(), only_default_vector(&vec15))
+        .upsert_point(15, 15.into(), only_default_vector(&vec15), &hw_counter)
         .unwrap();
 
     segment2

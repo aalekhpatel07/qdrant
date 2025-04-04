@@ -217,8 +217,12 @@ impl quantization::EncodedStorage for ChunkedVectors<u8> {
         for i in 0..self.len() {
             buffer.write_all(self.get(i))?;
         }
-        buffer.flush()?;
+        buffer.sync_all()?;
         Ok(())
+    }
+
+    fn is_on_disk(&self) -> bool {
+        true
     }
 }
 

@@ -4,11 +4,12 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
 use bitvec::prelude::{BitSlice, BitVec};
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use rand::Rng;
 
-use crate::common::operation_error::OperationResult;
 use crate::common::Flusher;
+use crate::common::operation_error::OperationResult;
 use crate::data_types::named_vectors::CowVector;
 use crate::data_types::vectors::{DenseVector, VectorElementType, VectorRef};
 use crate::payload_storage::FilterContext;
@@ -16,11 +17,11 @@ use crate::spaces::metric::Metric;
 use crate::types::{Distance, VectorStorageDatatype};
 use crate::vector_storage::chunked_vectors::ChunkedVectors;
 use crate::vector_storage::{
-    raw_scorer_impl, DenseVectorStorage, RawScorer, VectorStorage, DEFAULT_STOPPED,
+    DEFAULT_STOPPED, DenseVectorStorage, RawScorer, VectorStorage, raw_scorer_impl,
 };
 
 pub fn random_vector<R: Rng + ?Sized>(rnd_gen: &mut R, size: usize) -> DenseVector {
-    (0..size).map(|_| rnd_gen.gen_range(-1.0..1.0)).collect()
+    (0..size).map(|_| rnd_gen.random_range(-1.0..1.0)).collect()
 }
 
 pub struct FakeFilterContext {}
@@ -67,10 +68,6 @@ impl<TMetric: Metric<VectorElementType>> VectorStorage for TestRawScorerProducer
         self.vectors.len()
     }
 
-    fn size_of_available_vectors_in_bytes(&self) -> usize {
-        self.available_vector_count() * self.vector_dim() * std::mem::size_of::<VectorElementType>()
-    }
-
     fn get_vector(&self, key: PointOffsetType) -> CowVector {
         self.get_vector_opt(key).expect("vector not found")
     }
@@ -79,14 +76,19 @@ impl<TMetric: Metric<VectorElementType>> VectorStorage for TestRawScorerProducer
         self.vectors.get_opt(key as _).map(|v| v.into())
     }
 
-    fn insert_vector(&mut self, key: PointOffsetType, vector: VectorRef) -> OperationResult<()> {
+    fn insert_vector(
+        &mut self,
+        key: PointOffsetType,
+        vector: VectorRef,
+        _hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
         self.vectors.insert(key as _, vector.try_into()?)?;
         Ok(())
     }
 
     fn update_from<'a>(
         &mut self,
-        _other_ids: &'a mut impl Iterator<Item = (CowVector<'a>, bool)>,
+        _other_vectors: &'a mut impl Iterator<Item = (CowVector<'a>, bool)>,
         _stopped: &AtomicBool,
     ) -> OperationResult<Range<PointOffsetType>> {
         todo!()
@@ -146,6 +148,7 @@ where
             self,
             self.deleted_vector_bitslice(),
             &DEFAULT_STOPPED,
+            HardwareCounterCell::new(),
         )
     }
 }

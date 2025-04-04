@@ -16,6 +16,9 @@ pub struct Device {
     /// Native Vulkan device handle.
     vk_device: ash::Device,
 
+    /// Hardware device name.
+    name: String,
+
     /// GPU memory allocator from `gpu-allocator` crate.
     /// It's an Option because of drop order. We need to drop it before the device.
     /// But `Allocator` is destroyed by it's own drop.
@@ -39,8 +42,14 @@ pub struct Device {
     /// It's used in bounds checking in Context.
     max_compute_work_group_count: [usize; 3],
 
+    /// Maximum GPU buffer size.
+    max_buffer_size: usize,
+
     /// Selected queue index to use.
     queue_index: usize,
+
+    /// Does the device support half precision floats.
+    has_half_precision: bool,
 }
 
 // GPU execution queue.
@@ -61,13 +70,14 @@ impl Device {
         instance: Arc<Instance>,
         vk_physical_device: &PhysicalDevice,
     ) -> GpuResult<Arc<Device>> {
-        Self::new_with_queue_index(instance, vk_physical_device, 0)
+        Self::new_with_params(instance, vk_physical_device, 0, false)
     }
 
-    pub fn new_with_queue_index(
+    pub fn new_with_params(
         instance: Arc<Instance>,
         vk_physical_device: &PhysicalDevice,
         queue_index: usize,
+        skip_half_precision: bool,
     ) -> GpuResult<Arc<Device>> {
         #[allow(unused_mut)]
         let mut extensions_cstr: Vec<CString> = vec![CString::from(ash::khr::maintenance1::NAME)];
@@ -82,15 +92,15 @@ impl Device {
                 .get_physical_device_queue_family_properties(vk_physical_device.vk_physical_device)
         };
 
-        let max_queue_priorities_count = vk_queue_families
+        let max_queue_priorities_counts: Vec<Vec<f32>> = vk_queue_families
             .iter()
-            .map(|vk_queue_family| vk_queue_family.queue_count as usize)
-            .max()
-            .ok_or_else(|| GpuError::Other("No queue families found".to_string()))?;
-        let queue_priorities = vec![0.; max_queue_priorities_count];
+            .map(|vk_queue_family| vec![0.; vk_queue_family.queue_count as usize])
+            .collect();
 
-        let queue_create_infos: Vec<vk::DeviceQueueCreateInfo> = (0..vk_queue_families.len())
-            .map(|queue_family_index| {
+        let queue_create_infos: Vec<vk::DeviceQueueCreateInfo> = max_queue_priorities_counts
+            .iter()
+            .enumerate()
+            .map(|(queue_family_index, queue_priorities)| {
                 vk::DeviceQueueCreateInfo::default()
                     .flags(vk::DeviceQueueCreateFlags::empty())
                     .queue_family_index(queue_family_index as u32)
@@ -99,8 +109,6 @@ impl Device {
             .collect();
 
         let physical_device_features = vk::PhysicalDeviceFeatures::default();
-
-        // TODO(gpu): check presence of features
 
         // Define Vulkan features that we need.
         let mut enabled_physical_device_features_1_1 =
@@ -133,10 +141,10 @@ impl Device {
         if !enabled_physical_device_features_1_2.shader_int8 == 0 {
             return Err(GpuError::NotSupported("Int8 is not supported".to_string()));
         }
-        if !enabled_physical_device_features_1_2.shader_float16 == 0 {
-            return Err(GpuError::NotSupported(
-                "Float16 is not supported".to_string(),
-            ));
+        let has_half_precision =
+            !skip_half_precision && enabled_physical_device_features_1_2.shader_float16 == 1;
+        if !has_half_precision {
+            log::warn!("Half precision is not supported, falling back to full precision floats");
         }
         if !enabled_physical_device_features_1_2.storage_buffer8_bit_access == 0 {
             return Err(GpuError::NotSupported(
@@ -145,32 +153,38 @@ impl Device {
         }
         let mut physical_device_features_1_2 = vk::PhysicalDeviceVulkan12Features::default()
             .shader_int8(true)
-            .shader_float16(true)
+            .shader_float16(has_half_precision)
             .storage_buffer8_bit_access(true);
 
         // From Vulkan 1.3 we need subgroup size control if it's dynamic.
         let mut physical_device_features_1_3 = vk::PhysicalDeviceVulkan13Features::default();
 
         let max_compute_work_group_count;
+        let max_buffer_size;
         let mut is_dynamic_subgroup_size = false;
-        let subgroup_size = unsafe {
-            let props = instance
-                .vk_instance()
-                .get_physical_device_properties(vk_physical_device.vk_physical_device);
+        let subgroup_size = {
+            let props = unsafe {
+                instance
+                    .vk_instance()
+                    .get_physical_device_properties(vk_physical_device.vk_physical_device)
+            };
             max_compute_work_group_count = [
                 props.limits.max_compute_work_group_count[0] as usize,
                 props.limits.max_compute_work_group_count[1] as usize,
                 props.limits.max_compute_work_group_count[2] as usize,
             ];
+            max_buffer_size = props.limits.max_storage_buffer_range as usize;
             let mut subgroup_properties = vk::PhysicalDeviceSubgroupProperties::default();
             let mut vulkan_1_3_properties = vk::PhysicalDeviceVulkan13Properties::default();
             let mut props2 = vk::PhysicalDeviceProperties2::default()
                 .push_next(&mut subgroup_properties)
                 .push_next(&mut vulkan_1_3_properties);
-            instance.vk_instance().get_physical_device_properties2(
-                vk_physical_device.vk_physical_device,
-                &mut props2,
-            );
+            unsafe {
+                instance.vk_instance().get_physical_device_properties2(
+                    vk_physical_device.vk_physical_device,
+                    &mut props2,
+                );
+            }
 
             let subgroup_size = if vulkan_1_3_properties.min_subgroup_size
                 != vulkan_1_3_properties.max_subgroup_size
@@ -248,8 +262,8 @@ impl Device {
                 };
                 let queue = Queue {
                     vk_queue,
-                    vk_queue_index,
                     vk_queue_family_index,
+                    vk_queue_index,
                 };
 
                 let queue_flags = vk_queue_family.queue_flags;
@@ -291,8 +305,11 @@ impl Device {
             _transfer_queues: transfer_queues,
             subgroup_size,
             max_compute_work_group_count,
+            max_buffer_size,
             is_dynamic_subgroup_size,
             queue_index,
+            name: vk_physical_device.name.clone(),
+            has_half_precision,
         }))
     }
 
@@ -321,7 +338,7 @@ impl Device {
             let mut gpu_allocator = gpu_allocator.lock();
             if let Err(e) = gpu_allocator.free(allocation) {
                 // Log error because free is called from Drop.
-                log::error!("Failed to free GPU memory: {:?}", e);
+                log::error!("Failed to free GPU memory: {e:?}");
             }
         } else {
             log::error!("GPU allocator is not available");
@@ -349,8 +366,20 @@ impl Device {
         self.max_compute_work_group_count
     }
 
+    pub fn max_buffer_size(&self) -> usize {
+        self.max_buffer_size
+    }
+
+    pub fn has_half_precision(&self) -> bool {
+        self.has_half_precision
+    }
+
     pub fn compute_queue(&self) -> &Queue {
         &self.compute_queues[self.queue_index % self.compute_queues.len()]
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     fn check_extensions_list(
@@ -373,8 +402,7 @@ impl Device {
 
             if !is_extension_available {
                 return Err(GpuError::NotSupported(format!(
-                    "Extension {:?} is not supported",
-                    required_extension
+                    "Extension {required_extension:?} is not supported"
                 )));
             }
         }

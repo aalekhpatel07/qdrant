@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use api::grpc::qdrant::vector_input::Variant;
 use api::grpc::qdrant::{
-    query, ContextInput, ContextInputPair, DiscoverInput, PrefetchQuery, Query, RecommendInput,
-    VectorInput,
+    ContextInput, ContextInputPair, DiscoverInput, PrefetchQuery, Query, RecommendInput,
+    VectorInput, query,
 };
 use api::rest::schema as rest;
 use tonic::Status;
@@ -161,6 +161,7 @@ pub(crate) fn collect_query(query: &Query, batch: &mut BatchAccumGrpc) -> Result
         query::Variant::OrderBy(_) => {}
         query::Variant::Fusion(_) => {}
         query::Variant::Sample(_) => {}
+        query::Variant::Formula(_) => {}
     }
 
     Ok(())

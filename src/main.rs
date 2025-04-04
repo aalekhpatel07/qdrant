@@ -17,7 +17,9 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use ::common::cpu::{get_cpu_budget, CpuBudget};
+use ::common::budget::{ResourceBudget, get_io_budget};
+use ::common::cpu::get_cpu_budget;
+use ::common::flags::{feature_flags, init_feature_flags};
 use ::tonic::transport::Uri;
 use api::grpc::transport_channel_pool::TransportChannelPool;
 use clap::Parser;
@@ -28,8 +30,8 @@ use startup::setup_panic_hook;
 use storage::content_manager::consensus::operation_sender::OperationSender;
 use storage::content_manager::consensus::persistent::Persistent;
 use storage::content_manager::consensus_manager::{ConsensusManager, ConsensusStateRef};
-use storage::content_manager::toc::dispatcher::TocDispatcher;
 use storage::content_manager::toc::TableOfContent;
+use storage::content_manager::toc::dispatcher::TocDispatcher;
 use storage::dispatcher::Dispatcher;
 use storage::rbac::Access;
 #[cfg(all(
@@ -69,7 +71,7 @@ const FULL_ACCESS: Access = Access::full("For main");
 struct Args {
     /// Uri of the peer to bootstrap from in case of multi-peer deployment.
     /// If not specified - this peer will be considered as a first in a new deployment.
-    #[arg(long, value_parser, value_name = "URI")]
+    #[arg(long, value_parser, value_name = "URI", env = "QDRANT_BOOTSTRAP")]
     bootstrap: Option<Uri>,
     /// Uri of this peer.
     /// Other peers should be able to reach it by this uri.
@@ -78,7 +80,7 @@ struct Args {
     ///
     /// In case this is not the first peer and it bootstraps the value is optional.
     /// If not supplied then qdrant will take internal grpc port from config and derive the IP address of this peer on bootstrap peer (receiving side)
-    #[arg(long, value_parser, value_name = "URI")]
+    #[arg(long, value_parser, value_name = "URI", env = "QDRANT_URI")]
     uri: Option<Uri>,
 
     /// Force snapshot re-creation
@@ -144,19 +146,23 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    remove_started_file_indicator();
-
     let settings = Settings::new(args.config_path)?;
+
+    // Set global feature flags, sourced from configuration
+    init_feature_flags(settings.feature_flags);
 
     let reporting_enabled = !settings.telemetry_disabled && !args.disable_telemetry;
 
     let reporting_id = TelemetryCollector::generate_id();
 
+    // Setup logging (no logging before this point)
     let logger_handle = tracing::setup(
         settings
             .logger
             .with_top_level_directive(settings.log_level.clone()),
     )?;
+
+    remove_started_file_indicator();
 
     setup_panic_hook(reporting_enabled, reporting_id.to_string());
 
@@ -171,8 +177,35 @@ fn main() -> anyhow::Result<()> {
 
     welcome(&settings);
 
+    #[cfg(feature = "gpu")]
+    if let Some(settings_gpu) = &settings.gpu {
+        use segment::index::hnsw_index::gpu::*;
+
+        // initialize GPU devices manager.
+        if settings_gpu.indexing {
+            set_gpu_force_half_precision(settings_gpu.force_half_precision);
+            set_gpu_groups_count(settings_gpu.groups_count);
+
+            let mut gpu_device_manager = GPU_DEVICES_MANAGER.write();
+            *gpu_device_manager = match gpu_devices_manager::GpuDevicesMaganer::new(
+                &settings_gpu.device_filter,
+                settings_gpu.devices.as_deref(),
+                settings_gpu.allow_integrated,
+                settings_gpu.allow_emulated,
+                true, // Currently we always wait for the free gpu device.
+                settings_gpu.parallel_indexes.unwrap_or(1),
+            ) {
+                Ok(gpu_device_manager) => Some(gpu_device_manager),
+                Err(err) => {
+                    log::error!("Can't initialize GPU devices manager: {err}");
+                    None
+                }
+            }
+        }
+    }
+
     if let Some(recovery_warning) = &settings.storage.recovery_mode {
-        log::warn!("Qdrant is loaded in recovery mode: {}", recovery_warning);
+        log::warn!("Qdrant is loaded in recovery mode: {recovery_warning}");
         log::warn!(
             "Read more: https://qdrant.tech/documentation/guides/administration/#recovery-mode"
         );
@@ -181,10 +214,27 @@ fn main() -> anyhow::Result<()> {
     // Validate as soon as possible, but we must initialize logging first
     settings.validate_and_warn();
 
+    // Report feature flags that are enabled for easier debugging
+    let flags = feature_flags();
+    if !flags.is_empty() {
+        log::debug!("Feature flags: {flags:?}");
+    }
+
+    let bootstrap = if args.bootstrap == args.uri {
+        if args.bootstrap.is_some() {
+            log::warn!(
+                "Bootstrap URI is the same as this peer URI. Consider this peer as a first in a new deployment.",
+            );
+        }
+        None
+    } else {
+        args.bootstrap
+    };
+
     // Saved state of the consensus.
     let persistent_consensus_state = Persistent::load_or_init(
         &settings.storage.storage_path,
-        args.bootstrap.is_none(),
+        bootstrap.is_none(),
         args.reinit,
     )?;
 
@@ -229,9 +279,9 @@ fn main() -> anyhow::Result<()> {
     let runtime_handle = general_runtime.handle().clone();
 
     // Use global CPU budget for optimizations based on settings
-    let optimizer_cpu_budget = CpuBudget::new(get_cpu_budget(
-        settings.storage.performance.optimizer_cpu_budget,
-    ));
+    let cpu_budget = get_cpu_budget(settings.storage.performance.optimizer_cpu_budget);
+    let io_budget = get_io_budget(settings.storage.performance.optimizer_io_budget, cpu_budget);
+    let optimizer_resource_budget = ResourceBudget::new(cpu_budget, io_budget);
 
     // Create a signal sender and receiver. It is used to communicate with the consensus thread.
     let (propose_sender, propose_receiver) = std::sync::mpsc::channel();
@@ -274,7 +324,7 @@ fn main() -> anyhow::Result<()> {
         search_runtime,
         update_runtime,
         general_runtime,
-        optimizer_cpu_budget,
+        optimizer_resource_budget,
         channel_service.clone(),
         persistent_consensus_state.this_peer_id(),
         propose_operation_sender.clone(),
@@ -309,7 +359,8 @@ fn main() -> anyhow::Result<()> {
         .into();
         let is_new_deployment = consensus_state.is_new_deployment();
 
-        dispatcher = dispatcher.with_consensus(consensus_state.clone());
+        dispatcher =
+            dispatcher.with_consensus(consensus_state.clone(), settings.cluster.resharding_enabled);
 
         let toc_dispatcher = TocDispatcher::new(Arc::downgrade(&toc_arc), consensus_state.clone());
         toc_arc.with_toc_dispatcher(toc_dispatcher);
@@ -332,13 +383,13 @@ fn main() -> anyhow::Result<()> {
             consensus_state.clone(),
             &runtime_handle,
             // NOTE: `wait_for_bootstrap` should be calculated *before* starting `Consensus` thread
-            consensus_state.is_new_deployment() && args.bootstrap.is_some(),
+            consensus_state.is_new_deployment() && bootstrap.is_some(),
         ));
 
         let handle = Consensus::run(
             &slog_logger,
             consensus_state.clone(),
-            args.bootstrap,
+            bootstrap,
             args.uri.map(|uri| uri.to_string()),
             settings.clone(),
             channel_service,
@@ -357,14 +408,14 @@ fn main() -> anyhow::Result<()> {
         let _cancel_transfer_handle = runtime_handle.spawn(async move {
             consensus_state_clone.is_leader_established.await_ready();
             match toc_arc_clone
-                .cancel_outgoing_all_transfers("Source peer restarted")
+                .cancel_related_transfers("Source or target peer restarted")
                 .await
             {
                 Ok(_) => {
                     log::debug!("All transfers if any cancelled");
                 }
                 Err(err) => {
-                    log::error!("Can't cancel outgoing transfers: {}", err);
+                    log::error!("Can't cancel related transfers: {err}");
                 }
             }
         });
@@ -417,11 +468,15 @@ fn main() -> anyhow::Result<()> {
     let telemetry_collector = Arc::new(tokio::sync::Mutex::new(telemetry_collector));
 
     if reporting_enabled {
-        log::info!("Telemetry reporting enabled, id: {}", reporting_id);
+        log::info!("Telemetry reporting enabled, id: {reporting_id}");
 
         runtime_handle.spawn(TelemetryReporter::run(telemetry_collector.clone()));
     } else {
         log::info!("Telemetry reporting disabled");
+    }
+
+    if settings.service.hardware_reporting == Some(true) {
+        log::info!("Hardware reporting enabled");
     }
 
     // Setup subscribers to listen for issue-able events
@@ -430,7 +485,7 @@ fn main() -> anyhow::Result<()> {
     // Helper to better log start errors
     let log_err_if_any = |server_name, result| match result {
         Err(err) => {
-            log::error!("Error while starting {} server: {}", server_name, err);
+            log::error!("Error while starting {server_name} server: {err}");
             Err(err)
         }
         ok => ok,
@@ -514,27 +569,29 @@ fn main() -> anyhow::Result<()> {
 
         thread::Builder::new()
             .name("deadlock_checker".to_string())
-            .spawn(move || loop {
-                thread::sleep(DEADLOCK_CHECK_PERIOD);
-                let deadlocks = deadlock::check_deadlock();
-                if deadlocks.is_empty() {
-                    continue;
-                }
-
-                let mut error = format!("{} deadlocks detected\n", deadlocks.len());
-                for (i, threads) in deadlocks.iter().enumerate() {
-                    writeln!(error, "Deadlock #{i}").expect("fail to writeln!");
-                    for t in threads {
-                        writeln!(
-                            error,
-                            "Thread Id {:#?}\n{:#?}",
-                            t.thread_id(),
-                            t.backtrace()
-                        )
-                        .expect("fail to writeln!");
+            .spawn(move || {
+                loop {
+                    thread::sleep(DEADLOCK_CHECK_PERIOD);
+                    let deadlocks = deadlock::check_deadlock();
+                    if deadlocks.is_empty() {
+                        continue;
                     }
+
+                    let mut error = format!("{} deadlocks detected\n", deadlocks.len());
+                    for (i, threads) in deadlocks.iter().enumerate() {
+                        writeln!(error, "Deadlock #{i}").expect("fail to writeln!");
+                        for t in threads {
+                            writeln!(
+                                error,
+                                "Thread Id {:#?}\n{:#?}",
+                                t.thread_id(),
+                                t.backtrace(),
+                            )
+                            .expect("fail to writeln!");
+                        }
+                    }
+                    log::error!("{error}");
                 }
-                log::error!("{}", error);
             })
             .unwrap();
     }

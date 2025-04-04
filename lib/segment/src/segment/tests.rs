@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::sync::atomic::AtomicBool;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::tar_ext;
 use rstest::rstest;
 use tempfile::Builder;
@@ -11,45 +12,33 @@ use crate::common::operation_error::OperationError::PointIdError;
 use crate::common::{check_named_vectors, check_vector, check_vector_name};
 use crate::data_types::named_vectors::NamedVectors;
 use crate::data_types::query_context::QueryContext;
-use crate::data_types::vectors::{only_default_vector, DEFAULT_VECTOR_NAME};
+use crate::data_types::vectors::{DEFAULT_VECTOR_NAME, only_default_vector};
+use crate::entry::SnapshotEntry as _;
 use crate::entry::entry_point::SegmentEntry;
-use crate::segment_constructor::{build_segment, load_segment};
-use crate::types::{
-    Distance, Filter, Indexes, Payload, SegmentConfig, SnapshotFormat, VectorDataConfig,
-    VectorStorageType, WithPayload, WithVector,
+use crate::segment_constructor::load_segment;
+use crate::segment_constructor::simple_segment_constructor::{
+    VECTOR1_NAME, VECTOR2_NAME, build_multivec_segment, build_simple_segment,
 };
+use crate::types::{Distance, Filter, Payload, SnapshotFormat, WithPayload, WithVector};
 
 #[test]
 fn test_search_batch_equivalence_single() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let dim = 4;
-    let config = SegmentConfig {
-        vector_data: HashMap::from([(
-            DEFAULT_VECTOR_NAME.to_owned(),
-            VectorDataConfig {
-                size: dim,
-                distance: Distance::Dot,
-                storage_type: VectorStorageType::Memory,
-                index: Indexes::Plain {},
-                quantization_config: None,
-                multivector_config: None,
-                datatype: None,
-            },
-        )]),
-        sparse_vector_data: Default::default(),
-        payload_storage_type: Default::default(),
-    };
-    let mut segment = build_segment(dir.path(), &config, true).unwrap();
+
+    let mut segment = build_simple_segment(dir.path(), dim, Distance::Dot).unwrap();
+
+    let hw_counter = HardwareCounterCell::new();
 
     let vec4 = vec![1.1, 1.0, 0.0, 1.0];
     segment
-        .upsert_point(100, 4.into(), only_default_vector(&vec4))
+        .upsert_point(100, 4.into(), only_default_vector(&vec4), &hw_counter)
         .unwrap();
     let vec6 = vec![1.0, 1.0, 0.5, 1.0];
     segment
-        .upsert_point(101, 6.into(), only_default_vector(&vec6))
+        .upsert_point(101, 6.into(), only_default_vector(&vec6), &hw_counter)
         .unwrap();
-    segment.delete_point(102, 1.into()).unwrap();
+    segment.delete_point(102, 1.into(), &hw_counter).unwrap();
 
     let query_vector = [1.0, 1.0, 1.0, 1.0].into();
     let search_result = segment
@@ -84,9 +73,6 @@ fn test_search_batch_equivalence_single() {
 
     assert!(!search_result.is_empty());
     assert_eq!(search_result, search_batch_result[0].clone());
-    segment_query_context
-        .take_hardware_counter()
-        .discard_results();
 }
 
 #[test]
@@ -103,31 +89,19 @@ fn test_from_filter_attributes() {
 
     let dir = Builder::new().prefix("payload_dir").tempdir().unwrap();
     let dim = 2;
-    let config = SegmentConfig {
-        vector_data: HashMap::from([(
-            DEFAULT_VECTOR_NAME.to_owned(),
-            VectorDataConfig {
-                size: dim,
-                distance: Distance::Dot,
-                storage_type: VectorStorageType::Memory,
-                index: Indexes::Plain {},
-                quantization_config: None,
-                multivector_config: None,
-                datatype: None,
-            },
-        )]),
-        sparse_vector_data: Default::default(),
-        payload_storage_type: Default::default(),
-    };
 
-    let mut segment = build_segment(dir.path(), &config, true).unwrap();
+    let hw_counter = HardwareCounterCell::new();
+
+    let mut segment = build_simple_segment(dir.path(), dim, Distance::Dot).unwrap();
     segment
-        .upsert_point(0, 0.into(), only_default_vector(&[1.0, 1.0]))
+        .upsert_point(0, 0.into(), only_default_vector(&[1.0, 1.0]), &hw_counter)
         .unwrap();
 
     let payload: Payload = serde_json::from_str(data).unwrap();
 
-    segment.set_full_payload(0, 0.into(), &payload).unwrap();
+    segment
+        .set_full_payload(0, 0.into(), &payload, &hw_counter)
+        .unwrap();
 
     let filter_valid_str = r#"
         {
@@ -199,31 +173,22 @@ fn test_snapshot(#[case] format: SnapshotFormat) {
         }"#;
 
     let segment_base_dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
-    let config = SegmentConfig {
-        vector_data: HashMap::from([(
-            DEFAULT_VECTOR_NAME.to_owned(),
-            VectorDataConfig {
-                size: 2,
-                distance: Distance::Dot,
-                storage_type: VectorStorageType::Memory,
-                index: Indexes::Plain {},
-                quantization_config: None,
-                multivector_config: None,
-                datatype: None,
-            },
-        )]),
-        sparse_vector_data: Default::default(),
-        payload_storage_type: Default::default(),
-    };
 
-    let mut segment = build_segment(segment_base_dir.path(), &config, true).unwrap();
+    let hw_counter = HardwareCounterCell::new();
+
+    let mut segment = build_simple_segment(segment_base_dir.path(), 2, Distance::Dot).unwrap();
 
     segment
-        .upsert_point(0, 0.into(), only_default_vector(&[1.0, 1.0]))
+        .upsert_point(0, 0.into(), only_default_vector(&[1.0, 1.0]), &hw_counter)
         .unwrap();
 
     segment
-        .set_full_payload(1, 0.into(), &serde_json::from_str(data).unwrap())
+        .set_full_payload(
+            1,
+            0.into(),
+            &serde_json::from_str(data).unwrap(),
+            &hw_counter,
+        )
         .unwrap();
 
     let temp_dir = Builder::new().prefix("temp_dir").tempdir().unwrap();
@@ -242,7 +207,7 @@ fn test_snapshot(#[case] format: SnapshotFormat) {
     // snapshotting!
     let tar = tar_ext::BuilderExt::new_seekable_owned(File::create(&parent_snapshot_tar).unwrap());
     segment
-        .take_snapshot(temp_dir.path(), &tar, format, &mut HashSet::new())
+        .take_snapshot(temp_dir.path(), &tar, format, None, &mut HashSet::new())
         .unwrap();
     tar.blocking_finish().unwrap();
 
@@ -303,8 +268,8 @@ fn test_snapshot(#[case] format: SnapshotFormat) {
         let restored_vectors = restored_segment.all_vectors(id).unwrap();
         assert_eq!(vectors, restored_vectors);
 
-        let payload = segment.payload(id).unwrap();
-        let restored_payload = restored_segment.payload(id).unwrap();
+        let payload = segment.payload(id, &hw_counter).unwrap();
+        let restored_payload = restored_segment.payload(id, &hw_counter).unwrap();
         assert_eq!(payload, restored_payload);
     }
 }
@@ -322,30 +287,18 @@ fn test_background_flush() {
         }"#;
 
     let segment_base_dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
-    let config = SegmentConfig {
-        vector_data: HashMap::from([(
-            DEFAULT_VECTOR_NAME.to_owned(),
-            VectorDataConfig {
-                size: 2,
-                distance: Distance::Dot,
-                storage_type: VectorStorageType::Memory,
-                index: Indexes::Plain {},
-                quantization_config: None,
-                multivector_config: None,
-                datatype: None,
-            },
-        )]),
-        sparse_vector_data: Default::default(),
-        payload_storage_type: Default::default(),
-    };
 
-    let mut segment = build_segment(segment_base_dir.path(), &config, true).unwrap();
+    let hw_counter = HardwareCounterCell::new();
+
+    let mut segment = build_simple_segment(segment_base_dir.path(), 2, Distance::Dot).unwrap();
     segment
-        .upsert_point(0, 0.into(), only_default_vector(&[1.0, 1.0]))
+        .upsert_point(0, 0.into(), only_default_vector(&[1.0, 1.0]), &hw_counter)
         .unwrap();
 
     let payload: Payload = serde_json::from_str(data).unwrap();
-    segment.set_full_payload(0, 0.into(), &payload).unwrap();
+    segment
+        .set_full_payload(0, 0.into(), &payload, &hw_counter)
+        .unwrap();
     segment.flush(false, false).unwrap();
 
     // call flush second time to check that background flush finished successful
@@ -356,31 +309,18 @@ fn test_background_flush() {
 fn test_check_consistency() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let dim = 4;
-    let config = SegmentConfig {
-        vector_data: HashMap::from([(
-            DEFAULT_VECTOR_NAME.to_owned(),
-            VectorDataConfig {
-                size: dim,
-                distance: Distance::Dot,
-                storage_type: VectorStorageType::Memory,
-                index: Indexes::Plain {},
-                quantization_config: None,
-                multivector_config: None,
-                datatype: None,
-            },
-        )]),
-        sparse_vector_data: Default::default(),
-        payload_storage_type: Default::default(),
-    };
-    let mut segment = build_segment(dir.path(), &config, true).unwrap();
+
+    let mut segment = build_simple_segment(dir.path(), dim, Distance::Dot).unwrap();
+
+    let hw_counter = HardwareCounterCell::new();
 
     let vec4 = vec![1.1, 1.0, 0.0, 1.0];
     segment
-        .upsert_point(100, 4.into(), only_default_vector(&vec4))
+        .upsert_point(100, 4.into(), only_default_vector(&vec4), &hw_counter)
         .unwrap();
     let vec6 = vec![1.0, 1.0, 0.5, 1.0];
     segment
-        .upsert_point(101, 6.into(), only_default_vector(&vec6))
+        .upsert_point(101, 6.into(), only_default_vector(&vec6), &hw_counter)
         .unwrap();
 
     // first pass on consistent data
@@ -451,43 +391,30 @@ fn test_check_consistency() {
 fn test_point_vector_count() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let dim = 1;
-    let config = SegmentConfig {
-        vector_data: HashMap::from([(
-            DEFAULT_VECTOR_NAME.to_owned(),
-            VectorDataConfig {
-                size: dim,
-                distance: Distance::Dot,
-                storage_type: VectorStorageType::Memory,
-                index: Indexes::Plain {},
-                quantization_config: None,
-                multivector_config: None,
-                datatype: None,
-            },
-        )]),
-        sparse_vector_data: Default::default(),
-        payload_storage_type: Default::default(),
-    };
-    let mut segment = build_segment(dir.path(), &config, true).unwrap();
+
+    let mut segment = build_simple_segment(dir.path(), dim, Distance::Dot).unwrap();
+
+    let hw_counter = HardwareCounterCell::new();
 
     // Insert point ID 4 and 6, assert counts
     segment
-        .upsert_point(100, 4.into(), only_default_vector(&[0.4]))
+        .upsert_point(100, 4.into(), only_default_vector(&[0.4]), &hw_counter)
         .unwrap();
     segment
-        .upsert_point(101, 6.into(), only_default_vector(&[0.6]))
+        .upsert_point(101, 6.into(), only_default_vector(&[0.6]), &hw_counter)
         .unwrap();
     let segment_info = segment.info();
     assert_eq!(segment_info.num_points, 2);
     assert_eq!(segment_info.num_vectors, 2);
 
     // Delete nonexistent point, counts should remain the same
-    segment.delete_point(102, 1.into()).unwrap();
+    segment.delete_point(102, 1.into(), &hw_counter).unwrap();
     let segment_info = segment.info();
     assert_eq!(segment_info.num_points, 2);
     assert_eq!(segment_info.num_vectors, 2);
 
     // Delete point 4, counts should decrease by 1
-    segment.delete_point(103, 4.into()).unwrap();
+    segment.delete_point(103, 4.into(), &hw_counter).unwrap();
     let segment_info = segment.info();
     assert_eq!(segment_info.num_points, 1);
     assert_eq!(segment_info.num_vectors, 2); // We don't propagate deletes to vectors at this time
@@ -505,65 +432,48 @@ fn test_point_vector_count() {
 fn test_point_vector_count_multivec() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let dim = 1;
-    let config = SegmentConfig {
-        vector_data: HashMap::from([
-            (
-                "a".into(),
-                VectorDataConfig {
-                    size: dim,
-                    distance: Distance::Dot,
-                    storage_type: VectorStorageType::Memory,
-                    index: Indexes::Plain {},
-                    quantization_config: None,
-                    multivector_config: None,
-                    datatype: None,
-                },
-            ),
-            (
-                "b".into(),
-                VectorDataConfig {
-                    size: dim,
-                    distance: Distance::Dot,
-                    storage_type: VectorStorageType::Memory,
-                    index: Indexes::Plain {},
-                    quantization_config: None,
-                    multivector_config: None,
-                    datatype: None,
-                },
-            ),
-        ]),
-        sparse_vector_data: Default::default(),
-        payload_storage_type: Default::default(),
-    };
-    let mut segment = build_segment(dir.path(), &config, true).unwrap();
+
+    let mut segment = build_multivec_segment(dir.path(), dim, dim, Distance::Dot).unwrap();
+
+    let hw_counter = HardwareCounterCell::new();
 
     // Insert point ID 4 and 6 fully, 8 and 10 partially, assert counts
     segment
         .upsert_point(
             100,
             4.into(),
-            NamedVectors::from_pairs([("a".into(), vec![0.4]), ("b".into(), vec![0.5])]),
+            NamedVectors::from_pairs([
+                (VECTOR1_NAME.into(), vec![0.4]),
+                (VECTOR2_NAME.into(), vec![0.5]),
+            ]),
+            &hw_counter,
         )
         .unwrap();
     segment
         .upsert_point(
             101,
             6.into(),
-            NamedVectors::from_pairs([("a".into(), vec![0.6]), ("b".into(), vec![0.7])]),
+            NamedVectors::from_pairs([
+                (VECTOR1_NAME.into(), vec![0.6]),
+                (VECTOR2_NAME.into(), vec![0.7]),
+            ]),
+            &hw_counter,
         )
         .unwrap();
     segment
         .upsert_point(
             102,
             8.into(),
-            NamedVectors::from_pairs([("a".into(), vec![0.0])]),
+            NamedVectors::from_pairs([(VECTOR1_NAME.into(), vec![0.0])]),
+            &hw_counter,
         )
         .unwrap();
     segment
         .upsert_point(
             103,
             10.into(),
-            NamedVectors::from_pairs([("b".into(), vec![1.0])]),
+            NamedVectors::from_pairs([(VECTOR2_NAME.into(), vec![1.0])]),
+            &hw_counter,
         )
         .unwrap();
     let segment_info = segment.info();
@@ -571,25 +481,25 @@ fn test_point_vector_count_multivec() {
     assert_eq!(segment_info.num_vectors, 6);
 
     // Delete nonexistent point, counts should remain the same
-    segment.delete_point(104, 1.into()).unwrap();
+    segment.delete_point(104, 1.into(), &hw_counter).unwrap();
     let segment_info = segment.info();
     assert_eq!(segment_info.num_points, 4);
     assert_eq!(segment_info.num_vectors, 6);
 
     // Delete point 4, counts should decrease by 1
-    segment.delete_point(105, 4.into()).unwrap();
+    segment.delete_point(105, 4.into(), &hw_counter).unwrap();
     let segment_info = segment.info();
     assert_eq!(segment_info.num_points, 3);
     assert_eq!(segment_info.num_vectors, 6); // We don't propagate deletes to vectors at this time
 
     // Delete vector 'a' of point 6, vector count should decrease by 1
-    segment.delete_vector(106, 6.into(), "a").unwrap();
+    segment.delete_vector(106, 6.into(), VECTOR1_NAME).unwrap();
     let segment_info = segment.info();
     assert_eq!(segment_info.num_points, 3);
     assert_eq!(segment_info.num_vectors, 5);
 
     // Deleting it again shouldn't chain anything
-    segment.delete_vector(107, 6.into(), "a").unwrap();
+    segment.delete_vector(107, 6.into(), VECTOR1_NAME).unwrap();
     let segment_info = segment.info();
     assert_eq!(segment_info.num_points, 3);
     assert_eq!(segment_info.num_vectors, 5);
@@ -599,7 +509,8 @@ fn test_point_vector_count_multivec() {
     segment
         .replace_all_vectors(
             internal_8,
-            &NamedVectors::from_pairs([("a".into(), vec![0.1])]),
+            &NamedVectors::from_pairs([(VECTOR1_NAME.into(), vec![0.1])]),
+            &hw_counter,
         )
         .unwrap();
     let segment_info = segment.info();
@@ -610,7 +521,11 @@ fn test_point_vector_count_multivec() {
     segment
         .replace_all_vectors(
             internal_8,
-            &NamedVectors::from_pairs([("a".into(), vec![0.1]), ("b".into(), vec![0.1])]),
+            &NamedVectors::from_pairs([
+                (VECTOR1_NAME.into(), vec![0.1]),
+                (VECTOR2_NAME.into(), vec![0.1]),
+            ]),
+            &hw_counter,
         )
         .unwrap();
     let segment_info = segment.info();
@@ -622,37 +537,10 @@ fn test_point_vector_count_multivec() {
 #[test]
 fn test_vector_compatibility_checks() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
-    let config = SegmentConfig {
-        vector_data: HashMap::from([
-            (
-                "a".into(),
-                VectorDataConfig {
-                    size: 4,
-                    distance: Distance::Dot,
-                    storage_type: VectorStorageType::Memory,
-                    index: Indexes::Plain {},
-                    quantization_config: None,
-                    multivector_config: None,
-                    datatype: None,
-                },
-            ),
-            (
-                "b".into(),
-                VectorDataConfig {
-                    size: 2,
-                    distance: Distance::Dot,
-                    storage_type: VectorStorageType::Memory,
-                    index: Indexes::Plain {},
-                    quantization_config: None,
-                    multivector_config: None,
-                    datatype: None,
-                },
-            ),
-        ]),
-        sparse_vector_data: Default::default(),
-        payload_storage_type: Default::default(),
-    };
-    let mut segment = build_segment(dir.path(), &config, true).unwrap();
+
+    let mut segment = build_multivec_segment(dir.path(), 4, 2, Distance::Dot).unwrap();
+
+    let hw_counter = HardwareCounterCell::new();
 
     // Insert one point for a reference internal ID
     let point_id = 4.into();
@@ -661,9 +549,10 @@ fn test_vector_compatibility_checks() {
             100,
             point_id,
             NamedVectors::from_pairs([
-                ("a".into(), vec![0.1, 0.2, 0.3, 0.4]),
-                ("b".into(), vec![1.0, 0.9]),
+                (VECTOR1_NAME.into(), vec![0.1, 0.2, 0.3, 0.4]),
+                (VECTOR2_NAME.into(), vec![1.0, 0.9]),
             ]),
+            &hw_counter,
         )
         .unwrap();
     let internal_id = segment.lookup_internal_id(point_id).unwrap();
@@ -671,41 +560,41 @@ fn test_vector_compatibility_checks() {
     // A set of broken vectors
     let wrong_vectors_single = vec![
         // Incorrect dimensionality
-        ("a", vec![]),
-        ("a", vec![0.0, 1.0, 0.0]),
-        ("a", vec![0.0, 1.0, 0.0, 1.0, 0.0]),
-        ("b", vec![]),
-        ("b", vec![0.5]),
-        ("b", vec![0.0, 0.1, 0.2, 0.3]),
+        (VECTOR1_NAME, vec![]),
+        (VECTOR1_NAME, vec![0.0, 1.0, 0.0]),
+        (VECTOR1_NAME, vec![0.0, 1.0, 0.0, 1.0, 0.0]),
+        (VECTOR2_NAME, vec![]),
+        (VECTOR2_NAME, vec![0.5]),
+        (VECTOR2_NAME, vec![0.0, 0.1, 0.2, 0.3]),
         // Incorrect names
         ("aa", vec![0.0, 0.1, 0.2, 0.3]),
         ("bb", vec![0.0, 0.1]),
     ];
     let wrong_vectors_multi = vec![
         // Incorrect dimensionality
-        NamedVectors::from_ref("a", [].as_slice().into()),
-        NamedVectors::from_ref("a", [0.0, 1.0, 0.0].as_slice().into()),
-        NamedVectors::from_ref("a", [0.0, 1.0, 0.0, 1.0, 0.0].as_slice().into()),
-        NamedVectors::from_ref("b", [].as_slice().into()),
-        NamedVectors::from_ref("b", [0.5].as_slice().into()),
-        NamedVectors::from_ref("b", [0.0, 0.1, 0.2, 0.3].as_slice().into()),
+        NamedVectors::from_ref(VECTOR1_NAME, [].as_slice().into()),
+        NamedVectors::from_ref(VECTOR1_NAME, [0.0, 1.0, 0.0].as_slice().into()),
+        NamedVectors::from_ref(VECTOR1_NAME, [0.0, 1.0, 0.0, 1.0, 0.0].as_slice().into()),
+        NamedVectors::from_ref(VECTOR2_NAME, [].as_slice().into()),
+        NamedVectors::from_ref(VECTOR2_NAME, [0.5].as_slice().into()),
+        NamedVectors::from_ref(VECTOR2_NAME, [0.0, 0.1, 0.2, 0.3].as_slice().into()),
         NamedVectors::from_pairs([
-            ("a".into(), vec![0.1, 0.2, 0.3]),
-            ("b".into(), vec![1.0, 0.9]),
+            (VECTOR1_NAME.into(), vec![0.1, 0.2, 0.3]),
+            (VECTOR2_NAME.into(), vec![1.0, 0.9]),
         ]),
         NamedVectors::from_pairs([
-            ("a".into(), vec![0.1, 0.2, 0.3, 0.4]),
-            ("b".into(), vec![1.0, 0.9, 0.0]),
+            (VECTOR1_NAME.into(), vec![0.1, 0.2, 0.3, 0.4]),
+            (VECTOR2_NAME.into(), vec![1.0, 0.9, 0.0]),
         ]),
         // Incorrect names
         NamedVectors::from_ref("aa", [0.0, 0.1, 0.2, 0.3].as_slice().into()),
         NamedVectors::from_ref("bb", [0.0, 0.1].as_slice().into()),
         NamedVectors::from_pairs([
             ("aa".into(), vec![0.1, 0.2, 0.3, 0.4]),
-            ("b".into(), vec![1.0, 0.9]),
+            (VECTOR2_NAME.into(), vec![1.0, 0.9]),
         ]),
         NamedVectors::from_pairs([
-            ("a".into(), vec![0.1, 0.2, 0.3, 0.4]),
+            (VECTOR1_NAME.into(), vec![0.1, 0.2, 0.3, 0.4]),
             ("bb".into(), vec![1.0, 0.9]),
         ]),
     ];
@@ -713,7 +602,7 @@ fn test_vector_compatibility_checks() {
 
     for (vector_name, vector) in wrong_vectors_single.iter() {
         let query_vector = vector.to_owned().into();
-        check_vector(vector_name, &query_vector, &config)
+        check_vector(vector_name, &query_vector, &segment.segment_config)
             .err()
             .unwrap();
         segment
@@ -752,27 +641,31 @@ fn test_vector_compatibility_checks() {
     }
 
     for vectors in wrong_vectors_multi {
-        check_named_vectors(&vectors, &config).err().unwrap();
-        segment
-            .upsert_point(101, point_id, vectors.clone())
+        check_named_vectors(&vectors, &segment.segment_config)
             .err()
             .unwrap();
         segment
-            .update_vectors(internal_id, vectors.clone())
+            .upsert_point(101, point_id, vectors.clone(), &hw_counter)
             .err()
             .unwrap();
         segment
-            .insert_new_vectors(point_id, &vectors)
+            .update_vectors(internal_id, vectors.clone(), &hw_counter)
             .err()
             .unwrap();
         segment
-            .replace_all_vectors(internal_id, &vectors)
+            .insert_new_vectors(point_id, &vectors, &hw_counter)
+            .err()
+            .unwrap();
+        segment
+            .replace_all_vectors(internal_id, &vectors, &hw_counter)
             .err()
             .unwrap();
     }
 
     for wrong_name in wrong_names {
-        check_vector_name(wrong_name, &config).err().unwrap();
+        check_vector_name(wrong_name, &segment.segment_config)
+            .err()
+            .unwrap();
         segment.vector(wrong_name, point_id).err().unwrap();
         segment
             .delete_vector(101, point_id, wrong_name)
@@ -799,25 +692,17 @@ fn test_handle_point_version() {
     // Create base segment with a single point
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let dim = 4;
-    let config = SegmentConfig {
-        vector_data: HashMap::from([(
-            DEFAULT_VECTOR_NAME.to_owned(),
-            VectorDataConfig {
-                size: dim,
-                distance: Distance::Dot,
-                storage_type: VectorStorageType::Memory,
-                index: Indexes::Plain {},
-                quantization_config: None,
-                multivector_config: None,
-                datatype: None,
-            },
-        )]),
-        sparse_vector_data: Default::default(),
-        payload_storage_type: Default::default(),
-    };
-    let mut segment = build_segment(dir.path(), &config, true).unwrap();
+
+    let hw_counter = HardwareCounterCell::new();
+
+    let mut segment = build_simple_segment(dir.path(), dim, Distance::Dot).unwrap();
     segment
-        .upsert_point(100, 1.into(), only_default_vector(&[1.1, 1.0, 0.0, 1.0]))
+        .upsert_point(
+            100,
+            1.into(),
+            only_default_vector(&[1.1, 1.0, 0.0, 1.0]),
+            &hw_counter,
+        )
         .unwrap();
 
     // Do not handle operation on existing point when providing an old version

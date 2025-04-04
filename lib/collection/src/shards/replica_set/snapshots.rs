@@ -4,13 +4,14 @@ use std::path::Path;
 use common::tar_ext;
 use segment::types::SnapshotFormat;
 
-use super::{ReplicaSetState, ReplicaState, ShardReplicaSet, REPLICA_STATE_FILE};
+use super::{REPLICA_STATE_FILE, ReplicaSetState, ReplicaState, ShardReplicaSet};
 use crate::operations::types::{CollectionError, CollectionResult};
 use crate::save_on_disk::SaveOnDisk;
 use crate::shards::dummy_shard::DummyShard;
 use crate::shards::local_shard::LocalShard;
 use crate::shards::shard::{PeerId, Shard};
 use crate::shards::shard_config::ShardConfig;
+use crate::shards::shard_initializing_flag_path;
 
 impl ShardReplicaSet {
     pub async fn create_snapshot(
@@ -81,6 +82,7 @@ impl ShardReplicaSet {
     pub async fn restore_local_replica_from(
         &self,
         replica_path: &Path,
+        collection_path: &Path,
         cancel: cancel::CancellationToken,
     ) -> CollectionResult<bool> {
         // `local.take()` call and `restore` task have to be executed as a single transaction
@@ -95,6 +97,13 @@ impl ShardReplicaSet {
 
         let mut local = cancel::future::cancel_on_token(cancel.clone(), self.local.write()).await?;
 
+        // set shard_id initialization flag
+        // the file is removed after full recovery to indicate a well-formed shard
+        // for example: some of the files may go missing if node gets killed during shard directory move/replace
+        let shard_flag = shard_initializing_flag_path(collection_path, self.shard_id);
+        let flag_file = tokio::fs::File::create(&shard_flag).await?;
+        flag_file.sync_all().await?;
+
         // Check `cancel` token one last time before starting non-cancellable section
         if cancel.is_cancelled() {
             return Err(cancel::Error::Cancelled.into());
@@ -106,6 +115,7 @@ impl ShardReplicaSet {
         // Try to restore local replica from specified shard snapshot directory
         let restore = async {
             if clear {
+                // Remove shard data but not configuration files
                 LocalShard::clear(&self.shard_path).await?;
             }
 
@@ -121,7 +131,7 @@ impl ShardReplicaSet {
                 self.payload_index_schema.clone(),
                 self.update_runtime.clone(),
                 self.search_runtime.clone(),
-                self.optimizer_cpu_budget.clone(),
+                self.optimizer_resource_budget.clone(),
             )
             .await
         };
@@ -129,6 +139,8 @@ impl ShardReplicaSet {
         match restore.await {
             Ok(new_local) => {
                 local.replace(Shard::Local(new_local));
+                // remove shard_id initialization flag because shard is fully recovered
+                tokio::fs::remove_file(&shard_flag).await?;
                 Ok(true)
             }
 
@@ -138,9 +150,9 @@ impl ShardReplicaSet {
                     "Failed to restore local replica",
                 )));
 
-                // TODO: Handle single-node mode!? (How!? 😰)
-
                 // Mark this peer as "locally disabled"...
+                //
+                // `active_remote_shards` includes `Active` and `ReshardingScaleDown` replicas!
                 let has_other_active_peers = self.active_remote_shards().is_empty();
 
                 // ...if this peer is *not* the last active replica
@@ -159,8 +171,9 @@ impl ShardReplicaSet {
                     }
                 }
 
-                // Remove shard directory, so we don't leave empty directory/corrupted data
-                match tokio::fs::remove_dir_all(&self.shard_path).await {
+                // Remove inner shard data but keep the shard folder with its configuration files.
+                // This way the shard can be read on startup and the user can decide what to do next.
+                match LocalShard::clear(&self.shard_path).await {
                     Ok(()) => Err(restore_err),
 
                     Err(cleanup_err) => {

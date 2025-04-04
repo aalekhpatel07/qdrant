@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use serde::{Deserialize, Serialize};
 
@@ -37,16 +38,21 @@ impl Document {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ParsedQuery {
     pub tokens: Vec<Option<TokenId>>,
 }
 
 impl ParsedQuery {
-    pub fn check_match(&self, document: &Document) -> bool {
+    pub fn check_match(&self, document: &Document, hw_counter: &HardwareCounterCell) -> bool {
         if self.tokens.contains(&None) {
             return false;
         }
+
+        hw_counter
+            .payload_index_io_read_counter()
+            .incr_delta((self.tokens.len() + document.tokens().len()) * size_of::<TokenId>());
+
         // Check that all tokens are in document
         self.tokens
             .iter()
@@ -77,18 +83,29 @@ pub trait InvertedIndex {
         Document::new(document_tokens)
     }
 
-    fn index_document(&mut self, idx: PointOffsetType, document: Document) -> OperationResult<()>;
+    fn index_document(
+        &mut self,
+        idx: PointOffsetType,
+        document: Document,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()>;
 
     fn remove_document(&mut self, idx: PointOffsetType) -> bool;
 
-    fn filter(&self, query: &ParsedQuery) -> Box<dyn Iterator<Item = PointOffsetType> + '_>;
+    fn filter<'a>(
+        &'a self,
+        query: ParsedQuery,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> Box<dyn Iterator<Item = PointOffsetType> + 'a>;
 
-    fn get_posting_len(&self, token_id: TokenId) -> Option<usize>;
+    fn get_posting_len(&self, token_id: TokenId, hw_counter: &HardwareCounterCell)
+    -> Option<usize>;
 
     fn estimate_cardinality(
         &self,
         query: &ParsedQuery,
         condition: &FieldCondition,
+        hw_counter: &HardwareCounterCell,
     ) -> CardinalityEstimation {
         let points_count = self.points_count();
 
@@ -97,13 +114,13 @@ pub trait InvertedIndex {
             .iter()
             .map(|&vocab_idx| match vocab_idx {
                 None => None,
-                Some(idx) => self.get_posting_len(idx),
+                Some(idx) => self.get_posting_len(idx, hw_counter),
             })
             .collect();
         if posting_lengths.is_none() || points_count == 0 {
             // There are unseen tokens -> no matches
             return CardinalityEstimation {
-                primary_clauses: vec![PrimaryCondition::Condition(condition.clone())],
+                primary_clauses: vec![PrimaryCondition::Condition(Box::new(condition.clone()))],
                 min: 0,
                 exp: 0,
                 max: 0,
@@ -113,7 +130,7 @@ pub trait InvertedIndex {
         if postings.is_empty() {
             // Empty request -> no matches
             return CardinalityEstimation {
-                primary_clauses: vec![PrimaryCondition::Condition(condition.clone())],
+                primary_clauses: vec![PrimaryCondition::Condition(Box::new(condition.clone()))],
                 min: 0,
                 exp: 0,
                 max: 0,
@@ -122,9 +139,9 @@ pub trait InvertedIndex {
         // Smallest posting is the largest possible cardinality
         let smallest_posting = postings.iter().min().copied().unwrap();
 
-        return if postings.len() == 1 {
+        if postings.len() == 1 {
             CardinalityEstimation {
-                primary_clauses: vec![PrimaryCondition::Condition(condition.clone())],
+                primary_clauses: vec![PrimaryCondition::Condition(Box::new(condition.clone()))],
                 min: smallest_posting,
                 exp: smallest_posting,
                 max: smallest_posting,
@@ -136,12 +153,12 @@ pub trait InvertedIndex {
                 .product();
             let exp = (expected_frac * points_count as f64) as usize;
             CardinalityEstimation {
-                primary_clauses: vec![PrimaryCondition::Condition(condition.clone())],
+                primary_clauses: vec![PrimaryCondition::Condition(Box::new(condition.clone()))],
                 min: 0, // ToDo: make better estimation
                 exp,
                 max: smallest_posting,
             }
-        };
+        }
     }
 
     fn vocab_with_postings_len_iter(&self) -> impl Iterator<Item = (&str, usize)> + '_;
@@ -168,7 +185,12 @@ pub trait InvertedIndex {
             .filter_map(map_filter_condition)
     }
 
-    fn check_match(&self, parsed_query: &ParsedQuery, point_id: PointOffsetType) -> bool;
+    fn check_match(
+        &self,
+        parsed_query: &ParsedQuery,
+        point_id: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> bool;
 
     fn values_is_empty(&self, point_id: PointOffsetType) -> bool;
 
@@ -176,15 +198,16 @@ pub trait InvertedIndex {
 
     fn points_count(&self) -> usize;
 
-    fn get_token_id(&self, token: &str) -> Option<TokenId>;
+    fn get_token_id(&self, token: &str, hw_counter: &HardwareCounterCell) -> Option<TokenId>;
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
-    use rand::seq::SliceRandom;
+    use common::counter::hardware_counter::HardwareCounterCell;
     use rand::Rng;
+    use rand::seq::SliceRandom;
     use rstest::rstest;
 
     use super::{InvertedIndex, ParsedQuery, TokenId};
@@ -193,19 +216,19 @@ mod tests {
     use crate::index::field_index::full_text_index::mutable_inverted_index::MutableInvertedIndex;
 
     fn generate_word() -> String {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         // Each word is 1 to 3 characters long
-        let len = rng.gen_range(1..=3);
-        rng.sample_iter(rand::distributions::Alphanumeric)
+        let len = rng.random_range(1..=3);
+        rng.sample_iter(rand::distr::Alphanumeric)
             .take(len)
             .map(char::from)
             .collect()
     }
 
     fn generate_query() -> Vec<String> {
-        let mut rng = rand::thread_rng();
-        let len = rng.gen_range(1..=2);
+        let mut rng = rand::rng();
+        let len = rng.random_range(1..=2);
         (0..len).map(|_| generate_word()).collect()
     }
 
@@ -220,17 +243,19 @@ mod tests {
     fn mutable_inverted_index(indexed_count: u32, deleted_count: u32) -> MutableInvertedIndex {
         let mut index = MutableInvertedIndex::default();
 
+        let hw_counter = HardwareCounterCell::new();
+
         for idx in 0..indexed_count {
             // Generate 10 tot 30-word documents
-            let doc_len = rand::thread_rng().gen_range(10..=30);
+            let doc_len = rand::rng().random_range(10..=30);
             let tokens: BTreeSet<String> = (0..doc_len).map(|_| generate_word()).collect();
             let document = index.document_from_tokens(&tokens);
-            index.index_document(idx, document).unwrap();
+            index.index_document(idx, document, &hw_counter).unwrap();
         }
 
         // Remove some points
         let mut points_to_delete = (0..indexed_count).collect::<Vec<_>>();
-        points_to_delete.shuffle(&mut rand::thread_rng());
+        points_to_delete.shuffle(&mut rand::rng());
         for idx in &points_to_delete[..deleted_count as usize] {
             index.remove_document(*idx);
         }
@@ -247,6 +272,8 @@ mod tests {
         assert!(immutable.vocab.len() < mutable.vocab.len());
         assert!(immutable.postings.len() < mutable.postings.len());
         assert!(!immutable.vocab.is_empty());
+
+        let hw_counter = HardwareCounterCell::new();
 
         // Check that new vocabulary token ids leads to the same posting lists
         assert!({
@@ -268,10 +295,10 @@ mod tests {
 
                 let new_contains_orig = orig_posting
                     .iter()
-                    .all(|point_id| new_posting.contains(point_id));
+                    .all(|point_id| new_posting.reader(&hw_counter).contains(point_id));
 
                 let orig_contains_new = new_posting
-                    .iter()
+                    .iter(&hw_counter)
                     .all(|point_id| orig_posting.contains(point_id));
 
                 new_contains_orig && orig_contains_new
@@ -285,6 +312,7 @@ mod tests {
     #[case(1111, 1110)]
     #[case(1111, 0)]
     #[case(10, 2)]
+    #[case(0, 0)]
     #[test]
     fn test_immutable_to_mmap(#[case] indexed_count: u32, #[case] deleted_count: u32) {
         let mutable = mutable_inverted_index(indexed_count, deleted_count);
@@ -294,18 +322,20 @@ mod tests {
 
         MmapInvertedIndex::create(path.clone(), immutable.clone()).unwrap();
 
+        let hw_counter = HardwareCounterCell::new();
+
         let mmap = MmapInvertedIndex::open(path, false).unwrap();
 
         // Check same vocabulary
         for (token, token_id) in immutable.vocab.iter() {
-            assert_eq!(mmap.get_token_id(token), Some(*token_id));
+            assert_eq!(mmap.get_token_id(token, &hw_counter), Some(*token_id));
         }
 
         // Check same postings
         for (token_id, posting) in immutable.postings.iter().enumerate() {
-            let chunk_reader = mmap.postings.get(token_id as u32).unwrap();
+            let chunk_reader = mmap.postings.get(token_id as u32, &hw_counter).unwrap();
 
-            for point_id in posting.iter() {
+            for point_id in posting.iter(&hw_counter) {
                 assert!(chunk_reader.contains(point_id));
             }
         }
@@ -351,14 +381,24 @@ mod tests {
             .map(|query| to_parsed_query(query, |token| mutable.vocab.get(&token).copied()))
             .collect();
 
+        let hw_counter = HardwareCounterCell::new();
+
         let imm_parsed_queries: Vec<_> = queries
             .into_iter()
-            .map(|query| to_parsed_query(query, |token| mmap_index.get_token_id(&token)))
+            .map(|query| {
+                to_parsed_query(query, |token| mmap_index.get_token_id(&token, &hw_counter))
+            })
             .collect();
 
-        for (mut_query, imm_query) in mut_parsed_queries.iter().zip(imm_parsed_queries.iter()) {
-            let mut_filtered = mutable.filter(mut_query).collect::<Vec<_>>();
-            let imm_filtered = mmap_index.filter(imm_query).collect::<Vec<_>>();
+        for (mut_query, imm_query) in mut_parsed_queries
+            .iter()
+            .cloned()
+            .zip(imm_parsed_queries.iter().cloned())
+        {
+            let mut_filtered = mutable.filter(mut_query, &hw_counter).collect::<Vec<_>>();
+            let imm_filtered = mmap_index
+                .filter(imm_query, &hw_counter)
+                .collect::<Vec<_>>();
 
             assert_eq!(mut_filtered, imm_filtered);
         }
@@ -366,7 +406,7 @@ mod tests {
         // Delete random documents from both indexes
 
         let points_to_delete: Vec<_> = (0..deleted_count)
-            .map(|_| rand::thread_rng().gen_range(0..indexed_count))
+            .map(|_| rand::rng().random_range(0..indexed_count))
             .collect();
 
         for point_id in &points_to_delete {
@@ -376,9 +416,15 @@ mod tests {
 
         // Check congruence after deletion
 
-        for (mut_query, imm_query) in mut_parsed_queries.iter().zip(imm_parsed_queries.iter()) {
-            let mut_filtered = mutable.filter(mut_query).collect::<Vec<_>>();
-            let imm_filtered = mmap_index.filter(imm_query).collect::<Vec<_>>();
+        for (mut_query, imm_query) in mut_parsed_queries
+            .iter()
+            .cloned()
+            .zip(imm_parsed_queries.iter().cloned())
+        {
+            let mut_filtered = mutable.filter(mut_query, &hw_counter).collect::<Vec<_>>();
+            let imm_filtered = mmap_index
+                .filter(imm_query, &hw_counter)
+                .collect::<Vec<_>>();
 
             assert_eq!(mut_filtered, imm_filtered);
         }

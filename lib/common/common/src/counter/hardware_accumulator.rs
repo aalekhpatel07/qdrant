@@ -1,149 +1,205 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::hardware_counter::HardwareCounterCell;
+use super::hardware_data::HardwareData;
 
 /// Data structure, that routes hardware measurement counters to specific location.
 /// Shared drain MUST NOT create its own counters, but only hold a reference to the existing one,
 /// as it doesn't provide any checks on drop.
-struct HwSharedDrain {
-    cpu_counter: Arc<AtomicUsize>,
+#[derive(Debug)]
+pub struct HwSharedDrain {
+    pub(crate) cpu_counter: Arc<AtomicUsize>,
+    pub(crate) payload_io_read_counter: Arc<AtomicUsize>,
+    pub(crate) payload_io_write_counter: Arc<AtomicUsize>,
+    pub(crate) payload_index_io_read_counter: Arc<AtomicUsize>,
+    pub(crate) payload_index_io_write_counter: Arc<AtomicUsize>,
+    pub(crate) vector_io_read_counter: Arc<AtomicUsize>,
+    pub(crate) vector_io_write_counter: Arc<AtomicUsize>,
 }
 
 impl HwSharedDrain {
-    fn new(cpu: Arc<AtomicUsize>) -> Self {
-        Self { cpu_counter: cpu }
+    pub fn get_cpu(&self) -> usize {
+        self.cpu_counter.load(Ordering::Relaxed)
+    }
+
+    pub fn get_payload_io_read(&self) -> usize {
+        self.payload_io_read_counter.load(Ordering::Relaxed)
+    }
+
+    pub fn get_payload_io_write(&self) -> usize {
+        self.payload_io_write_counter.load(Ordering::Relaxed)
+    }
+
+    pub fn get_payload_index_io_read(&self) -> usize {
+        self.payload_index_io_read_counter.load(Ordering::Relaxed)
+    }
+
+    pub fn get_payload_index_io_write(&self) -> usize {
+        self.payload_index_io_write_counter.load(Ordering::Relaxed)
+    }
+
+    pub fn get_vector_io_write(&self) -> usize {
+        self.vector_io_write_counter.load(Ordering::Relaxed)
+    }
+
+    pub fn get_vector_io_read(&self) -> usize {
+        self.vector_io_read_counter.load(Ordering::Relaxed)
+    }
+
+    /// Accumulates all values from `src` into this HwSharedDrain.
+    fn accumulate_from_hw_data(&self, src: HardwareData) {
+        let HwSharedDrain {
+            cpu_counter,
+            payload_io_read_counter,
+            payload_io_write_counter,
+            payload_index_io_read_counter,
+            payload_index_io_write_counter,
+            vector_io_read_counter,
+            vector_io_write_counter,
+        } = self;
+
+        cpu_counter.fetch_add(src.cpu, Ordering::Relaxed);
+        payload_io_read_counter.fetch_add(src.payload_io_read, Ordering::Relaxed);
+        payload_io_write_counter.fetch_add(src.payload_io_write, Ordering::Relaxed);
+        payload_index_io_read_counter.fetch_add(src.payload_index_io_read, Ordering::Relaxed);
+        payload_index_io_write_counter.fetch_add(src.payload_index_io_write, Ordering::Relaxed);
+        vector_io_read_counter.fetch_add(src.vector_io_read, Ordering::Relaxed);
+        vector_io_write_counter.fetch_add(src.vector_io_write, Ordering::Relaxed);
+    }
+}
+
+impl Clone for HwSharedDrain {
+    fn clone(&self) -> Self {
+        HwSharedDrain {
+            cpu_counter: self.cpu_counter.clone(),
+            payload_io_read_counter: self.payload_io_read_counter.clone(),
+            payload_io_write_counter: self.payload_io_write_counter.clone(),
+            payload_index_io_read_counter: self.payload_index_io_read_counter.clone(),
+            payload_index_io_write_counter: self.payload_index_io_write_counter.clone(),
+            vector_io_read_counter: self.vector_io_read_counter.clone(),
+            vector_io_write_counter: self.vector_io_write_counter.clone(),
+        }
+    }
+}
+impl Default for HwSharedDrain {
+    fn default() -> Self {
+        Self {
+            cpu_counter: Arc::new(AtomicUsize::new(0)),
+            payload_io_read_counter: Arc::new(AtomicUsize::new(0)),
+            payload_io_write_counter: Arc::new(AtomicUsize::new(0)),
+            payload_index_io_read_counter: Arc::new(AtomicUsize::new(0)),
+            payload_index_io_write_counter: Arc::new(AtomicUsize::new(0)),
+            vector_io_read_counter: Arc::new(AtomicUsize::new(0)),
+            vector_io_write_counter: Arc::new(AtomicUsize::new(0)),
+        }
     }
 }
 
 /// A "slow" but thread-safe accumulator for measurement results of `HardwareCounterCell` values.
 /// This type is completely reference counted and clones of this type will read/write the same values as their origin structure.
+#[derive(Debug)]
 pub struct HwMeasurementAcc {
-    cpu_counter: Arc<AtomicUsize>,
-    drain: Option<HwSharedDrain>,
+    request_drain: HwSharedDrain,
+    metrics_drain: HwSharedDrain,
+    /// If this is set to true, the accumulator will not accumulate any values.
+    disposable: bool,
 }
 
 impl HwMeasurementAcc {
+    #[cfg(feature = "testing")]
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn new_with_values(cpu: usize) -> Self {
         Self {
-            cpu_counter: Arc::new(AtomicUsize::new(cpu)),
-            drain: None,
+            request_drain: HwSharedDrain::default(),
+            metrics_drain: HwSharedDrain::default(),
+            disposable: false,
         }
     }
 
-    pub fn new_with_drain(drain: &Self) -> Self {
+    /// Create a disposable accumulator, which will not accumulate any values.
+    /// WARNING: This is intended for specific internal use-cases only.
+    /// DO NOT use it in tests or if you don't know what you're doing.
+    pub fn disposable() -> Self {
         Self {
-            cpu_counter: Arc::new(AtomicUsize::new(0)),
-            drain: Some(HwSharedDrain::new(drain.cpu_counter.clone())),
+            request_drain: HwSharedDrain::default(),
+            metrics_drain: HwSharedDrain::default(),
+            disposable: true,
         }
     }
 
-    /// Creates a new instance of `HwMeasurementAcc` we call "collector" with self as a "parent".
-    /// All values collected by the collector will be applied to the parents counters
-    /// when the collector drops.
-    /// This allows using `HwMeasurementAcc` in multi-threaded or async code without cloning it.
-    pub fn new_collector(&self) -> HwMeasurementAcc {
-        HwMeasurementAcc {
-            cpu_counter: Arc::new(AtomicUsize::new(0)),
-            drain: Some(HwSharedDrain::new(self.cpu_counter.clone())),
+    pub fn is_disposable(&self) -> bool {
+        self.disposable
+    }
+
+    /// Returns a new `HardwareCounterCell` that accumulates it's measurements to the same parent than this `HwMeasurementAcc`.
+    pub fn get_counter_cell(&self) -> HardwareCounterCell {
+        HardwareCounterCell::new_with_accumulator(self.clone())
+    }
+
+    pub fn new_with_metrics_drain(metrics_drain: HwSharedDrain) -> Self {
+        Self {
+            request_drain: HwSharedDrain::default(),
+            metrics_drain,
+            disposable: false,
         }
     }
 
-    /// Creates completely independent copy of the current `HwMeasurementAcc`'s values.
-    pub fn deep_copy(&self) -> Self {
-        Self::new_with_values(self.get_cpu())
+    pub fn accumulate<T: Into<HardwareData>>(&self, src: T) {
+        let src = src.into();
+        self.request_drain.accumulate_from_hw_data(src);
+        self.metrics_drain.accumulate_from_hw_data(src);
+    }
+
+    /// Accumulate usage values for request drain only.
+    /// This is useful if we want to report usage, which happened on another machine
+    /// So we don't want to accumulate the same usage on the current machine second time
+    pub fn accumulate_request<T: Into<HardwareData>>(&self, src: T) {
+        let src = src.into();
+        self.request_drain.accumulate_from_hw_data(src);
     }
 
     pub fn get_cpu(&self) -> usize {
-        self.cpu_counter.load(Ordering::Relaxed)
+        self.request_drain.get_cpu()
     }
 
-    /// Discards all values of the `HwMeasurementAcc`.
-    ///
-    /// This function explicitly states that we don't care about the measurement result and therefore want
-    /// to disable the check on `drop`.
-    pub fn discard(&self) {
-        let HwMeasurementAcc {
-            cpu_counter,
-            drain: _,
-        } = self;
-
-        cpu_counter.store(0, Ordering::Relaxed);
+    pub fn get_payload_io_read(&self) -> usize {
+        self.request_drain.get_payload_io_read()
     }
 
-    /// Merge, but for internal use only.
-    fn merge_to_drain(&self) {
-        if let Some(drain) = &self.drain {
-            let HwSharedDrain {
-                cpu_counter: drain_cpu_counter,
-            } = drain;
-
-            let cpu = self.cpu_counter.swap(0, Ordering::Relaxed);
-            drain_cpu_counter.fetch_add(cpu, Ordering::Relaxed);
-        }
+    pub fn get_payload_io_write(&self) -> usize {
+        self.request_drain.get_payload_io_write()
     }
 
-    /// Consumes and accumulates the values from `other` into the accumulator.
-    pub fn merge(&self, other: Self) {
-        let HwMeasurementAcc {
-            ref cpu_counter,
-            drain: _,
-        } = other;
-        // Discard of the drain is not a problem, as no counters are lost.
-        let cpu = cpu_counter.swap(0, Ordering::Relaxed);
-        self.cpu_counter.fetch_add(cpu, Ordering::Relaxed);
+    pub fn get_payload_index_io_read(&self) -> usize {
+        self.request_drain.get_payload_index_io_read()
     }
 
-    /// Consumes and accumulates the values from `hw_counter_cell` into the accumulator.
-    pub fn merge_from_cell(&self, hw_counter_cell: impl Into<HardwareCounterCell>) {
-        let HardwareCounterCell { ref cpu_counter } = hw_counter_cell.into();
-
-        self.cpu_counter
-            .fetch_add(cpu_counter.take(), Ordering::Relaxed);
+    pub fn get_payload_index_io_write(&self) -> usize {
+        self.request_drain.get_payload_index_io_write()
     }
 
-    /// Returns `true` if all values of the `HwMeasurementAcc` are zero.
-    pub fn is_zero(&self) -> bool {
-        let HwMeasurementAcc {
-            ref cpu_counter,
-            drain: _,
-        } = self;
-        cpu_counter.load(Ordering::Relaxed) == 0
+    pub fn get_vector_io_read(&self) -> usize {
+        self.request_drain.get_vector_io_read()
+    }
+
+    pub fn get_vector_io_write(&self) -> usize {
+        self.request_drain.get_vector_io_write()
     }
 }
 
-impl Drop for HwMeasurementAcc {
-    // `HwMeasurementAcc` holds collected hardware measurements for certain operations. To not accidentally lose measured values, we have
-    // this custom drop() function, panicking if it gets dropped while still holding values (in debug/test builds).
-    //
-    // If you encountered it panicking here, it means that you probably don't have propagated or handled some collected measurements properly,
-    // or didn't discard them when unneeded using `discard()`.
-    //
-    // You can apply values by utilizing `merge_from_cell(other_cell)` or `merge(other)`, consuming the other counter, which then can be dropped safely.
-    fn drop(&mut self) {
-        self.merge_to_drain();
-
-        #[cfg(any(debug_assertions, test))] // Fail in both, release and debug tests.
-        {
-            if !self.is_zero() {
-                panic!(
-                    "HwMeasurementAcc dropped while still holding values! Drain: {:?}",
-                    self.drain.is_some()
-                );
-            }
-        }
-    }
-}
-
+#[cfg(feature = "testing")]
 impl Default for HwMeasurementAcc {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for HwMeasurementAcc {
+    fn clone(&self) -> Self {
         Self {
-            cpu_counter: Arc::new(AtomicUsize::new(0)),
-            drain: None,
+            request_drain: self.request_drain.clone(),
+            metrics_drain: self.metrics_drain.clone(),
+            disposable: self.disposable,
         }
     }
 }

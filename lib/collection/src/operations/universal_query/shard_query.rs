@@ -1,18 +1,26 @@
-use api::grpc::qdrant as grpc;
+use api::conversions::json::proto_to_json;
+use api::grpc::conversions::grpc_condition_into_condition;
+use api::grpc::{DecayParamsExpression, qdrant as grpc};
 use common::types::ScoreType;
 use itertools::Itertools;
 use segment::data_types::order_by::OrderBy;
 use segment::data_types::vectors::{
-    NamedQuery, NamedVectorStruct, VectorInternal, DEFAULT_VECTOR_NAME,
+    DEFAULT_VECTOR_NAME, NamedQuery, NamedVectorStruct, VectorInternal,
 };
-use segment::types::{Filter, Order, ScoredPoint, SearchParams, WithPayloadInterface, WithVector};
+use segment::index::query_optimization::rescore_formula::parsed_formula::{
+    DecayKind, ParsedFormula,
+};
+use segment::types::{
+    Filter, Order, ScoredPoint, SearchParams, VectorName, VectorNameBuf, WithPayloadInterface,
+    WithVector,
+};
 use segment::vector_storage::query::{ContextQuery, DiscoveryQuery, RecoQuery};
 use tonic::Status;
 
 use crate::config::CollectionParams;
 use crate::operations::query_enum::QueryEnum;
 use crate::operations::types::CollectionResult;
-
+use crate::operations::universal_query::formula::{ExpressionInternal, FormulaInternal};
 /// Internal response type for a universal query request.
 ///
 /// Capable of returning multiple intermediate results if needed, like the case of RRF (Reciprocal Rank Fusion)
@@ -21,6 +29,8 @@ pub type ShardQueryResponse = Vec<Vec<ScoredPoint>>;
 /// Internal representation of a universal query request.
 ///
 /// Direct translation of the user-facing request, but with all point ids substituted with their corresponding vectors.
+///
+/// For the case of formula queries, it collects conditions and variables too.
 #[derive(Clone, Debug)]
 pub struct ShardQueryRequest {
     pub prefetches: Vec<ShardPrefetch>,
@@ -70,23 +80,31 @@ pub enum ScoringQuery {
     /// Order by a payload field
     OrderBy(OrderBy),
 
+    /// Score boosting via an arbitrary formula
+    Formula(ParsedFormula),
+
     /// Sample points
     Sample(SampleInternal),
 }
 
 impl ScoringQuery {
+    /// Whether the query needs the prefetches results from all shards to compute the final score
+    ///
+    /// If false, there is a single list of scored points which contain the final score.
     pub fn needs_intermediate_results(&self) -> bool {
         match self {
             Self::Fusion(fusion) => match fusion {
+                // We need the ranking information of each prefetch
                 FusionInternal::Rrf => true,
+                // We need the score distribution information of each prefetch
                 FusionInternal::Dbsf => true,
             },
-            Self::Vector(_) | Self::OrderBy(_) | Self::Sample(_) => false,
+            Self::Vector(_) | Self::OrderBy(_) | Self::Formula(_) | Self::Sample(_) => false,
         }
     }
 
     /// Get the vector name if it is scored against a vector
-    pub fn get_vector_name(&self) -> Option<&str> {
+    pub fn get_vector_name(&self) -> Option<&VectorName> {
         match self {
             Self::Vector(query) => Some(query.get_vector_name()),
             _ => None,
@@ -114,6 +132,9 @@ impl ScoringQuery {
                 ScoringQuery::Fusion(fusion) => match fusion {
                     FusionInternal::Rrf | FusionInternal::Dbsf => Some(Order::LargeBetter),
                 },
+                // Score boosting formulas are always have descending order,
+                // euclidean scores can be negated within the formula
+                ScoringQuery::Formula(_formula) => Some(Order::LargeBetter),
                 ScoringQuery::OrderBy(order_by) => Some(Order::from(order_by.direction())),
                 // Random sample does not require ordering
                 ScoringQuery::Sample(SampleInternal::Random) => None,
@@ -252,7 +273,7 @@ impl TryFrom<grpc::query_shard_points::Prefetch> for ShardPrefetch {
 impl QueryEnum {
     fn try_from_grpc_raw_query(
         raw_query: grpc::RawQuery,
-        using: Option<String>,
+        using: Option<VectorNameBuf>,
     ) -> Result<Self, Status> {
         use grpc::raw_query::Variant;
 
@@ -265,7 +286,7 @@ impl QueryEnum {
                 let vector = VectorInternal::try_from(nearest)?;
                 let name = match (using, &vector) {
                     (None, VectorInternal::Sparse(_)) => {
-                        return Err(Status::invalid_argument("Sparse vector must have a name"))
+                        return Err(Status::invalid_argument("Sparse vector must have a name"));
                     }
                     (
                         Some(name),
@@ -274,7 +295,7 @@ impl QueryEnum {
                         | VectorInternal::Dense(_),
                     ) => name,
                     (None, VectorInternal::MultiDense(_) | VectorInternal::Dense(_)) => {
-                        DEFAULT_VECTOR_NAME.to_string()
+                        DEFAULT_VECTOR_NAME.to_owned()
                     }
                 };
                 let named_vector = NamedVectorStruct::new_from_vector(vector, name);
@@ -321,6 +342,160 @@ impl TryFrom<i32> for SampleInternal {
     }
 }
 
+impl TryFrom<api::grpc::qdrant::Formula> for FormulaInternal {
+    type Error = tonic::Status;
+
+    fn try_from(formula: api::grpc::qdrant::Formula) -> Result<Self, Self::Error> {
+        let api::grpc::qdrant::Formula {
+            expression,
+            defaults,
+        } = formula;
+
+        let expression = expression
+            .ok_or_else(|| tonic::Status::invalid_argument("missing field: expression"))?;
+
+        let expression = ExpressionInternal::try_from(expression)?;
+        let defaults = defaults
+            .into_iter()
+            .map(|(key, value)| {
+                let value = proto_to_json(value)?;
+                Result::<_, tonic::Status>::Ok((key, value))
+            })
+            .try_collect()?;
+
+        Ok(Self {
+            formula: expression,
+            defaults,
+        })
+    }
+}
+
+impl TryFrom<grpc::Expression> for ExpressionInternal {
+    type Error = tonic::Status;
+
+    fn try_from(expression: grpc::Expression) -> Result<Self, Self::Error> {
+        use grpc::expression::Variant;
+
+        let variant = expression
+            .variant
+            .ok_or_else(|| tonic::Status::invalid_argument("missing field: variant"))?;
+
+        let expression = match variant {
+            Variant::Constant(constant) => ExpressionInternal::Constant(constant),
+            Variant::Variable(variable) => ExpressionInternal::Variable(variable),
+            Variant::Condition(condition) => {
+                let condition = grpc_condition_into_condition(condition)?
+                    .ok_or_else(|| tonic::Status::invalid_argument("missing field: condition"))?;
+                ExpressionInternal::Condition(Box::new(condition))
+            }
+            Variant::GeoDistance(grpc::GeoDistance { origin, to }) => {
+                let origin = origin
+                    .ok_or_else(|| tonic::Status::invalid_argument("missing field: origin"))?
+                    .into();
+                let to = to
+                    .parse()
+                    .map_err(|_| tonic::Status::invalid_argument("invalid payload key"))?;
+                ExpressionInternal::GeoDistance { origin, to }
+            }
+            Variant::Mult(grpc::MultExpression { mult }) => {
+                let mult = mult
+                    .into_iter()
+                    .map(ExpressionInternal::try_from)
+                    .try_collect()?;
+                ExpressionInternal::Mult(mult)
+            }
+            Variant::Sum(grpc::SumExpression { sum }) => {
+                let sum = sum
+                    .into_iter()
+                    .map(ExpressionInternal::try_from)
+                    .try_collect()?;
+                ExpressionInternal::Sum(sum)
+            }
+            Variant::Div(div) => {
+                let grpc::DivExpression {
+                    left,
+                    right,
+                    by_zero_default,
+                } = *div;
+
+                let left =
+                    *left.ok_or_else(|| tonic::Status::invalid_argument("missing field: left"))?;
+                let right = *right
+                    .ok_or_else(|| tonic::Status::invalid_argument("missing field: right"))?;
+
+                ExpressionInternal::Div {
+                    left: Box::new(left.try_into()?),
+                    right: Box::new(right.try_into()?),
+                    by_zero_default,
+                }
+            }
+            Variant::Neg(expression) => {
+                ExpressionInternal::Neg(Box::new((*expression).try_into()?))
+            }
+            Variant::Abs(expression) => {
+                ExpressionInternal::Abs(Box::new((*expression).try_into()?))
+            }
+            Variant::Sqrt(expression) => {
+                ExpressionInternal::Sqrt(Box::new((*expression).try_into()?))
+            }
+            Variant::Pow(pow_expression) => {
+                let grpc::PowExpression { base, exponent } = *pow_expression;
+                let raw_base =
+                    *base.ok_or_else(|| tonic::Status::invalid_argument("missing field: base"))?;
+                let raw_exponent = *exponent
+                    .ok_or_else(|| tonic::Status::invalid_argument("missing field: exponent"))?;
+
+                ExpressionInternal::Pow {
+                    base: Box::new(raw_base.try_into()?),
+                    exponent: Box::new(raw_exponent.try_into()?),
+                }
+            }
+            Variant::Exp(expression) => {
+                ExpressionInternal::Exp(Box::new((*expression).try_into()?))
+            }
+            Variant::Log10(expression) => {
+                ExpressionInternal::Log10(Box::new((*expression).try_into()?))
+            }
+            Variant::Ln(expression) => ExpressionInternal::Ln(Box::new((*expression).try_into()?)),
+            Variant::LinDecay(decay_params) => {
+                try_from_decay_params(*decay_params, DecayKind::Lin)?
+            }
+            Variant::ExpDecay(decay_params) => {
+                try_from_decay_params(*decay_params, DecayKind::Exp)?
+            }
+            Variant::GaussDecay(decay_params) => {
+                try_from_decay_params(*decay_params, DecayKind::Gauss)?
+            }
+        };
+
+        Ok(expression)
+    }
+}
+
+fn try_from_decay_params(
+    params: DecayParamsExpression,
+    kind: DecayKind,
+) -> Result<ExpressionInternal, Status> {
+    let grpc::DecayParamsExpression {
+        x,
+        target,
+        midpoint,
+        scale,
+    } = params;
+
+    let x = *x.ok_or_else(|| tonic::Status::invalid_argument("missing field: x"))?;
+
+    let target = target.map(|t| (*t).try_into()).transpose()?.map(Box::new);
+
+    Ok(ExpressionInternal::Decay {
+        kind,
+        x: Box::new(x.try_into()?),
+        target,
+        midpoint,
+        scale,
+    })
+}
+
 impl From<api::grpc::qdrant::Fusion> for FusionInternal {
     fn from(fusion: api::grpc::qdrant::Fusion) -> Self {
         match fusion {
@@ -358,7 +533,7 @@ impl From<api::grpc::qdrant::Sample> for SampleInternal {
 impl ScoringQuery {
     fn try_from_grpc_query(
         query: grpc::query_shard_points::Query,
-        using: Option<String>,
+        using: Option<VectorNameBuf>,
     ) -> Result<Self, Status> {
         let score = query
             .score
@@ -376,6 +551,11 @@ impl ScoringQuery {
             grpc::query_shard_points::query::Score::Sample(sample) => {
                 ScoringQuery::Sample(SampleInternal::try_from(sample)?)
             }
+            grpc::query_shard_points::query::Score::Formula(formula) => ScoringQuery::Formula(
+                ParsedFormula::try_from(FormulaInternal::try_from(formula)?).map_err(|e| {
+                    Status::invalid_argument(format!("failed to parse formula: {e}"))
+                })?,
+            ),
         };
 
         Ok(scoring_query)
@@ -418,6 +598,9 @@ impl From<ScoringQuery> for grpc::query_shard_points::Query {
             },
             ScoringQuery::OrderBy(order_by) => Self {
                 score: Some(Score::OrderBy(grpc::OrderBy::from(order_by))),
+            },
+            ScoringQuery::Formula(parsed_formula) => Self {
+                score: Some(Score::Formula(grpc::Formula::from_parsed(parsed_formula))),
             },
             ScoringQuery::Sample(sample) => Self {
                 score: Some(Score::Sample(api::grpc::qdrant::Sample::from(sample) as i32)),

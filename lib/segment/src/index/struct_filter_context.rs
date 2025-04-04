@@ -1,6 +1,6 @@
 use common::types::PointOffsetType;
 
-use crate::index::query_optimization::optimized_filter::{check_optimized_filter, OptimizedFilter};
+use crate::index::query_optimization::optimized_filter::{OptimizedFilter, check_optimized_filter};
 use crate::payload_storage::FilterContext;
 
 pub struct StructFilterContext<'a> {
@@ -13,7 +13,7 @@ impl<'a> StructFilterContext<'a> {
     }
 }
 
-impl<'a> FilterContext for StructFilterContext<'a> {
+impl FilterContext for StructFilterContext<'_> {
     fn check(&self, point_id: PointOffsetType) -> bool {
         check_optimized_filter(&self.optimized_filter, point_id)
     }

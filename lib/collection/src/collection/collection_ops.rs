@@ -2,7 +2,7 @@ use std::cmp;
 use std::sync::Arc;
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use futures::{future, TryStreamExt as _};
+use futures::{TryStreamExt as _, future};
 use lazy_static::lazy_static;
 use segment::types::{QuantizationConfig, StrictModeConfig};
 use semver::Version;
@@ -176,7 +176,14 @@ impl Collection {
                 config.strict_mode_config = Some(strict_mode_diff);
             }
         }
+        // update collection config
         self.collection_config.read().await.save(&self.path)?;
+        // apply config change to all shards
+        let mut shard_holder = self.shards_holder.write().await;
+        let updates = shard_holder
+            .all_shards_mut()
+            .map(|replica_set| replica_set.on_strict_mode_config_update());
+        future::try_join_all(updates).await?;
         Ok(())
     }
 
@@ -212,10 +219,14 @@ impl Collection {
                 });
             }
 
-            // Check that we are not removing the
-            if replica_set.is_last_active_replica(peer_id) {
+            // Check that we are not removing the *last* replica or the last *active* replica
+            //
+            // `is_last_active_replica` counts both `Active` and `ReshardingScaleDown` replicas!
+            if peers.len() == 1 || replica_set.is_last_active_replica(peer_id) {
                 return Err(CollectionError::BadRequest {
-                    description: format!("Shard {shard_id} must have at least one active replica after removing {peer_id}"),
+                    description: format!(
+                        "Shard {shard_id} must have at least one active replica after removing {peer_id}",
+                    ),
                 });
             }
 
@@ -340,12 +351,15 @@ impl Collection {
                     .get(&replica_set.this_peer_id())
                     .copied()
                     .unwrap_or(ReplicaState::Dead);
-                let hw_acc = HwMeasurementAcc::new();
+
+                // Cluster info is explicitly excluded from hardware measurements
+                // So that we can monitor hardware usage without interference
+                let hw_acc = HwMeasurementAcc::disposable();
                 let count_result = replica_set
-                    .count_local(count_request.clone(), None, &hw_acc)
+                    .count_local(count_request.clone(), None, hw_acc)
                     .await
                     .unwrap_or_default();
-                hw_acc.discard(); // We don't need to measure hardware for this function.
+
                 let points_count = count_result.map(|x| x.count).unwrap_or(0);
                 local_shards.push(LocalShardInfo {
                     shard_id,
@@ -368,8 +382,7 @@ impl Collection {
         }
         let shard_transfers =
             shards_holder.get_shard_transfer_info(&*self.transfer_tasks.lock().await);
-        let resharding_operations =
-            shards_holder.get_resharding_operations_info(&*self.reshard_tasks.lock().await);
+        let resharding_operations = shards_holder.get_resharding_operations_info();
 
         // sort by shard_id
         local_shards.sort_by_key(|k| k.shard_id);

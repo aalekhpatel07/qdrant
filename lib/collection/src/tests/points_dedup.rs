@@ -3,9 +3,9 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use api::rest::OrderByInterface;
+use common::budget::ResourceBudget;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use common::cpu::CpuBudget;
-use rand::{thread_rng, Rng};
+use rand::{Rng, rng};
 use segment::data_types::vectors::NamedVectorStruct;
 use segment::types::{
     Distance, ExtendedPointId, Payload, PayloadFieldSchema, PayloadSchemaType, SearchParams,
@@ -81,13 +81,14 @@ async fn fixture() -> Collection {
         &config,
         storage_config.clone(),
         CollectionShardDistribution { shards },
+        None,
         ChannelService::default(),
         dummy_on_replica_failure(),
         dummy_request_shard_transfer(),
         dummy_abort_shard_transfer(),
         None,
         None,
-        CpuBudget::default(),
+        ResourceBudget::default(),
         None,
     )
     .await
@@ -98,6 +99,7 @@ async fn fixture() -> Collection {
         .create_payload_index(
             "num".parse().unwrap(),
             PayloadFieldSchema::FieldType(PayloadSchemaType::Integer),
+            HwMeasurementAcc::new(),
         )
         .await
         .expect("failed to create payload index");
@@ -105,14 +107,14 @@ async fn fixture() -> Collection {
     // Insert two points into all shards directly, a point matching the shard ID, and point 100
     // We insert into all shards directly to prevent spreading points by the hashring
     // We insert the same point into multiple shards on purpose
-    let mut rng = thread_rng();
+    let mut rng = rng();
     for (shard_id, shard) in collection.shards_holder().write().await.get_shards() {
         let op = OperationWithClockTag::from(CollectionUpdateOperations::PointOperation(
             PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsList(vec![
                 PointStructPersisted {
                     id: u64::from(shard_id).into(),
                     vector: VectorStructPersisted::Single(
-                        (0..DIM).map(|_| rng.gen_range(0.0..1.0)).collect(),
+                        (0..DIM).map(|_| rng.random_range(0.0..1.0)).collect(),
                     ),
                     payload: Some(Payload(Map::from_iter([(
                         "num".to_string(),
@@ -122,7 +124,7 @@ async fn fixture() -> Collection {
                 PointStructPersisted {
                     id: DUPLICATE_POINT_ID,
                     vector: VectorStructPersisted::Single(
-                        (0..DIM).map(|_| rng.gen_range(0.0..1.0)).collect(),
+                        (0..DIM).map(|_| rng.random_range(0.0..1.0)).collect(),
                     ),
                     payload: Some(Payload(Map::from_iter([(
                         "num".to_string(),
@@ -132,7 +134,7 @@ async fn fixture() -> Collection {
             ])),
         ));
         shard
-            .update_local(op, true)
+            .update_local(op, true, HwMeasurementAcc::new())
             .await
             .expect("failed to insert points");
     }
@@ -166,6 +168,7 @@ async fn test_scroll_dedup() {
             None,
             &ShardSelectorInternal::All,
             None,
+            HwMeasurementAcc::new(),
         )
         .await
         .expect("failed to search");
@@ -193,17 +196,21 @@ async fn test_scroll_dedup() {
             None,
             &ShardSelectorInternal::All,
             None,
+            HwMeasurementAcc::new(),
         )
         .await
         .expect("failed to search");
     assert!(!result.points.is_empty(), "expected some points");
 
     let mut seen = HashSet::new();
-    for point_id in result.points.iter().map(|point| point.id) {
+    for record in result.points.iter() {
         assert!(
-            seen.insert(point_id),
-            "got point id {point_id:?} more than once, they should be deduplicated",
+            seen.insert((record.id, record.order_value)),
+            "got point id {:?} with order value {:?} more than once, they should be deduplicated",
+            record.id,
+            record.order_value,
         );
+        assert!(record.order_value.is_some());
     }
 }
 
@@ -224,6 +231,7 @@ async fn test_retrieve_dedup() {
             None,
             &ShardSelectorInternal::All,
             None,
+            HwMeasurementAcc::new(),
         )
         .await
         .expect("failed to search");
@@ -261,12 +269,11 @@ async fn test_search_dedup() {
             None,
             &ShardSelectorInternal::All,
             None,
-            &hw_acc,
+            hw_acc,
         )
         .await
         .expect("failed to search");
     assert!(!points.is_empty(), "expected some points");
-    hw_acc.discard();
 
     let mut seen = HashSet::new();
     for point_id in points.iter().map(|point| point.id) {

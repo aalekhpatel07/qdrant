@@ -3,7 +3,7 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use rand::{thread_rng, Rng};
+use rand::{Rng, rng};
 use tokio::select;
 use tonic::codegen::InterceptedService;
 use tonic::service::Interceptor;
@@ -12,8 +12,8 @@ use tonic::{Code, Request, Status};
 
 use crate::grpc::dynamic_channel_pool::DynamicChannelPool;
 use crate::grpc::dynamic_pool::CountedItem;
-use crate::grpc::qdrant::qdrant_client::QdrantClient;
 use crate::grpc::qdrant::HealthCheckRequest;
+use crate::grpc::qdrant::qdrant_client::QdrantClient;
 
 /// Maximum lifetime of a gRPC channel.
 ///
@@ -364,7 +364,7 @@ impl TransportChannelPool {
                 RetryAction::RetryWithBackoff(fallback_status) => {
                     // Calculate backoff
                     let backoff = DEFAULT_BACKOFF * 2u32.pow(attempt as u32)
-                        + Duration::from_millis(thread_rng().gen_range(0..100));
+                        + Duration::from_millis(rng().random_range(0..100));
 
                     if backoff > max_timeout {
                         // We can't wait for the request any longer, return the error as is

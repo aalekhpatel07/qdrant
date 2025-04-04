@@ -5,13 +5,15 @@ use std::arch::x86_64::*;
 use std::iter::repeat_with;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use common::counter::hardware_counter::HardwareCounterCell;
+use io::file_operations::atomic_save_json;
 use serde::{Deserialize, Serialize};
 
 use crate::encoded_storage::{EncodedStorage, EncodedStorageBuilder};
-use crate::encoded_vectors::{validate_vector_parameters, EncodedVectors, VectorParameters};
+use crate::encoded_vectors::{EncodedVectors, VectorParameters, validate_vector_parameters};
 use crate::kmeans::kmeans;
 use crate::{ConditionalVariable, EncodingError};
 
@@ -33,10 +35,10 @@ pub struct EncodedQueryPQ {
 }
 
 #[derive(Serialize, Deserialize)]
-struct Metadata {
-    centroids: Vec<Vec<f32>>,
-    vector_division: Vec<Range<usize>>,
-    vector_parameters: VectorParameters,
+pub struct Metadata {
+    pub centroids: Vec<Vec<f32>>,
+    pub vector_division: Vec<Range<usize>>,
+    pub vector_parameters: VectorParameters,
 }
 
 impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
@@ -48,14 +50,14 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
     /// * `vector_parameters` - parameters of original vector data (dimension, distance, etc)
     /// * `chunk_size` - Max size of f32 chunk that replaced by centroid index (in original vector dimension)
     /// * `max_threads` - Max allowed threads for kmeans and encodind process
-    /// * `stop_condition` - Function that returns `true` if encoding should be stopped
+    /// * `stopped` - Atomic bool that indicates if encoding should be stopped
     pub fn encode<'a>(
         data: impl Iterator<Item = impl AsRef<[f32]> + 'a> + Clone + Send,
         mut storage_builder: impl EncodedStorageBuilder<TStorage> + Send,
         vector_parameters: &VectorParameters,
         chunk_size: usize,
         max_kmeans_threads: usize,
-        stop_condition: impl Fn() -> bool + Sync,
+        stopped: &AtomicBool,
     ) -> Result<Self, EncodingError> {
         debug_assert!(validate_vector_parameters(data.clone(), vector_parameters).is_ok());
 
@@ -69,7 +71,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
             vector_parameters,
             CENTROIDS_COUNT,
             max_kmeans_threads,
-            &stop_condition,
+            stopped,
         )?;
 
         // finally, encode data
@@ -79,12 +81,12 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
             &vector_division,
             &centroids,
             max_kmeans_threads,
-            &stop_condition,
+            stopped,
         )?;
 
         let storage = storage_builder.build();
 
-        if !stop_condition() {
+        if !stopped.load(Ordering::Relaxed) {
             Ok(Self {
                 encoded_vectors: storage,
                 metadata: Metadata {
@@ -120,7 +122,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
     /// * `vector_division` - Division of original vector into chunks
     /// * `centroids` - Centroid positions (flattened by chunks; for similarity to vector data format)
     /// * `max_threads` - Max allowed threads for encoding process
-    /// * `stop_condition` - Function that returns `true` if encoding should be stopped
+    /// * `stopped` - Atomic bool that indicates if encoding should be stopped
     ///
     /// # Lifetimes
     /// 'a is lifetime of vector in vector storage
@@ -131,7 +133,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
         vector_division: &'b [Range<usize>],
         centroids: &'b [Vec<f32>],
         max_threads: usize,
-        stop_condition: &(impl Fn() -> bool + Sync),
+        stopped: &AtomicBool,
     ) -> Result<(), EncodingError> {
         rayon::ThreadPoolBuilder::new()
             .thread_name(|idx| format!("pq-encoding-{idx}"))
@@ -150,7 +152,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
                     vector_division,
                     centroids,
                     max_threads,
-                    &stop_condition,
+                    stopped,
                 )
             });
         Ok(())
@@ -165,7 +167,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
         vector_division: &'b [Range<usize>],
         centroids: &'b [Vec<f32>],
         max_threads: usize,
-        stop_condition: &'b (impl Fn() -> bool + Sync),
+        stopped: &'b AtomicBool,
     ) {
         let storage_builder = Arc::new(Mutex::new(storage_builder));
 
@@ -188,7 +190,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
             scope.spawn(move |_| {
                 let mut encoded_vector = Vec::with_capacity(vector_division.len());
                 for vector in data.step_by(max_threads) {
-                    if stop_condition() {
+                    if stopped.load(Ordering::Relaxed) {
                         return;
                     }
 
@@ -266,14 +268,14 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
     /// * `vector_parameters` - parameters of original vector data (dimension, distance, etc)
     /// * `centroids_count` - Count of centroids for each chunk
     /// * `max_kmeans_threads` - Max allowed threads for kmeans process
-    /// * `stop_condition` - Function that returns `true` if encoding should be stopped
+    /// * `stopped` - Atomic bool that indicates if encoding should be stopped
     fn find_centroids<'a>(
         data: impl Iterator<Item = impl AsRef<[f32]> + 'a> + Clone,
         vector_division: &[Range<usize>],
         vector_parameters: &VectorParameters,
         centroids_count: usize,
         max_kmeans_threads: usize,
-        stop_condition: &(impl Fn() -> bool + Sync),
+        stopped: &AtomicBool,
     ) -> Result<Vec<Vec<f32>>, EncodingError> {
         let sample_size = KMEANS_SAMPLE_SIZE.min(vector_parameters.count);
         let mut result = vec![vec![]; centroids_count];
@@ -292,7 +294,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
         let permutor = permutation_iterator::Permutor::new(vector_parameters.count as u64);
         let mut selected_vectors: Vec<usize> =
             permutor.map(|i| i as usize).take(sample_size).collect();
-        if stop_condition() {
+        if stopped.load(Ordering::Relaxed) {
             return Err(EncodingError::Stopped);
         }
 
@@ -321,7 +323,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
                 KMEANS_MAX_ITERATIONS,
                 max_kmeans_threads,
                 KMEANS_ACCURACY,
-                stop_condition,
+                stopped,
             )?;
 
             // push found chunk centroids into result
@@ -336,72 +338,76 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "sse4.1")]
     unsafe fn score_point_sse(&self, query: &EncodedQueryPQ, i: u32) -> f32 {
-        let centroids = self
-            .encoded_vectors
-            .get_vector_data(i as usize, self.metadata.vector_division.len());
-        let len = centroids.len();
-        let centroids_count = self.metadata.centroids.len();
+        unsafe {
+            let centroids = self
+                .encoded_vectors
+                .get_vector_data(i as usize, self.metadata.vector_division.len());
+            let len = centroids.len();
+            let centroids_count = self.metadata.centroids.len();
 
-        let mut centroids = centroids.as_ptr();
-        let mut lut = query.lut.as_ptr();
-        let mut sum128: __m128 = _mm_setzero_ps();
-        for _ in 0..len / 4 {
-            let buffer = [
-                *lut.add(*centroids as usize),
-                *lut.add(centroids_count + *centroids.add(1) as usize),
-                *lut.add(2 * centroids_count + *centroids.add(2) as usize),
-                *lut.add(3 * centroids_count + *centroids.add(3) as usize),
-            ];
-            let c = _mm_loadu_ps(buffer.as_ptr());
-            sum128 = _mm_add_ps(sum128, c);
+            let mut centroids = centroids.as_ptr();
+            let mut lut = query.lut.as_ptr();
+            let mut sum128: __m128 = _mm_setzero_ps();
+            for _ in 0..len / 4 {
+                let buffer = [
+                    *lut.add(*centroids as usize),
+                    *lut.add(centroids_count + *centroids.add(1) as usize),
+                    *lut.add(2 * centroids_count + *centroids.add(2) as usize),
+                    *lut.add(3 * centroids_count + *centroids.add(3) as usize),
+                ];
+                let c = _mm_loadu_ps(buffer.as_ptr());
+                sum128 = _mm_add_ps(sum128, c);
 
-            centroids = centroids.add(4);
-            lut = lut.add(4 * centroids_count);
+                centroids = centroids.add(4);
+                lut = lut.add(4 * centroids_count);
+            }
+            let sum64: __m128 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+            let sum32: __m128 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 0x55));
+            let mut sum = _mm_cvtss_f32(sum32);
+
+            for _ in 0..len % 4 {
+                sum += *lut.add(*centroids as usize);
+                centroids = centroids.add(1);
+                lut = lut.add(centroids_count);
+            }
+            sum
         }
-        let sum64: __m128 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
-        let sum32: __m128 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 0x55));
-        let mut sum = _mm_cvtss_f32(sum32);
-
-        for _ in 0..len % 4 {
-            sum += *lut.add(*centroids as usize);
-            centroids = centroids.add(1);
-            lut = lut.add(centroids_count);
-        }
-        sum
     }
 
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     unsafe fn score_point_neon(&self, query: &EncodedQueryPQ, i: u32) -> f32 {
-        let centroids = self
-            .encoded_vectors
-            .get_vector_data(i as usize, self.metadata.vector_division.len());
-        let len = centroids.len();
-        let centroids_count = self.metadata.centroids.len();
+        unsafe {
+            let centroids = self
+                .encoded_vectors
+                .get_vector_data(i as usize, self.metadata.vector_division.len());
+            let len = centroids.len();
+            let centroids_count = self.metadata.centroids.len();
 
-        let mut centroids = centroids.as_ptr();
-        let mut lut = query.lut.as_ptr();
-        let mut sum128 = vdupq_n_f32(0.);
-        for _ in 0..len / 4 {
-            let buffer = [
-                *lut.add(*centroids as usize),
-                *lut.add(centroids_count + *centroids.add(1) as usize),
-                *lut.add(2 * centroids_count + *centroids.add(2) as usize),
-                *lut.add(3 * centroids_count + *centroids.add(3) as usize),
-            ];
-            let c = vld1q_f32(buffer.as_ptr());
-            sum128 = vaddq_f32(sum128, c);
+            let mut centroids = centroids.as_ptr();
+            let mut lut = query.lut.as_ptr();
+            let mut sum128 = vdupq_n_f32(0.);
+            for _ in 0..len / 4 {
+                let buffer = [
+                    *lut.add(*centroids as usize),
+                    *lut.add(centroids_count + *centroids.add(1) as usize),
+                    *lut.add(2 * centroids_count + *centroids.add(2) as usize),
+                    *lut.add(3 * centroids_count + *centroids.add(3) as usize),
+                ];
+                let c = vld1q_f32(buffer.as_ptr());
+                sum128 = vaddq_f32(sum128, c);
 
-            centroids = centroids.add(4);
-            lut = lut.add(4 * centroids_count);
+                centroids = centroids.add(4);
+                lut = lut.add(4 * centroids_count);
+            }
+            let mut sum = vaddvq_f32(sum128);
+
+            for _ in 0..len % 4 {
+                sum += *lut.add(*centroids as usize);
+                centroids = centroids.add(1);
+                lut = lut.add(centroids_count);
+            }
+            sum
         }
-        let mut sum = vaddvq_f32(sum128);
-
-        for _ in 0..len % 4 {
-            sum += *lut.add(*centroids as usize);
-            centroids = centroids.add(1);
-            lut = lut.add(centroids_count);
-        }
-        sum
     }
 
     fn score_point_simple(&self, query: &EncodedQueryPQ, i: u32) -> f32 {
@@ -423,13 +429,25 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
             })
             .sum()
     }
+
+    pub fn get_quantized_vector(&self, i: u32) -> &[u8] {
+        self.encoded_vectors
+            .get_vector_data(i as _, self.metadata.vector_division.len())
+    }
+
+    pub fn get_metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    pub fn vectors_count(&self) -> usize {
+        self.metadata.vector_parameters.count
+    }
 }
 
 impl<TStorage: EncodedStorage> EncodedVectors<EncodedQueryPQ> for EncodedVectorsPQ<TStorage> {
     fn save(&self, data_path: &Path, meta_path: &Path) -> std::io::Result<()> {
-        let metadata_bytes = serde_json::to_vec(&self.metadata)?;
         meta_path.parent().map(std::fs::create_dir_all);
-        std::fs::write(meta_path, metadata_bytes)?;
+        atomic_save_json(meta_path, &self.metadata)?;
 
         data_path.parent().map(std::fs::create_dir_all);
         self.encoded_vectors.save_to_file(data_path)?;
@@ -451,6 +469,10 @@ impl<TStorage: EncodedStorage> EncodedVectors<EncodedQueryPQ> for EncodedVectors
             metadata,
         };
         Ok(result)
+    }
+
+    fn is_on_disk(&self) -> bool {
+        self.encoded_vectors.is_on_disk()
     }
 
     fn encode_query(&self, query: &[f32]) -> EncodedQueryPQ {
@@ -482,6 +504,10 @@ impl<TStorage: EncodedStorage> EncodedVectors<EncodedQueryPQ> for EncodedVectors
             .cpu_counter()
             .incr_delta(self.metadata.vector_division.len());
 
+        hw_counter
+            .vector_io_read()
+            .incr_delta(self.metadata.vector_division.len());
+
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         if is_x86_feature_detected!("sse4.1") {
             return unsafe { self.score_point_sse(query, i) };
@@ -505,6 +531,10 @@ impl<TStorage: EncodedStorage> EncodedVectors<EncodedQueryPQ> for EncodedVectors
         let centroids_j = self
             .encoded_vectors
             .get_vector_data(j as usize, self.metadata.vector_division.len());
+
+        hw_counter
+            .vector_io_read()
+            .incr_delta(self.metadata.vector_division.len() * 2);
 
         hw_counter.cpu_counter().incr_delta(
             centroids_i.len()

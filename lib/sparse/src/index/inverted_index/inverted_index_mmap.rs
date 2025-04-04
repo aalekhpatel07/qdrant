@@ -3,6 +3,7 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use io::file_operations::{atomic_save_json, read_json};
 use io::storage_version::StorageVersion;
@@ -17,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use super::INDEX_FILE_NAME;
 use crate::common::sparse_vector::RemappedSparseVector;
 use crate::common::types::{DimId, DimOffset};
-use crate::index::inverted_index::inverted_index_ram::InvertedIndexRam;
 use crate::index::inverted_index::InvertedIndex;
+use crate::index::inverted_index::inverted_index_ram::InvertedIndexRam;
 use crate::index::posting_list::PostingListIterator;
 use crate::index::posting_list_common::PostingElementEx;
 
@@ -35,8 +36,10 @@ impl StorageVersion for Version {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct InvertedIndexFileHeader {
-    pub posting_count: usize, // number oof posting lists
-    pub vector_count: usize,  // number of unique vectors indexed
+    /// Number of posting lists
+    pub posting_count: usize,
+    /// Number of unique vectors indexed
+    pub vector_count: usize,
 }
 
 /// Inverted flatten index from dimension id to posting list
@@ -58,6 +61,10 @@ impl InvertedIndex for InvertedIndexMmap {
 
     type Version = Version;
 
+    fn is_on_disk(&self) -> bool {
+        true
+    }
+
     fn open(path: &Path) -> std::io::Result<Self> {
         Self::load(path)
     }
@@ -75,15 +82,25 @@ impl InvertedIndex for InvertedIndexMmap {
         Ok(())
     }
 
-    fn get(&self, id: &DimId) -> Option<PostingListIterator> {
-        self.get(id).map(PostingListIterator::new)
+    fn get<'a>(
+        &'a self,
+        id: DimOffset,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> Option<PostingListIterator<'a>> {
+        let posting_list = self.get(&id);
+
+        hw_counter
+            .vector_io_read()
+            .incr_delta(posting_list.map(|x| x.len()).unwrap_or(0) * size_of::<PostingElementEx>());
+
+        posting_list.map(PostingListIterator::new)
     }
 
     fn len(&self) -> usize {
         self.file_header.posting_count
     }
 
-    fn posting_list_len(&self, id: &DimOffset) -> Option<usize> {
+    fn posting_list_len(&self, id: &DimOffset, _hw_counter: &HardwareCounterCell) -> Option<usize> {
         self.get(id).map(|posting_list| posting_list.len())
     }
 
@@ -116,6 +133,14 @@ impl InvertedIndex for InvertedIndexMmap {
 
     fn vector_count(&self) -> usize {
         self.file_header.vector_count
+    }
+
+    fn total_sparse_vectors_size(&self) -> usize {
+        debug_assert!(
+            false,
+            "This index is already substituted by the compressed version, no need to maintain new features",
+        );
+        0
     }
 
     fn max_index(&self) -> Option<DimId> {
@@ -154,7 +179,7 @@ impl InvertedIndexMmap {
         path: P,
     ) -> std::io::Result<Self> {
         let total_posting_headers_size = Self::total_posting_headers_size(inverted_index_ram);
-        let total_posting_elements_size = Self::total_posting_elements_size(inverted_index_ram);
+        let total_posting_elements_size = inverted_index_ram.total_posting_elements_size();
 
         let file_length = total_posting_headers_size + total_posting_elements_size;
         let file_path = Self::index_file_path(path.as_ref());
@@ -213,15 +238,6 @@ impl InvertedIndexMmap {
 
     fn total_posting_headers_size(inverted_index_ram: &InvertedIndexRam) -> usize {
         inverted_index_ram.postings.len() * POSTING_HEADER_SIZE
-    }
-
-    fn total_posting_elements_size(inverted_index_ram: &InvertedIndexRam) -> usize {
-        let mut total_posting_elements_size = 0;
-        for posting in &inverted_index_ram.postings {
-            total_posting_elements_size += posting.elements.len() * size_of::<PostingElementEx>();
-        }
-
-        total_posting_elements_size
     }
 
     fn save_posting_headers(

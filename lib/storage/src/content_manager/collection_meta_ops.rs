@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use collection::config::{CollectionConfigInternal, ShardingMethod};
+use collection::config::{CollectionConfigInternal, CollectionParams, ShardingMethod};
 use collection::operations::config_diff::{
     CollectionParamsDiff, HnswConfigDiff, OptimizersConfigDiff, QuantizationConfigDiff,
     WalConfigDiff,
@@ -12,15 +12,17 @@ use collection::shards::replica_set::ReplicaState;
 use collection::shards::resharding::ReshardKey;
 use collection::shards::shard::{PeerId, ShardId, ShardsPlacement};
 use collection::shards::transfer::{ShardTransfer, ShardTransferKey, ShardTransferRestart};
-use collection::shards::{replica_set, CollectionId};
+use collection::shards::{CollectionId, replica_set};
 use schemars::JsonSchema;
 use segment::types::{
     PayloadFieldSchema, PayloadKeyType, QuantizationConfig, ShardKey, StrictModeConfig,
+    VectorNameBuf,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use validator::Validate;
 
+use crate::content_manager::errors::{StorageError, StorageResult};
 use crate::content_manager::shard_distribution::ShardDistributionProposal;
 
 // *Operation wrapper structure is only required for better OpenAPI generation
@@ -170,7 +172,7 @@ pub struct CreateCollection {
     pub quantization_config: Option<QuantizationConfig>,
     /// Sparse vector data config.
     #[validate(nested)]
-    pub sparse_vectors: Option<BTreeMap<String, SparseVectorParams>>,
+    pub sparse_vectors: Option<BTreeMap<VectorNameBuf, SparseVectorParams>>,
     /// Strict-mode config.
     #[validate(nested)]
     pub strict_mode_config: Option<StrictModeConfig>,
@@ -189,12 +191,26 @@ pub struct CreateCollectionOperation {
 }
 
 impl CreateCollectionOperation {
-    pub fn new(collection_name: String, create_collection: CreateCollection) -> Self {
-        Self {
+    pub fn new(
+        collection_name: String,
+        create_collection: CreateCollection,
+    ) -> StorageResult<Self> {
+        // validate vector names are unique between dense and sparse vectors
+        if let Some(sparse_config) = &create_collection.sparse_vectors {
+            let mut dense_names = create_collection.vectors.params_iter().map(|p| p.0);
+            if let Some(duplicate_name) = dense_names.find(|name| sparse_config.contains_key(*name))
+            {
+                return Err(StorageError::bad_input(format!(
+                    "Dense and sparse vector names must be unique - duplicate found with '{duplicate_name}'",
+                )));
+            }
+        }
+
+        Ok(Self {
             collection_name,
             create_collection,
             distribution: None,
-        }
+        })
     }
 
     pub fn is_distribution_set(&self) -> bool {
@@ -399,21 +415,42 @@ pub enum CollectionMetaOperations {
 /// for the new collection
 impl From<CollectionConfigInternal> for CreateCollection {
     fn from(value: CollectionConfigInternal) -> Self {
+        let CollectionConfigInternal {
+            params,
+            hnsw_config,
+            optimizer_config,
+            wal_config,
+            quantization_config,
+            strict_mode_config,
+            uuid,
+        } = value;
+
+        let CollectionParams {
+            vectors,
+            shard_number,
+            sharding_method,
+            replication_factor,
+            write_consistency_factor,
+            read_fan_out_factor: _,
+            on_disk_payload,
+            sparse_vectors,
+        } = params;
+
         Self {
-            vectors: value.params.vectors,
-            shard_number: Some(value.params.shard_number.get()),
-            sharding_method: value.params.sharding_method,
-            replication_factor: Some(value.params.replication_factor.get()),
-            write_consistency_factor: Some(value.params.write_consistency_factor.get()),
-            on_disk_payload: Some(value.params.on_disk_payload),
-            hnsw_config: Some(value.hnsw_config.into()),
-            wal_config: Some(value.wal_config.into()),
-            optimizers_config: Some(value.optimizer_config.into()),
+            vectors,
+            shard_number: Some(shard_number.get()),
+            sharding_method,
+            replication_factor: Some(replication_factor.get()),
+            write_consistency_factor: Some(write_consistency_factor.get()),
+            on_disk_payload: Some(on_disk_payload),
+            hnsw_config: Some(hnsw_config.into()),
+            wal_config: Some(wal_config.into()),
+            optimizers_config: Some(optimizer_config.into()),
             init_from: None,
-            quantization_config: value.quantization_config,
-            sparse_vectors: value.params.sparse_vectors,
-            strict_mode_config: value.strict_mode_config,
-            uuid: value.uuid,
+            quantization_config,
+            sparse_vectors,
+            strict_mode_config,
+            uuid,
         }
     }
 }

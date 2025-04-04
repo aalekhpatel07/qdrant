@@ -5,7 +5,7 @@ use futures::Future;
 use itertools::Itertools;
 use tokio::sync::RwLockReadGuard;
 
-use super::group_by::{group_by, GroupRequest};
+use super::group_by::{GroupRequest, group_by};
 use crate::collection::Collection;
 use crate::lookup::lookup_ids;
 use crate::lookup::types::PseudoId;
@@ -39,7 +39,7 @@ where
         group_by: GroupRequest,
         collection: &'a Collection,
         collection_by_name: F,
-        hw_measurement_acc: &HwMeasurementAcc,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> Self {
         Self {
             group_by,
@@ -48,7 +48,7 @@ where
             read_consistency: None,
             shard_selection: ShardSelectorInternal::All,
             timeout: None,
-            hw_measurement_acc: hw_measurement_acc.new_collector(),
+            hw_measurement_acc,
         }
     }
 
@@ -94,6 +94,7 @@ where
                 self.read_consistency,
                 self.shard_selection.clone(),
                 self.timeout,
+                self.hw_measurement_acc.clone(),
             )
             .await?;
 
@@ -103,7 +104,7 @@ where
             self.read_consistency,
             self.shard_selection.clone(),
             self.timeout,
-            &self.hw_measurement_acc,
+            self.hw_measurement_acc.clone(),
         )
         .await?;
 
@@ -126,6 +127,7 @@ where
                     self.read_consistency,
                     &self.shard_selection,
                     timeout,
+                    self.hw_measurement_acc.clone(),
                 )
                 .await?
             };

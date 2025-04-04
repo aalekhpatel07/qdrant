@@ -1,11 +1,11 @@
 use std::time::Duration;
 
+use collection::collection::Collection;
 use collection::collection::distance_matrix::{
     CollectionSearchMatrixRequest, CollectionSearchMatrixResponse,
 };
-use collection::collection::Collection;
-use collection::grouping::group_by::GroupRequest;
 use collection::grouping::GroupBy;
+use collection::grouping::group_by::GroupRequest;
 use collection::operations::consistency_params::ReadConsistency;
 use collection::operations::point_ops::WriteOrdering;
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
@@ -14,8 +14,8 @@ use collection::operations::universal_query::collection_query::CollectionQueryRe
 use collection::operations::{CollectionUpdateOperations, OperationWithClockTag};
 use collection::{discovery, recommendations};
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use futures::stream::FuturesUnordered;
 use futures::TryStreamExt as _;
+use futures::stream::FuturesUnordered;
 use segment::data_types::facets::{FacetParams, FacetResponse};
 use segment::types::{ScoredPoint, ShardKey};
 
@@ -43,7 +43,7 @@ impl TableOfContent {
         shard_selector: ShardSelectorInternal,
         access: Access,
         timeout: Option<Duration>,
-        hw_measurement_acc: &HwMeasurementAcc,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> StorageResult<Vec<ScoredPoint>> {
         let collection_pass = access.check_point_op(collection_name, &mut request)?;
 
@@ -78,7 +78,7 @@ impl TableOfContent {
         read_consistency: Option<ReadConsistency>,
         access: Access,
         timeout: Option<Duration>,
-        hw_measurement_acc: &HwMeasurementAcc,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> StorageResult<Vec<Vec<ScoredPoint>>> {
         let mut collection_pass = None;
         for (request, _shard_selector) in &mut requests {
@@ -124,7 +124,7 @@ impl TableOfContent {
         shard_selection: ShardSelectorInternal,
         access: Access,
         timeout: Option<Duration>,
-        hw_measurement_acc: &HwMeasurementAcc,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> StorageResult<Vec<Vec<ScoredPoint>>> {
         let mut collection_pass = None;
         for request in &mut request.searches {
@@ -168,7 +168,7 @@ impl TableOfContent {
         timeout: Option<Duration>,
         shard_selection: ShardSelectorInternal,
         access: Access,
-        hw_measurement_acc: &HwMeasurementAcc,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> StorageResult<CountResult> {
         let collection_pass = access.check_point_op(collection_name, &mut request)?;
 
@@ -196,6 +196,7 @@ impl TableOfContent {
     /// # Result
     ///
     /// List of points with specified information included
+    #[allow(clippy::too_many_arguments)]
     pub async fn retrieve(
         &self,
         collection_name: &str,
@@ -204,12 +205,19 @@ impl TableOfContent {
         timeout: Option<Duration>,
         shard_selection: ShardSelectorInternal,
         access: Access,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> StorageResult<Vec<RecordInternal>> {
         let collection_pass = access.check_point_op(collection_name, &mut request)?;
 
         let collection = self.get_collection(&collection_pass).await?;
         collection
-            .retrieve(request, read_consistency, &shard_selection, timeout)
+            .retrieve(
+                request,
+                read_consistency,
+                &shard_selection,
+                timeout,
+                hw_measurement_acc,
+            )
             .await
             .map_err(|err| err.into())
     }
@@ -223,7 +231,7 @@ impl TableOfContent {
         shard_selection: ShardSelectorInternal,
         access: Access,
         timeout: Option<Duration>,
-        hw_measurement_acc: &HwMeasurementAcc,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> StorageResult<GroupsResult> {
         let collection_pass = access.check_point_op(collection_name, &mut request)?;
 
@@ -252,7 +260,7 @@ impl TableOfContent {
         shard_selector: ShardSelectorInternal,
         access: Access,
         timeout: Option<Duration>,
-        hw_measurement_acc: &HwMeasurementAcc,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> StorageResult<Vec<ScoredPoint>> {
         let collection_pass = access.check_point_op(collection_name, &mut request)?;
 
@@ -277,7 +285,7 @@ impl TableOfContent {
         read_consistency: Option<ReadConsistency>,
         access: Access,
         timeout: Option<Duration>,
-        hw_measurement_acc: &HwMeasurementAcc,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> StorageResult<Vec<Vec<ScoredPoint>>> {
         let mut collection_pass = None;
         for (request, _shard_selector) in &mut requests {
@@ -312,6 +320,7 @@ impl TableOfContent {
     /// # Result
     ///
     /// List of points with specified information included
+    #[allow(clippy::too_many_arguments)]
     pub async fn scroll(
         &self,
         collection_name: &str,
@@ -320,12 +329,19 @@ impl TableOfContent {
         timeout: Option<Duration>,
         shard_selection: ShardSelectorInternal,
         access: Access,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> StorageResult<ScrollResult> {
         let collection_pass = access.check_point_op(collection_name, &mut request)?;
 
         let collection = self.get_collection(&collection_pass).await?;
         collection
-            .scroll_by(request, read_consistency, &shard_selection, timeout)
+            .scroll_by(
+                request,
+                read_consistency,
+                &shard_selection,
+                timeout,
+                hw_measurement_acc,
+            )
             .await
             .map_err(|err| err.into())
     }
@@ -337,7 +353,7 @@ impl TableOfContent {
         read_consistency: Option<ReadConsistency>,
         access: Access,
         timeout: Option<Duration>,
-        hw_measurement_acc: &HwMeasurementAcc,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> StorageResult<Vec<Vec<ScoredPoint>>> {
         let mut collection_pass = None;
         for (request, _shard_selector) in &mut requests {
@@ -363,6 +379,7 @@ impl TableOfContent {
     }
 
     // Return unique values for a payload key, and a count of points for each value.
+    #[allow(clippy::too_many_arguments)]
     pub async fn facet(
         &self,
         collection_name: &str,
@@ -371,13 +388,20 @@ impl TableOfContent {
         read_consistency: Option<ReadConsistency>,
         access: Access,
         timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> StorageResult<FacetResponse> {
         let collection_pass = access.check_point_op(collection_name, &mut request)?;
 
         let collection = self.get_collection(&collection_pass).await?;
 
         collection
-            .facet(request, shard_selection, read_consistency, timeout)
+            .facet(
+                request,
+                shard_selection,
+                read_consistency,
+                timeout,
+                hw_measurement_acc,
+            )
             .await
             .map_err(StorageError::from)
     }
@@ -391,7 +415,7 @@ impl TableOfContent {
         shard_selection: ShardSelectorInternal,
         access: Access,
         timeout: Option<Duration>,
-        hw_measurement_acc: &HwMeasurementAcc,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> Result<CollectionSearchMatrixResponse, StorageError> {
         let collection_pass = access.check_point_op(collection_name, &mut request)?;
 
@@ -421,13 +445,20 @@ impl TableOfContent {
         operation: CollectionUpdateOperations,
         wait: bool,
         ordering: WriteOrdering,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> StorageResult<UpdateResult> {
         // `Collection::update_from_client` is cancel safe, so this method is cancel safe.
 
         let updates: FuturesUnordered<_> = shard_keys
             .into_iter()
             .map(|shard_key| {
-                collection.update_from_client(operation.clone(), wait, ordering, Some(shard_key))
+                collection.update_from_client(
+                    operation.clone(),
+                    wait,
+                    ordering,
+                    Some(shard_key),
+                    hw_measurement_acc.clone(),
+                )
             })
             .collect();
 
@@ -443,6 +474,7 @@ impl TableOfContent {
     /// # Cancel safety
     ///
     /// This method is cancel safe.
+    #[allow(clippy::too_many_arguments)]
     pub async fn update(
         &self,
         collection_name: &str,
@@ -451,6 +483,7 @@ impl TableOfContent {
         ordering: WriteOrdering,
         shard_selector: ShardSelectorInternal,
         access: Access,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> StorageResult<UpdateResult> {
         let collection_pass = access.check_point_op(collection_name, &mut operation.operation)?;
 
@@ -508,7 +541,13 @@ impl TableOfContent {
         let res = match shard_selector {
             ShardSelectorInternal::Empty => {
                 collection
-                    .update_from_client(operation.operation, wait, ordering, None)
+                    .update_from_client(
+                        operation.operation,
+                        wait,
+                        ordering,
+                        None,
+                        hw_measurement_acc.clone(),
+                    )
                     .await?
             }
 
@@ -516,7 +555,13 @@ impl TableOfContent {
                 let shard_keys = collection.get_shard_keys().await;
                 if shard_keys.is_empty() {
                     collection
-                        .update_from_client(operation.operation, wait, ordering, None)
+                        .update_from_client(
+                            operation.operation,
+                            wait,
+                            ordering,
+                            None,
+                            hw_measurement_acc.clone(),
+                        )
                         .await?
                 } else {
                     Self::_update_shard_keys(
@@ -525,6 +570,7 @@ impl TableOfContent {
                         operation.operation,
                         wait,
                         ordering,
+                        hw_measurement_acc.clone(),
                     )
                     .await?
                 }
@@ -532,7 +578,13 @@ impl TableOfContent {
 
             ShardSelectorInternal::ShardKey(shard_key) => {
                 collection
-                    .update_from_client(operation.operation, wait, ordering, Some(shard_key))
+                    .update_from_client(
+                        operation.operation,
+                        wait,
+                        ordering,
+                        Some(shard_key),
+                        hw_measurement_acc.clone(),
+                    )
                     .await?
             }
 
@@ -543,13 +595,20 @@ impl TableOfContent {
                     operation.operation,
                     wait,
                     ordering,
+                    hw_measurement_acc.clone(),
                 )
                 .await?
             }
 
             ShardSelectorInternal::ShardId(shard_selection) => {
                 collection
-                    .update_from_peer(operation, shard_selection, wait, ordering)
+                    .update_from_peer(
+                        operation,
+                        shard_selection,
+                        wait,
+                        ordering,
+                        hw_measurement_acc.clone(),
+                    )
                     .await?
             }
         };

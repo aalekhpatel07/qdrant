@@ -1,10 +1,12 @@
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use api::rest::models::HardwareUsage;
 use collection::config::ShardingMethod;
 use collection::operations::verification::VerificationPass;
-use common::counter::hardware_accumulator::HwMeasurementAcc;
+use common::counter::hardware_accumulator::HwSharedDrain;
 use common::defaults::CONSENSUS_META_OP_WAIT;
 use segment::types::default_shard_number_per_node_const;
 
@@ -20,6 +22,7 @@ use crate::{
 pub struct Dispatcher {
     toc: Arc<TableOfContent>,
     consensus_state: Option<ConsensusStateRef>,
+    resharding_enabled: bool,
 }
 
 impl Dispatcher {
@@ -27,12 +30,14 @@ impl Dispatcher {
         Self {
             toc,
             consensus_state: None,
+            resharding_enabled: false,
         }
     }
 
-    pub fn with_consensus(self, state_ref: ConsensusStateRef) -> Self {
+    pub fn with_consensus(self, state_ref: ConsensusStateRef, resharding_enabled: bool) -> Self {
         Self {
             consensus_state: Some(state_ref),
+            resharding_enabled,
             ..self
         }
     }
@@ -50,6 +55,10 @@ impl Dispatcher {
 
     pub fn consensus_state(&self) -> Option<&ConsensusStateRef> {
         self.consensus_state.as_ref()
+    }
+
+    pub fn is_resharding_enabled(&self) -> bool {
+        self.resharding_enabled
     }
 
     /// If `wait_timeout` is not supplied - then default duration will be used.
@@ -187,9 +196,9 @@ impl Dispatcher {
                 match operation_awaiter.await {
                     Ok(Ok(())) => {} // all good
                     Ok(Err(err)) => {
-                        log::warn!("Not all expected operations were completed: {}", err)
+                        log::warn!("Not all expected operations were completed: {err}")
                     }
-                    Err(err) => log::warn!("Awaiting for expected operations timed out: {}", err),
+                    Err(err) => log::warn!("Awaiting for expected operations timed out: {err}"),
                 }
             }
 
@@ -198,7 +207,9 @@ impl Dispatcher {
                 let remaining_timeout =
                     wait_timeout.map(|timeout| timeout.saturating_sub(start.elapsed()));
                 if let Err(err) = self.await_consensus_sync(remaining_timeout).await {
-                    log::warn!("Failed to synchronize all nodes after collection operation in time, some nodes may not be ready: {err}");
+                    log::warn!(
+                        "Failed to synchronize all nodes after collection operation in time, some nodes may not be ready: {err}",
+                    );
                 }
             }
 
@@ -235,11 +246,7 @@ impl Dispatcher {
                 .await_commit_on_all_peers(this_peer_id, commit, term, timeout)
                 .await?;
 
-            log::debug!(
-                "Consensus is synchronized with term: {}, commit: {}",
-                term,
-                commit
-            );
+            log::debug!("Consensus is synchronized with term: {term}, commit: {commit}");
 
             Ok(())
         } else {
@@ -247,8 +254,12 @@ impl Dispatcher {
         }
     }
 
+    pub fn all_hw_metrics(&self) -> HashMap<String, HardwareUsage> {
+        self.toc.all_hw_metrics()
+    }
+
     #[must_use]
-    pub fn get_collection_hw_metrics(&self, collection: String) -> Arc<HwMeasurementAcc> {
+    pub fn get_collection_hw_metrics(&self, collection: String) -> HwSharedDrain {
         self.toc.get_collection_hw_metrics(collection)
     }
 }

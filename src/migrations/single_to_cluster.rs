@@ -65,7 +65,8 @@ pub async fn handle_existing_collections(
                 strict_mode_config: collection_state.config.strict_mode_config,
                 uuid: collection_state.config.uuid,
             },
-        );
+        )
+        .expect("Failed to create collection operation");
 
         let mut consensus_operations = Vec::new();
 
@@ -96,7 +97,7 @@ pub async fn handle_existing_collections(
                     collection_create_operation,
                 ));
 
-                for (shard_key, shards) in &collection_state.shards_key_mapping {
+                for (shard_key, shards) in collection_state.shards_key_mapping.iter() {
                     let mut placement = Vec::new();
 
                     for shard_id in shards {

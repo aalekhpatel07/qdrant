@@ -5,7 +5,7 @@ use collection::operations::vector_params_builder::VectorParamsBuilder;
 use collection::operations::verification::new_unchecked_verification_pass;
 use collection::optimizers_builder::OptimizersConfig;
 use collection::shards::channel_service::ChannelService;
-use common::cpu::CpuBudget;
+use common::budget::ResourceBudget;
 use memory::madvise;
 use segment::types::Distance;
 use storage::content_manager::collection_meta_ops::{
@@ -37,7 +37,6 @@ fn test_alias_operation() {
         snapshots_config: Default::default(),
         temp_path: None,
         on_disk_payload: false,
-        on_disk_payload_uses_mmap: false,
         optimizers: OptimizersConfig {
             deleted_threshold: 0.5,
             vacuum_min_vector_number: 100,
@@ -54,6 +53,7 @@ fn test_alias_operation() {
             max_search_threads: 1,
             max_optimization_threads: 1,
             optimizer_cpu_budget: 0,
+            optimizer_io_budget: 0,
             update_rate_limit: None,
             search_timeout_sec: None,
             incoming_shard_transfers_limit: Some(1),
@@ -87,7 +87,7 @@ fn test_alias_operation() {
         search_runtime,
         update_runtime,
         general_runtime,
-        CpuBudget::default(),
+        ResourceBudget::default(),
         ChannelService::new(6333, None),
         0,
         Some(propose_operation_sender),
@@ -97,27 +97,30 @@ fn test_alias_operation() {
     handle
         .block_on(
             dispatcher.submit_collection_meta_op(
-                CollectionMetaOperations::CreateCollection(CreateCollectionOperation::new(
-                    "test".to_string(),
-                    CreateCollection {
-                        vectors: VectorParamsBuilder::new(10, Distance::Cosine)
-                            .build()
-                            .into(),
-                        sparse_vectors: None,
-                        hnsw_config: None,
-                        wal_config: None,
-                        optimizers_config: None,
-                        shard_number: Some(1),
-                        on_disk_payload: None,
-                        replication_factor: None,
-                        write_consistency_factor: None,
-                        init_from: None,
-                        quantization_config: None,
-                        sharding_method: None,
-                        strict_mode_config: None,
-                        uuid: None,
-                    },
-                )),
+                CollectionMetaOperations::CreateCollection(
+                    CreateCollectionOperation::new(
+                        "test".to_string(),
+                        CreateCollection {
+                            vectors: VectorParamsBuilder::new(10, Distance::Cosine)
+                                .build()
+                                .into(),
+                            sparse_vectors: None,
+                            hnsw_config: None,
+                            wal_config: None,
+                            optimizers_config: None,
+                            shard_number: Some(1),
+                            on_disk_payload: None,
+                            replication_factor: None,
+                            write_consistency_factor: None,
+                            init_from: None,
+                            quantization_config: None,
+                            sharding_method: None,
+                            strict_mode_config: None,
+                            uuid: None,
+                        },
+                    )
+                    .unwrap(),
+                ),
                 FULL_ACCESS,
                 None,
             ),

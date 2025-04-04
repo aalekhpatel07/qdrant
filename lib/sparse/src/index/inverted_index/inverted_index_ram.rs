@@ -1,11 +1,12 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use io::storage_version::StorageVersion;
 
 use crate::common::sparse_vector::RemappedSparseVector;
-use crate::common::types::DimId;
+use crate::common::types::{DimId, DimOffset};
 use crate::index::inverted_index::InvertedIndex;
 use crate::index::posting_list::{PostingList, PostingListIterator};
 use crate::index::posting_list_common::PostingElementEx;
@@ -27,12 +28,18 @@ pub struct InvertedIndexRam {
     /// Number of unique indexed vectors
     /// pre-computed on build and upsert to avoid having to traverse the posting lists.
     pub vector_count: usize,
+    /// Total size of all searchable sparse vectors in bytes
+    pub total_sparse_size: usize,
 }
 
 impl InvertedIndex for InvertedIndexRam {
     type Iter<'a> = PostingListIterator<'a>;
 
     type Version = Version;
+
+    fn is_on_disk(&self) -> bool {
+        false
+    }
 
     fn open(_path: &Path) -> std::io::Result<Self> {
         panic!("InvertedIndexRam is not supposed to be loaded");
@@ -42,15 +49,19 @@ impl InvertedIndex for InvertedIndexRam {
         panic!("InvertedIndexRam is not supposed to be saved");
     }
 
-    fn get(&self, id: &DimId) -> Option<PostingListIterator> {
-        self.get(id).map(|posting_list| posting_list.iter())
+    fn get<'a>(
+        &'a self,
+        id: DimOffset,
+        _hw_counter: &'a HardwareCounterCell,
+    ) -> Option<PostingListIterator<'a>> {
+        self.get(&id).map(|posting_list| posting_list.iter())
     }
 
     fn len(&self) -> usize {
         self.postings.len()
     }
 
-    fn posting_list_len(&self, id: &DimId) -> Option<usize> {
+    fn posting_list_len(&self, id: &DimId, _hw_counter: &HardwareCounterCell) -> Option<usize> {
         self.get(id).map(|posting_list| posting_list.elements.len())
     }
 
@@ -59,6 +70,7 @@ impl InvertedIndex for InvertedIndexRam {
     }
 
     fn remove(&mut self, id: PointOffsetType, old_vector: RemappedSparseVector) {
+        let old_vector_size = old_vector.len() * size_of::<PostingElementEx>();
         for dim_id in old_vector.indices {
             if let Some(posting) = self.postings.get_mut(dim_id as usize) {
                 posting.delete(id);
@@ -67,6 +79,7 @@ impl InvertedIndex for InvertedIndexRam {
             }
         }
 
+        self.total_sparse_size = self.total_sparse_size.saturating_sub(old_vector_size);
         self.vector_count = self.vector_count.saturating_sub(1);
     }
 
@@ -90,6 +103,10 @@ impl InvertedIndex for InvertedIndexRam {
         self.vector_count
     }
 
+    fn total_sparse_vectors_size(&self) -> usize {
+        self.total_sparse_size
+    }
+
     fn max_index(&self) -> Option<DimId> {
         match self.postings.len() {
             0 => None,
@@ -104,6 +121,7 @@ impl InvertedIndexRam {
         InvertedIndexRam {
             postings: Vec::new(),
             vector_count: 0,
+            total_sparse_size: 0,
         }
     }
 
@@ -135,6 +153,8 @@ impl InvertedIndexRam {
             }
         }
 
+        let new_vector_size = vector.len() * size_of::<PostingElementEx>();
+
         for (dim_id, weight) in vector.indices.into_iter().zip(vector.values.into_iter()) {
             let dim_id = dim_id as usize;
             match self.postings.get_mut(dim_id) {
@@ -151,9 +171,22 @@ impl InvertedIndexRam {
                 }
             }
         }
-        if old_vector.is_none() {
+        if let Some(old) = old_vector {
+            self.total_sparse_size = self
+                .total_sparse_size
+                .saturating_sub(old.len() * size_of::<PostingElementEx>());
+        } else {
             self.vector_count += 1;
         }
+
+        self.total_sparse_size += new_vector_size
+    }
+
+    pub fn total_posting_elements_size(&self) -> usize {
+        self.postings
+            .iter()
+            .map(|posting| posting.elements.len() * size_of::<PostingElementEx>())
+            .sum()
     }
 }
 

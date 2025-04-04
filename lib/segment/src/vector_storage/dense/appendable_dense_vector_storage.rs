@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use bitvec::prelude::BitSlice;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use memory::madvise::AdviceSetting;
 
-use crate::common::operation_error::{check_process_stopped, OperationResult};
 use crate::common::Flusher;
+use crate::common::operation_error::{OperationResult, check_process_stopped};
 use crate::data_types::named_vectors::CowVector;
 use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::{VectorElementType, VectorRef};
@@ -37,7 +38,7 @@ impl<T: PrimitiveVectorElement, S: ChunkedVectorStorage<T>> AppendableMmapDenseV
     /// Set deleted flag for given key. Returns previous deleted state.
     #[inline]
     fn set_deleted(&mut self, key: PointOffsetType, deleted: bool) -> OperationResult<bool> {
-        if self.vectors.len() <= key as usize {
+        if !deleted && self.vectors.len() <= key as usize {
             return Ok(false);
         }
 
@@ -99,10 +100,6 @@ impl<T: PrimitiveVectorElement, S: ChunkedVectorStorage<T>> VectorStorage
         self.vectors.len()
     }
 
-    fn size_of_available_vectors_in_bytes(&self) -> usize {
-        self.available_vector_count() * self.vector_dim() * std::mem::size_of::<T>()
-    }
-
     fn get_vector(&self, key: PointOffsetType) -> CowVector {
         self.get_vector_opt(key).expect("vector not found")
     }
@@ -113,26 +110,32 @@ impl<T: PrimitiveVectorElement, S: ChunkedVectorStorage<T>> VectorStorage
             .map(|slice| CowVector::from(T::slice_to_float_cow(slice.into())))
     }
 
-    fn insert_vector(&mut self, key: PointOffsetType, vector: VectorRef) -> OperationResult<()> {
+    fn insert_vector(
+        &mut self,
+        key: PointOffsetType,
+        vector: VectorRef,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
         let vector: &[VectorElementType] = vector.try_into()?;
         let vector = T::slice_from_float_cow(Cow::from(vector));
         self.vectors
-            .insert(key as VectorOffsetType, vector.as_ref())?;
+            .insert(key as VectorOffsetType, vector.as_ref(), hw_counter)?;
         self.set_deleted(key, false)?;
         Ok(())
     }
 
     fn update_from<'a>(
         &mut self,
-        other_ids: &'a mut impl Iterator<Item = (CowVector<'a>, bool)>,
+        other_vectors: &'a mut impl Iterator<Item = (CowVector<'a>, bool)>,
         stopped: &AtomicBool,
     ) -> OperationResult<Range<PointOffsetType>> {
         let start_index = self.vectors.len() as PointOffsetType;
-        for (other_vector, other_deleted) in other_ids {
+        let disposed_hw = HardwareCounterCell::disposable(); // This function is only used for internal operations.
+        for (other_vector, other_deleted) in other_vectors {
             check_process_stopped(stopped)?;
             // Do not perform preprocessing - vectors should be already processed
             let other_vector = T::slice_from_float_cow(Cow::try_from(other_vector)?);
-            let new_id = self.vectors.push(other_vector.as_ref())?;
+            let new_id = self.vectors.push(other_vector.as_ref(), &disposed_hw)?;
             self.set_deleted(new_id as PointOffsetType, other_deleted)?;
         }
         let end_index = self.vectors.len() as PointOffsetType;
@@ -219,15 +222,17 @@ pub fn open_appendable_memmap_vector_storage_impl<T: PrimitiveVectorElement>(
     let vectors_path = path.join(VECTORS_DIR_PATH);
     let deleted_path = path.join(DELETED_DIR_PATH);
 
+    let populate = false;
+
     let vectors = ChunkedMmapVectors::<T>::open(
         &vectors_path,
         dim,
         Some(false),
         AdviceSetting::Global,
-        Some(false),
+        Some(populate),
     )?;
 
-    let deleted: DynamicMmapFlags = DynamicMmapFlags::open(&deleted_path)?;
+    let deleted: DynamicMmapFlags = DynamicMmapFlags::open(&deleted_path, populate)?;
     let deleted_count = deleted.count_flags();
 
     Ok(AppendableMmapDenseVectorStorage {
@@ -286,7 +291,8 @@ pub fn open_appendable_in_ram_vector_storage_impl<T: PrimitiveVectorElement>(
 
     let vectors = InRamPersistedVectors::<T>::open(&vectors_path, dim)?;
 
-    let deleted: DynamicMmapFlags = DynamicMmapFlags::open(&deleted_path)?;
+    let populate = true;
+    let deleted: DynamicMmapFlags = DynamicMmapFlags::open(&deleted_path, populate)?;
     let deleted_count = deleted.count_flags();
 
     Ok(AppendableMmapDenseVectorStorage {

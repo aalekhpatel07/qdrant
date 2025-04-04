@@ -1,3 +1,5 @@
+//! Handlers for transferring data from one collection into another within single cluster
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,9 +10,10 @@ use collection::operations::point_ops::{
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::types::{CollectionError, CollectionResult, ScrollRequestInternal};
 use collection::operations::{CollectionUpdateOperations, CreateIndex, FieldIndexOperations};
+use collection::shards::CollectionId;
 use collection::shards::replica_set::ReplicaState;
 use collection::shards::shard::{PeerId, ShardId};
-use collection::shards::CollectionId;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use segment::types::{WithPayloadInterface, WithVector};
 use tokio::sync::RwLock;
 
@@ -18,8 +21,6 @@ use crate::content_manager::collections_ops::Collections;
 
 const MIGRATION_BATCH_SIZE: usize = 1000;
 const COLLECTION_INITIATION_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Handlers for transferring data from one collection into another within single cluster
 
 /// Get a list of local shards, which can be used for migration
 ///
@@ -31,6 +32,14 @@ async fn get_local_source_shards(
 ) -> CollectionResult<Vec<ShardId>> {
     let collection_state = source.state().await;
 
+    if source.resharding_state().await.is_some() {
+        return Err(CollectionError::bad_input(format!(
+            "can't initialize new collection from collection {source}, \
+             because resharding is in progress for collection {source}",
+            source = source.name(),
+        )));
+    }
+
     let mut local_responsible_shards = Vec::new();
 
     // Find max replica peer id for each shard
@@ -38,17 +47,18 @@ async fn get_local_source_shards(
         let responsible_shard_opt = shard_info
             .replicas
             .iter()
-            .filter(|(_, replica_state)| **replica_state == ReplicaState::Active)
+            .filter(|&(_, &replica_state)| {
+                // It's much easier to only select among `Active` (but not `ReshardingScaleDown`) shards here.
+                // Also, don't initialize-from during resharding... 🙄
+                replica_state == ReplicaState::Active
+            })
             .max_by_key(|(peer_id, _)| *peer_id)
             .map(|(peer_id, _)| *peer_id);
 
-        let responsible_shard = match responsible_shard_opt {
-            None => {
-                return Err(CollectionError::service_error(format!(
-                    "No active replica for shard {shard_id}, collection initialization is cancelled"
-                )));
-            }
-            Some(responsible_shard) => responsible_shard,
+        let Some(responsible_shard) = responsible_shard_opt else {
+            return Err(CollectionError::service_error(format!(
+                "No active replica for shard {shard_id}, collection initialization is cancelled"
+            )));
         };
 
         if responsible_shard == this_peer_id {
@@ -98,6 +108,7 @@ async fn replicate_shard_data(
                 None,
                 &ShardSelectorInternal::ShardId(shard_id),
                 None,
+                HwMeasurementAcc::disposable(), // Internal operation, don't measure hardware here
             )
             .await?;
 
@@ -120,8 +131,9 @@ async fn replicate_shard_data(
         let target_collection =
             handle_get_collection(collections_read.get(target_collection_name))?;
 
+        let hw_counter = HwMeasurementAcc::disposable(); // Internal operation
         target_collection
-            .update_from_client_simple(upsert_request, false, WriteOrdering::default())
+            .update_from_client_simple(upsert_request, false, WriteOrdering::default(), hw_counter)
             .await?;
 
         if offset.is_none() {
@@ -161,10 +173,7 @@ pub async fn populate_collection(
     let local_responsible_shards = get_local_source_shards(collection, this_peer_id).await?;
 
     log::debug!(
-        "Transferring shards {:?} from collection {} to collection {}",
-        local_responsible_shards,
-        source_collection,
-        target_collection
+        "Transferring shards {local_responsible_shards:?} from collection {source_collection} to collection {target_collection}"
     );
 
     // Wait for all shards to be active
@@ -222,8 +231,9 @@ pub async fn transfer_indexes(
                 field_schema: Some(schema.try_into()?),
             }),
         );
+        let hw_counter = HwMeasurementAcc::disposable(); // Internal operation
         target_collection
-            .update_from_client_simple(request, false, WriteOrdering::default())
+            .update_from_client_simple(request, false, WriteOrdering::default(), hw_counter)
             .await?;
     }
 

@@ -14,24 +14,25 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use chrono::DateTime;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use delegate::delegate;
 use mmap_numeric_index::MmapNumericIndex;
 use mutable_numeric_index::{InMemoryNumericIndex, MutableNumericIndex};
 use parking_lot::RwLock;
 use rocksdb::DB;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use uuid::Uuid;
 
 use self::immutable_numeric_index::ImmutableNumericIndex;
+use super::FieldIndexBuilderTrait;
 use super::histogram::Point;
 use super::mmap_point_to_values::MmapValue;
 use super::utils::check_boundaries;
-use super::FieldIndexBuilderTrait;
-use crate::common::operation_error::{OperationError, OperationResult};
 use crate::common::Flusher;
+use crate::common::operation_error::{OperationError, OperationResult};
 use crate::index::field_index::histogram::{Histogram, Numericable};
 use crate::index::field_index::stat_tools::estimate_multi_value_selection_cardinality;
 use crate::index::field_index::{
@@ -173,8 +174,10 @@ impl<T: Encodable + Numericable + MmapValue + Default> NumericIndexInner<T> {
         }
     }
 
-    pub fn new_mmap(path: &Path) -> OperationResult<Self> {
-        Ok(NumericIndexInner::Mmap(MmapNumericIndex::load(path)?))
+    pub fn new_mmap(path: &Path, is_on_disk: bool) -> OperationResult<Self> {
+        Ok(NumericIndexInner::Mmap(MmapNumericIndex::load(
+            path, is_on_disk,
+        )?))
     }
 
     fn get_histogram(&self) -> &Histogram<T> {
@@ -239,11 +242,18 @@ impl<T: Encodable + Numericable + MmapValue + Default> NumericIndexInner<T> {
         }
     }
 
-    pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool) -> bool {
+    pub fn check_values_any(
+        &self,
+        idx: PointOffsetType,
+        check_fn: impl Fn(&T) -> bool,
+        hw_counter: &HardwareCounterCell,
+    ) -> bool {
         match self {
-            NumericIndexInner::Mutable(index) => index.check_values_any(idx, check_fn),
-            NumericIndexInner::Immutable(index) => index.check_values_any(idx, check_fn),
-            NumericIndexInner::Mmap(index) => index.check_values_any(idx, check_fn),
+            NumericIndexInner::Mutable(index) => index.check_values_any(idx, check_fn, hw_counter),
+            NumericIndexInner::Immutable(index) => {
+                index.check_values_any(idx, check_fn, hw_counter)
+            }
+            NumericIndexInner::Mmap(index) => index.check_values_any(idx, check_fn, hw_counter),
         }
     }
 
@@ -357,20 +367,33 @@ impl<T: Encodable + Numericable + MmapValue + Default> NumericIndexInner<T> {
         self.values_count(idx) == 0
     }
 
-    pub fn point_ids_by_value(&self, value: &T) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
-        let start = Bound::Included(Point::new(*value, PointOffsetType::MIN));
-        let end = Bound::Included(Point::new(*value, PointOffsetType::MAX));
+    pub fn point_ids_by_value<'a>(
+        &'a self,
+        value: T,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> Box<dyn Iterator<Item = PointOffsetType> + 'a> {
+        let start = Bound::Included(Point::new(value, PointOffsetType::MIN));
+        let end = Bound::Included(Point::new(value, PointOffsetType::MAX));
         match &self {
-            NumericIndexInner::Mutable(mutable) => Box::new(mutable.values_range(start, end)),
-            NumericIndexInner::Immutable(immutable) => Box::new(immutable.values_range(start, end)),
-            NumericIndexInner::Mmap(mmap) => Box::new(mmap.values_range(start, end)),
+            NumericIndexInner::Mutable(mutable) => {
+                Box::new(mutable.values_range(start, end, hw_counter))
+            }
+            NumericIndexInner::Immutable(immutable) => {
+                Box::new(immutable.values_range(start, end, hw_counter))
+            }
+            NumericIndexInner::Mmap(mmap) => Box::new(mmap.values_range(start, end, hw_counter)),
         }
     }
 
     /// Tries to estimate the amount of points for a given key.
-    pub fn estimate_points(&self, value: &T) -> usize {
+    pub fn estimate_points(&self, value: &T, hw_counter: &HardwareCounterCell) -> usize {
         let start = Bound::Included(Point::new(*value, PointOffsetType::MIN));
         let end = Bound::Included(Point::new(*value, PointOffsetType::MAX));
+
+        hw_counter
+            .payload_index_io_read_counter()
+            // We have to do 2 times binary search in mmap and immutable storage.
+            .incr_delta(2 * ((self.total_unique_values_count() as f32).log2().ceil() as usize));
 
         match &self {
             NumericIndexInner::Mutable(mutable) => {
@@ -423,9 +446,9 @@ impl<T: Encodable + Numericable + MmapValue + Default, P> NumericIndex<T, P> {
         }
     }
 
-    pub fn new_mmap(path: &Path) -> OperationResult<Self> {
+    pub fn new_mmap(path: &Path, is_on_disk: bool) -> OperationResult<Self> {
         Ok(Self {
-            inner: NumericIndexInner::new_mmap(path)?,
+            inner: NumericIndexInner::new_mmap(path, is_on_disk)?,
             _phantom: PhantomData,
         })
     }
@@ -449,13 +472,14 @@ impl<T: Encodable + Numericable + MmapValue + Default, P> NumericIndex<T, P> {
         }
     }
 
-    pub fn builder_mmap(path: &Path) -> NumericIndexMmapBuilder<T, P>
+    pub fn builder_mmap(path: &Path, is_on_disk: bool) -> NumericIndexMmapBuilder<T, P>
     where
         Self: ValueIndexer<ValueType = P> + NumericIndexIntoInnerValue<T, P>,
     {
         NumericIndexMmapBuilder {
             path: path.to_owned(),
             in_memory_index: InMemoryNumericIndex::default(),
+            is_on_disk,
             _phantom: PhantomData,
         }
     }
@@ -470,8 +494,8 @@ impl<T: Encodable + Numericable + MmapValue + Default, P> NumericIndex<T, P> {
 
     delegate! {
         to self.inner {
-            pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool) -> bool;
-            pub fn clear(self) -> OperationResult<()>;
+            pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool, hw_counter: &HardwareCounterCell) -> bool;
+            pub fn cleanup(self) -> OperationResult<()>;
             pub fn get_telemetry_data(&self) -> PayloadIndexTelemetry;
             pub fn load(&mut self) -> OperationResult<bool>;
             pub fn values_count(&self, idx: PointOffsetType) -> usize;
@@ -502,8 +526,13 @@ where
         }
     }
 
-    fn add_point(&mut self, id: PointOffsetType, payload: &[&Value]) -> OperationResult<()> {
-        self.0.add_point(id, payload)
+    fn add_point(
+        &mut self,
+        id: PointOffsetType,
+        payload: &[&Value],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        self.0.add_point(id, payload, hw_counter)
     }
 
     fn finalize(self) -> OperationResult<Self::FieldIndexType> {
@@ -538,8 +567,13 @@ where
         }
     }
 
-    fn add_point(&mut self, id: PointOffsetType, payload: &[&Value]) -> OperationResult<()> {
-        self.index.add_point(id, payload)
+    fn add_point(
+        &mut self,
+        id: PointOffsetType,
+        payload: &[&Value],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        self.index.add_point(id, payload, hw_counter)
     }
 
     fn finalize(self) -> OperationResult<Self::FieldIndexType> {
@@ -562,6 +596,7 @@ where
 {
     path: PathBuf,
     in_memory_index: InMemoryNumericIndex<T>,
+    is_on_disk: bool,
     _phantom: PhantomData<P>,
 }
 
@@ -576,7 +611,12 @@ where
         Ok(())
     }
 
-    fn add_point(&mut self, id: PointOffsetType, payload: &[&Value]) -> OperationResult<()> {
+    fn add_point(
+        &mut self,
+        id: PointOffsetType,
+        payload: &[&Value],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
         self.in_memory_index.remove_point(id);
         let mut flatten_values: Vec<_> = vec![];
         for value in payload.iter() {
@@ -587,12 +627,17 @@ where
             .into_iter()
             .map(NumericIndex::into_inner_value)
             .collect();
+
+        hw_counter
+            .payload_index_io_write_counter()
+            .incr_delta(size_of_val(&flatten_values));
+
         self.in_memory_index.add_many_to_list(id, flatten_values);
         Ok(())
     }
 
     fn finalize(self) -> OperationResult<Self::FieldIndexType> {
-        let inner = MmapNumericIndex::build(self.in_memory_index, &self.path)?;
+        let inner = MmapNumericIndex::build(self.in_memory_index, &self.path, self.is_on_disk)?;
         Ok(NumericIndex {
             inner: NumericIndexInner::Mmap(inner),
             _phantom: PhantomData,
@@ -609,7 +654,7 @@ impl<T: Encodable + Numericable + MmapValue + Default> PayloadFieldIndex for Num
         NumericIndexInner::load(self)
     }
 
-    fn clear(self) -> OperationResult<()> {
+    fn cleanup(self) -> OperationResult<()> {
         match self {
             NumericIndexInner::Mutable(index) => index.get_db_wrapper().recreate_column_family(),
             NumericIndexInner::Immutable(index) => index.get_db_wrapper().recreate_column_family(),
@@ -625,10 +670,11 @@ impl<T: Encodable + Numericable + MmapValue + Default> PayloadFieldIndex for Num
         NumericIndexInner::files(self)
     }
 
-    fn filter(
-        &self,
+    fn filter<'a>(
+        &'a self,
         condition: &FieldCondition,
-    ) -> Option<Box<dyn Iterator<Item = PointOffsetType> + '_>> {
+        hw_counter: &'a HardwareCounterCell,
+    ) -> Option<Box<dyn Iterator<Item = PointOffsetType> + 'a>> {
         if let Some(Match::Value(MatchValue {
             value: ValueVariants::String(keyword),
         })) = &condition.r#match
@@ -637,7 +683,7 @@ impl<T: Encodable + Numericable + MmapValue + Default> PayloadFieldIndex for Num
 
             if let Ok(uuid) = Uuid::from_str(keyword) {
                 let value = T::from_u128(uuid.as_u128());
-                return Some(self.point_ids_by_value(&value));
+                return Some(self.point_ids_by_value(value, hw_counter));
             }
         }
 
@@ -659,16 +705,22 @@ impl<T: Encodable + Numericable + MmapValue + Default> PayloadFieldIndex for Num
 
         Some(match self {
             NumericIndexInner::Mutable(index) => {
-                Box::new(index.values_range(start_bound, end_bound))
+                Box::new(index.values_range(start_bound, end_bound, hw_counter))
             }
             NumericIndexInner::Immutable(index) => {
-                Box::new(index.values_range(start_bound, end_bound))
+                Box::new(index.values_range(start_bound, end_bound, hw_counter))
             }
-            NumericIndexInner::Mmap(index) => Box::new(index.values_range(start_bound, end_bound)),
+            NumericIndexInner::Mmap(index) => {
+                Box::new(index.values_range(start_bound, end_bound, hw_counter))
+            }
         })
     }
 
-    fn estimate_cardinality(&self, condition: &FieldCondition) -> Option<CardinalityEstimation> {
+    fn estimate_cardinality(
+        &self,
+        condition: &FieldCondition,
+        hw_counter: &HardwareCounterCell,
+    ) -> Option<CardinalityEstimation> {
         if let Some(Match::Value(MatchValue {
             value: ValueVariants::String(keyword),
         })) = &condition.r#match
@@ -677,10 +729,11 @@ impl<T: Encodable + Numericable + MmapValue + Default> PayloadFieldIndex for Num
             if let Ok(uuid) = Uuid::from_str(keyword) {
                 let key = T::from_u128(uuid.as_u128());
 
-                let estimated_count = self.estimate_points(&key);
+                let estimated_count = self.estimate_points(&key, hw_counter);
                 return Some(
-                    CardinalityEstimation::exact(estimated_count)
-                        .with_primary_clause(PrimaryCondition::Condition(condition.clone())),
+                    CardinalityEstimation::exact(estimated_count).with_primary_clause(
+                        PrimaryCondition::Condition(Box::new(condition.clone())),
+                    ),
                 );
             }
         }
@@ -689,7 +742,7 @@ impl<T: Encodable + Numericable + MmapValue + Default> PayloadFieldIndex for Num
             let mut cardinality = self.range_cardinality(range);
             cardinality
                 .primary_clauses
-                .push(PrimaryCondition::Condition(condition.clone()));
+                .push(PrimaryCondition::Condition(Box::new(condition.clone())));
             cardinality
         })
     }
@@ -773,9 +826,10 @@ impl ValueIndexer for NumericIndex<IntPayloadType, IntPayloadType> {
         &mut self,
         id: PointOffsetType,
         values: Vec<IntPayloadType>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         match &mut self.inner {
-            NumericIndexInner::Mutable(index) => index.add_many_to_list(id, values),
+            NumericIndexInner::Mutable(index) => index.add_many_to_list(id, values, hw_counter),
             NumericIndexInner::Immutable(_) => Err(OperationError::service_error(
                 "Can't add values to immutable numeric index",
             )),
@@ -809,11 +863,14 @@ impl ValueIndexer for NumericIndex<IntPayloadType, DateTimePayloadType> {
         &mut self,
         id: PointOffsetType,
         values: Vec<DateTimePayloadType>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         match &mut self.inner {
-            NumericIndexInner::Mutable(index) => {
-                index.add_many_to_list(id, values.into_iter().map(Self::into_inner_value).collect())
-            }
+            NumericIndexInner::Mutable(index) => index.add_many_to_list(
+                id,
+                values.into_iter().map(Self::into_inner_value).collect(),
+                hw_counter,
+            ),
             NumericIndexInner::Immutable(_) => Err(OperationError::service_error(
                 "Can't add values to immutable numeric index",
             )),
@@ -847,9 +904,10 @@ impl ValueIndexer for NumericIndex<FloatPayloadType, FloatPayloadType> {
         &mut self,
         id: PointOffsetType,
         values: Vec<FloatPayloadType>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         match &mut self.inner {
-            NumericIndexInner::Mutable(index) => index.add_many_to_list(id, values),
+            NumericIndexInner::Mutable(index) => index.add_many_to_list(id, values, hw_counter),
             NumericIndexInner::Immutable(_) => Err(OperationError::service_error(
                 "Can't add values to immutable numeric index",
             )),
@@ -883,11 +941,12 @@ impl ValueIndexer for NumericIndex<UuidIntType, UuidPayloadType> {
         &mut self,
         id: PointOffsetType,
         values: Vec<Self::ValueType>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         match &mut self.inner {
             NumericIndexInner::Mutable(index) => {
                 let values: Vec<u128> = values.iter().map(|i| i.as_u128()).collect();
-                index.add_many_to_list(id, values)
+                index.add_many_to_list(id, values, hw_counter)
             }
             NumericIndexInner::Immutable(_) => Err(OperationError::service_error(
                 "Can't add values to immutable numeric index",

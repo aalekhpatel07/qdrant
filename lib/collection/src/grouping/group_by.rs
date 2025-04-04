@@ -88,6 +88,7 @@ impl GroupRequest {
         read_consistency: Option<ReadConsistency>,
         shard_selection: ShardSelectorInternal,
         timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<QueryGroupRequest>
     where
         F: Fn(String) -> Fut,
@@ -102,6 +103,7 @@ impl GroupRequest {
                     collection_by_name,
                     read_consistency,
                     timeout,
+                    hw_measurement_acc.clone(),
                 )
                 .await?;
 
@@ -119,6 +121,7 @@ impl GroupRequest {
                     collection_by_name,
                     read_consistency,
                     timeout,
+                    hw_measurement_acc.clone(),
                 )
                 .await?;
                 query_req.try_into_shard_request(&collection.id, &referenced_vectors)?
@@ -147,14 +150,14 @@ impl QueryGroupRequest {
         read_consistency: Option<ReadConsistency>,
         shard_selection: ShardSelectorInternal,
         timeout: Option<Duration>,
-        hw_measurement_acc: &HwMeasurementAcc,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<ScoredPoint>> {
         let mut request = self.source.clone();
 
         // Adjust limit to fetch enough points to fill groups
         request.limit = self.groups * self.group_size;
         request.prefetches.iter_mut().for_each(|prefetch| {
-            increase_limit_for_group(prefetch, self.groups);
+            increase_limit_for_group(prefetch, self.group_size);
         });
 
         let key_not_empty = Filter::new_must_not(Condition::IsEmpty(self.group_by.clone().into()));
@@ -283,8 +286,8 @@ impl From<CollectionQueryGroupsRequest> for GroupRequest {
         } = request;
 
         let collection_query_request = CollectionQueryRequest {
-            prefetch: prefetch.into_iter().map(From::from).collect(),
-            query: query.map(From::from),
+            prefetch: prefetch.into_iter().collect(),
+            query,
             using,
             filter,
             score_threshold,
@@ -301,7 +304,7 @@ impl From<CollectionQueryGroupsRequest> for GroupRequest {
             group_by,
             group_size,
             limit,
-            with_lookup: with_lookup_interface.map(Into::into),
+            with_lookup: with_lookup_interface,
         }
     }
 }
@@ -313,7 +316,7 @@ pub async fn group_by(
     read_consistency: Option<ReadConsistency>,
     shard_selection: ShardSelectorInternal,
     timeout: Option<Duration>,
-    hw_measurement_acc: &HwMeasurementAcc,
+    hw_measurement_acc: HwMeasurementAcc,
 ) -> CollectionResult<Vec<PointGroup>> {
     let start = std::time::Instant::now();
     let collection_params = collection.collection_config.read().await.params.clone();
@@ -374,7 +377,7 @@ pub async fn group_by(
                 read_consistency,
                 shard_selection.clone(),
                 timeout,
-                hw_measurement_acc,
+                hw_measurement_acc.clone(),
             )
             .await?;
 
@@ -437,7 +440,7 @@ pub async fn group_by(
                     read_consistency,
                     shard_selection.clone(),
                     timeout,
-                    hw_measurement_acc,
+                    hw_measurement_acc.clone(),
                 )
                 .await?;
 
@@ -475,6 +478,7 @@ pub async fn group_by(
             read_consistency,
             &shard_selection,
             timeout,
+            hw_measurement_acc.clone(),
         )
         .await?
         .into_iter()
@@ -541,10 +545,10 @@ fn values_to_any_variants(values: &[Value]) -> Vec<AnyVariants> {
     any_variants
 }
 
-fn increase_limit_for_group(shard_prefetch: &mut ShardPrefetch, groups: usize) {
-    shard_prefetch.limit *= groups;
+fn increase_limit_for_group(shard_prefetch: &mut ShardPrefetch, group_size: usize) {
+    shard_prefetch.limit *= group_size;
     shard_prefetch.prefetches.iter_mut().for_each(|prefetch| {
-        increase_limit_for_group(prefetch, groups);
+        increase_limit_for_group(prefetch, group_size);
     });
 }
 
@@ -553,6 +557,7 @@ mod tests {
     use std::collections::HashMap;
 
     use segment::data_types::groups::GroupId;
+    use segment::payload_json;
     use segment::types::{Payload, ScoredPoint};
 
     use crate::grouping::types::Group;
@@ -598,8 +603,8 @@ mod tests {
             groups.push(group);
         });
 
-        let payload_a = Payload::from(serde_json::json!({"some_key": "some value a"}));
-        let payload_b = Payload::from(serde_json::json!({"some_key": "some value b"}));
+        let payload_a = payload_json! {"some_key": "some value a"};
+        let payload_b = payload_json! {"some_key": "some value b"};
 
         let hydrated = vec![
             make_scored_point(1, 1.0, Some(payload_a.clone())),
@@ -621,13 +626,15 @@ mod tests {
         let a = groups.first().unwrap();
         let b = groups.get(1).unwrap();
 
-        assert!(a
-            .hits
-            .iter()
-            .all(|x| x.payload.as_ref() == Some(&payload_a)));
-        assert!(b
-            .hits
-            .iter()
-            .all(|x| x.payload.as_ref() == Some(&payload_b)));
+        assert!(
+            a.hits
+                .iter()
+                .all(|x| x.payload.as_ref() == Some(&payload_a)),
+        );
+        assert!(
+            b.hits
+                .iter()
+                .all(|x| x.payload.as_ref() == Some(&payload_b)),
+        );
     }
 }

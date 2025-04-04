@@ -6,7 +6,7 @@ authors = [
     "Qdrant Team <info@qdrant.tech>",
 ]
 license = "Apache-2.0"
-edition = "2021"
+edition = "2024"
 
 [lints]
 workspace = true
@@ -18,8 +18,8 @@ data-consistency-check = []
 
 [dev-dependencies]
 criterion = { workspace = true }
-proptest = "1.5.0"
-rstest = "0.23.0"
+proptest = { workspace = true }
+rstest = { workspace = true }
 approx = "0.5.1"
 collection = { path = ".", features = ["testing"] }
 common = { path = "../common/common", features = ["testing"] }
@@ -36,15 +36,14 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_cbor = { workspace = true }
 serde_json = { workspace = true }
-serde_variant = { workspace = true }
 rmp-serde = "~1.3"
 wal = { workspace = true }
 ordered-float = { workspace = true }
 hashring = "0.3.6"
-tinyvec = { version = "1.8.0", features = ["alloc"] }
+tinyvec = { version = "1.9.0", features = ["alloc", "latest_stable_rust"] }
 bitvec = { workspace = true }
 lazy_static = "1.5.0"
-smallvec = "1.13.2"
+smallvec = "1.14.0"
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -53,14 +52,14 @@ atomicwrites = { workspace = true}
 log = { workspace = true }
 env_logger = "0.11"
 merge = { workspace = true }
-async-trait = "0.1.83"
+async-trait = "0.1.88"
 arc-swap = "1.7.1"
 tonic = { workspace = true }
 uuid = { workspace = true }
 url = { version = "2", features = ["serde"] }
 validator = { workspace = true }
 actix-web-validator = "6.0.0"
-actix-web = { version = "4.9.0" }
+actix-web = { version = "4.10.2" }
 actix-files = "0.6.6"
 
 common = { path = "../common/common" }
@@ -87,10 +86,10 @@ ringbuffer = "0.15.0"
 strum = { workspace = true }
 
 tracing = { workspace = true, optional = true }
-fs4 = "0.11.1"
+fs4 = "0.13.1"
 
 # AWS S3 support
-object_store = { version = "0.11.1", features = ["aws"] }
+object_store = { version = "0.12.0", features = ["aws"] }
 
 
 [[bench]]

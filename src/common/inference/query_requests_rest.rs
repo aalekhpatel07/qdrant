@@ -4,12 +4,14 @@ use collection::operations::universal_query::collection_query::{
     CollectionPrefetch, CollectionQueryGroupsRequest, CollectionQueryRequest, Query,
     VectorInputInternal, VectorQuery,
 };
+use collection::operations::universal_query::formula::FormulaInternal;
 use collection::operations::universal_query::shard_query::{FusionInternal, SampleInternal};
 use segment::data_types::order_by::OrderBy;
-use segment::data_types::vectors::{MultiDenseVectorInternal, VectorInternal, DEFAULT_VECTOR_NAME};
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, MultiDenseVectorInternal, VectorInternal};
 use segment::vector_storage::query::{ContextPair, ContextQuery, DiscoveryQuery, RecoQuery};
 use storage::content_manager::errors::StorageError;
 
+use crate::common::inference::InferenceToken;
 use crate::common::inference::batch_processing::{
     collect_query_groups_request, collect_query_request,
 };
@@ -18,6 +20,7 @@ use crate::common::inference::service::{InferenceData, InferenceType};
 
 pub async fn convert_query_groups_request_from_rest(
     request: rest::QueryGroupsRequestInternal,
+    inference_token: InferenceToken,
 ) -> Result<CollectionQueryGroupsRequest, StorageError> {
     let batch = collect_query_groups_request(&request);
     let rest::QueryGroupsRequestInternal {
@@ -33,7 +36,9 @@ pub async fn convert_query_groups_request_from_rest(
         group_request,
     } = request;
 
-    let inferred = BatchAccumInferred::from_batch_accum(batch, InferenceType::Search).await?;
+    let inferred =
+        BatchAccumInferred::from_batch_accum(batch, InferenceType::Search, &inference_token)
+            .await?;
     let query = query
         .map(|q| convert_query_with_inferred(q, &inferred))
         .transpose()?;
@@ -51,7 +56,7 @@ pub async fn convert_query_groups_request_from_rest(
     Ok(CollectionQueryGroupsRequest {
         prefetch,
         query,
-        using: using.unwrap_or(DEFAULT_VECTOR_NAME.to_string()),
+        using: using.unwrap_or(DEFAULT_VECTOR_NAME.to_owned()),
         filter,
         score_threshold,
         params,
@@ -71,9 +76,11 @@ pub async fn convert_query_groups_request_from_rest(
 
 pub async fn convert_query_request_from_rest(
     request: rest::QueryRequestInternal,
+    inference_token: &InferenceToken,
 ) -> Result<CollectionQueryRequest, StorageError> {
     let batch = collect_query_request(&request);
-    let inferred = BatchAccumInferred::from_batch_accum(batch, InferenceType::Search).await?;
+    let inferred =
+        BatchAccumInferred::from_batch_accum(batch, InferenceType::Search, inference_token).await?;
     let rest::QueryRequestInternal {
         prefetch,
         query,
@@ -105,7 +112,7 @@ pub async fn convert_query_request_from_rest(
     Ok(CollectionQueryRequest {
         prefetch,
         query,
-        using: using.unwrap_or(DEFAULT_VECTOR_NAME.to_string()),
+        using: using.unwrap_or(DEFAULT_VECTOR_NAME.to_owned()),
         filter,
         score_threshold,
         limit: limit.unwrap_or(CollectionQueryRequest::DEFAULT_LIMIT),
@@ -223,6 +230,7 @@ fn convert_query_with_inferred(
         }
         rest::Query::OrderBy(order_by) => Ok(Query::OrderBy(OrderBy::from(order_by.order_by))),
         rest::Query::Fusion(fusion) => Ok(Query::Fusion(FusionInternal::from(fusion.fusion))),
+        rest::Query::Formula(formula) => Ok(Query::Formula(FormulaInternal::from(formula))),
         rest::Query::Sample(sample) => Ok(Query::Sample(SampleInternal::from(sample.sample))),
     }
 }
@@ -258,7 +266,7 @@ fn convert_prefetch_with_inferred(
     Ok(CollectionPrefetch {
         prefetch: nested_prefetches,
         query,
-        using: using.unwrap_or(DEFAULT_VECTOR_NAME.to_string()),
+        using: using.unwrap_or(DEFAULT_VECTOR_NAME.to_owned()),
         filter,
         score_threshold,
         limit: limit.unwrap_or(CollectionQueryRequest::DEFAULT_LIMIT),
@@ -366,10 +374,12 @@ mod tests {
 
         let result = convert_vector_input_with_inferred(vector, &inferred);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Missing inferred vector"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Missing inferred vector"),
+        );
     }
 
     #[test]

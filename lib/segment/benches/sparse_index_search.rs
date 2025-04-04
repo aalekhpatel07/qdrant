@@ -1,21 +1,22 @@
 use std::sync::atomic::AtomicBool;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use dataset::Dataset;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use itertools::Itertools as _;
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use segment::fixtures::sparse_fixtures::fixture_sparse_index_from_iter;
 use segment::index::sparse_index::sparse_index_config::{SparseIndexConfig, SparseIndexType};
 use segment::index::sparse_index::sparse_vector_index::{
     SparseVectorIndex, SparseVectorIndexOpenArgs,
 };
 use segment::index::{PayloadIndex, VectorIndex};
+use segment::payload_json;
 use segment::types::PayloadSchemaType::Keyword;
-use segment::types::{Condition, FieldCondition, Filter, Payload};
-use serde_json::json;
+use segment::types::{Condition, FieldCondition, Filter};
 use sparse::common::sparse_vector::SparseVector;
 use sparse::common::sparse_vector_fixture::{random_positive_sparse_vector, random_sparse_vector};
 use sparse::index::inverted_index::inverted_index_compressed_mmap::InvertedIndexCompressedMmap;
@@ -83,16 +84,15 @@ fn sparse_vector_index_search_benchmark_impl(
     // adding payload on field
     let field_name = "field";
     let field_value = "important value";
-    let payload: Payload = json!({
-        field_name: field_value,
-    })
-    .into();
+    let payload = payload_json! {field_name: field_value};
+
+    let hw_counter = HardwareCounterCell::new();
 
     // all points have the same payload
     let mut payload_index = sparse_vector_index.payload_index().borrow_mut();
     for idx in 0..NUM_VECTORS {
         payload_index
-            .set_payload(idx as PointOffsetType, &payload, &None)
+            .set_payload(idx as PointOffsetType, &payload, &None, &hw_counter)
             .unwrap();
     }
     drop(payload_index);
@@ -182,7 +182,7 @@ fn sparse_vector_index_search_benchmark_impl(
 
     // create payload field index
     payload_index
-        .set_indexed(&field_name.parse().unwrap(), Keyword)
+        .set_indexed(&field_name.parse().unwrap(), Keyword, &hw_counter)
         .unwrap();
 
     drop(payload_index);
@@ -229,9 +229,9 @@ fn sparse_vector_index_search_benchmark_impl(
     group.finish();
 }
 
-fn progress(name: &str, len: usize) -> ProgressBar {
+fn progress(name: &str, length: usize) -> ProgressBar {
     let pb =
-        ProgressBar::with_draw_target(Some(len as u64), ProgressDrawTarget::stderr_with_hz(12));
+        ProgressBar::with_draw_target(Some(length as u64), ProgressDrawTarget::stderr_with_hz(12));
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{msg} {wide_bar} {pos}/{len} (eta:{eta})")

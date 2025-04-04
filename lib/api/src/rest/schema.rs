@@ -8,8 +8,8 @@ use segment::common::utils::MaybeOneOrMany;
 use segment::data_types::order_by::OrderBy;
 use segment::json_path::JsonPath;
 use segment::types::{
-    Filter, IntPayloadType, Payload, PointIdType, SearchParams, ShardKey, WithPayloadInterface,
-    WithVector,
+    Condition, Filter, GeoPoint, IntPayloadType, Payload, PointIdType, SearchParams, ShardKey,
+    VectorNameBuf, WithPayloadInterface, WithVector,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,7 +29,7 @@ pub type MultiDenseVector = Vec<DenseVector>;
 #[serde(untagged, rename_all = "snake_case")]
 pub enum Vector {
     Dense(DenseVector),
-    Sparse(sparse::common::sparse_vector::SparseVector),
+    Sparse(SparseVector),
     MultiDense(MultiDenseVector),
     Document(Document),
     Image(Image),
@@ -41,7 +41,7 @@ pub enum Vector {
 #[serde(untagged, rename_all = "snake_case")]
 pub enum VectorOutput {
     Dense(DenseVector),
-    Sparse(sparse::common::sparse_vector::SparseVector),
+    Sparse(SparseVector),
     MultiDense(MultiDenseVector),
 }
 
@@ -70,10 +70,10 @@ fn multi_dense_vector_example() -> MultiDenseVector {
     ]
 }
 
-fn named_vector_example() -> HashMap<String, Vector> {
+fn named_vector_example() -> HashMap<VectorNameBuf, Vector> {
     let mut map = HashMap::new();
     map.insert(
-        "image-embeddings".to_string(),
+        "image-embeddings".into(),
         Vector::Dense(vec![0.873, 0.140625, 0.8976]),
     );
     map
@@ -88,7 +88,7 @@ pub enum VectorStruct {
     #[schemars(example = "multi_dense_vector_example")]
     MultiDense(MultiDenseVector),
     #[schemars(example = "named_vector_example")]
-    Named(HashMap<String, Vector>),
+    Named(HashMap<VectorNameBuf, Vector>),
     Document(Document),
     Image(Image),
     Object(InferenceObject),
@@ -103,7 +103,7 @@ pub enum VectorStructOutput {
     #[schemars(example = "multi_dense_vector_example")]
     MultiDense(MultiDenseVector),
     #[schemars(example = "named_vector_example")]
-    Named(HashMap<String, VectorOutput>),
+    Named(HashMap<VectorNameBuf, VectorOutput>),
 }
 
 impl VectorStruct {
@@ -222,7 +222,7 @@ pub struct InferenceObject {
 pub enum BatchVectorStruct {
     Single(Vec<DenseVector>),
     MultiDense(Vec<MultiDenseVector>),
-    Named(HashMap<String, Vec<Vector>>),
+    Named(HashMap<VectorNameBuf, Vec<Vector>>),
     Document(Vec<Document>),
     Image(Vec<Image>),
     Object(Vec<InferenceObject>),
@@ -238,6 +238,7 @@ pub struct Batch {
 
 #[derive(Debug, Deserialize, Serialize, Clone, JsonSchema, PartialEq)]
 #[serde(untagged)]
+#[serde(expecting = "Expected a string or an integer")]
 pub enum ShardKeySelector {
     ShardKey(ShardKey),
     ShardKeys(Vec<ShardKey>),
@@ -339,6 +340,7 @@ pub enum NamedVectorStruct {
 
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq)]
 #[serde(untagged)]
+#[serde(expecting = "Expected a string, or an object with a key, direction and/or start_from")]
 pub enum OrderByInterface {
     Key(JsonPath),
     Struct(OrderBy),
@@ -382,7 +384,7 @@ pub struct QueryRequestInternal {
     pub query: Option<QueryInterface>,
 
     /// Define which vector name to use for querying. If missing, the default vector is used.
-    pub using: Option<String>,
+    pub using: Option<VectorNameBuf>,
 
     /// Filter conditions - return only those points that satisfy the specified conditions.
     #[validate(nested)]
@@ -403,6 +405,7 @@ pub struct QueryRequestInternal {
     pub offset: Option<usize>,
 
     /// Options for specifying which vectors to include into the response. Default is false.
+    #[serde(alias = "with_vectors")]
     pub with_vector: Option<WithVector>,
 
     /// Options for specifying which payload to include or not. Default is false.
@@ -435,6 +438,7 @@ pub struct QueryResponse {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
+#[serde(expecting = "Expected some form of vector, id, or a type of query")]
 pub enum QueryInterface {
     Nearest(VectorInput),
     Query(Query),
@@ -460,6 +464,9 @@ pub enum Query {
 
     /// Fuse the results of multiple prefetches.
     Fusion(FusionQuery),
+
+    /// Score boosting via an arbitrary formula
+    Formula(FormulaQuery),
 
     /// Sample points from the collection, non-deterministically.
     Sample(SampleQuery),
@@ -502,6 +509,14 @@ pub struct FusionQuery {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct FormulaQuery {
+    pub formula: Expression,
+
+    #[serde(default)]
+    pub defaults: HashMap<String, Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct SampleQuery {
     pub sample: Sample,
@@ -520,7 +535,7 @@ pub struct Prefetch {
     pub query: Option<QueryInterface>,
 
     /// Define which vector name to use for querying. If missing, the default vector is used.
-    pub using: Option<String>,
+    pub using: Option<VectorNameBuf>,
 
     /// Filter conditions - return only those points that satisfy the specified conditions.
     #[validate(nested)]
@@ -620,6 +635,131 @@ impl ContextPair {
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum Expression {
+    Constant(f32),
+    Variable(String),
+    Condition(Box<Condition>),
+    Mult(MultExpression),
+    Sum(SumExpression),
+    Neg(NegExpression),
+    Abs(AbsExpression),
+    Div(DivExpression),
+    Sqrt(SqrtExpression),
+    Pow(PowExpression),
+    Exp(ExpExpression),
+    Log10(Log10Expression),
+    Ln(LnExpression),
+    GeoDistance(GeoDistance),
+    LinDecay(LinDecayExpression),
+    ExpDecay(ExpDecayExpression),
+    GaussDecay(GaussDecayExpression),
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct MultExpression {
+    pub mult: Vec<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SumExpression {
+    pub sum: Vec<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct NegExpression {
+    pub neg: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct AbsExpression {
+    pub abs: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct DivExpression {
+    pub div: DivParams,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct DivParams {
+    pub left: Box<Expression>,
+    pub right: Box<Expression>,
+    pub by_zero_default: Option<ScoreType>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SqrtExpression {
+    pub sqrt: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct PowExpression {
+    pub pow: PowParams,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct PowParams {
+    pub base: Box<Expression>,
+    pub exponent: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ExpExpression {
+    pub exp: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct Log10Expression {
+    pub log10: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct LnExpression {
+    pub ln: Box<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct LinDecayExpression {
+    pub lin_decay: DecayParamsExpression,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ExpDecayExpression {
+    pub exp_decay: DecayParamsExpression,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GaussDecayExpression {
+    pub gauss_decay: DecayParamsExpression,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct DecayParamsExpression {
+    /// The variable to decay.
+    pub x: Box<Expression>,
+    /// The target value to start decaying from. Defaults to 0.
+    pub target: Option<Box<Expression>>,
+    /// The scale factor of the decay, in terms of `x`. Defaults to 1.0. Must be a non-zero positive number.
+    pub scale: Option<f32>,
+    /// The midpoint of the decay. Defaults to 0.5. Output will be this value when `|x - target| == scale`.
+    pub midpoint: Option<f32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GeoDistance {
+    pub geo_distance: GeoDistanceParams,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GeoDistanceParams {
+    /// The origin geo point to measure from
+    pub origin: GeoPoint,
+    /// Payload field with the destination geo point
+    pub to: JsonPath,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Sample {
     Random,
@@ -663,7 +803,7 @@ pub struct LookupLocation {
     /// Optional name of the vector field within the collection.
     /// If not provided, the default vector field will be used.
     #[serde(default)]
-    pub vector: Option<String>,
+    pub vector: Option<VectorNameBuf>,
 
     /// Specify in which shards to look for the points, if not specified - look in all shards
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -790,7 +930,7 @@ pub struct QueryGroupsRequestInternal {
     pub query: Option<QueryInterface>,
 
     /// Define which vector name to use for querying. If missing, the default vector is used.
-    pub using: Option<String>,
+    pub using: Option<VectorNameBuf>,
 
     /// Filter conditions - return only those points that satisfy the specified conditions.
     #[validate(nested)]
@@ -841,7 +981,7 @@ pub struct SearchMatrixRequestInternal {
     #[validate(range(min = 1))]
     pub limit: Option<usize>,
     /// Define which vector name to use for querying. If missing, the default vector is used.
-    pub using: Option<String>,
+    pub using: Option<VectorNameBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
@@ -1018,7 +1158,7 @@ impl<'de> serde::Deserialize<'de> for PointInsertOperations {
 #[derive(Debug, Serialize, Clone, JsonSchema)]
 #[serde(untagged)]
 pub enum PointInsertOperations {
-    /// Inset points from a batch.
+    /// Insert points from a batch.
     PointsBatch(PointsBatch),
     /// Insert points from a list
     PointsList(PointsList),
@@ -1029,6 +1169,49 @@ impl Validate for PointInsertOperations {
         match self {
             PointInsertOperations::PointsBatch(batch) => batch.validate(),
             PointInsertOperations::PointsList(list) => list.validate(),
+        }
+    }
+}
+
+impl PointInsertOperations {
+    /// Amount of vectors in the operation request.
+    pub fn len(&self) -> usize {
+        match self {
+            PointInsertOperations::PointsBatch(batch) => batch.batch.ids.len(),
+            PointInsertOperations::PointsList(list) => list.points.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Hash, Default, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxOptimizationThreadsSetting {
+    #[default]
+    Auto,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Hash, JsonSchema)]
+#[serde(untagged)]
+pub enum MaxOptimizationThreads {
+    Setting(MaxOptimizationThreadsSetting),
+    Threads(usize),
+}
+
+impl Default for MaxOptimizationThreads {
+    fn default() -> Self {
+        MaxOptimizationThreads::Setting(MaxOptimizationThreadsSetting::Auto)
+    }
+}
+
+impl From<MaxOptimizationThreads> for Option<usize> {
+    fn from(value: MaxOptimizationThreads) -> Self {
+        match value {
+            MaxOptimizationThreads::Setting(MaxOptimizationThreadsSetting::Auto) => None,
+            MaxOptimizationThreads::Threads(threads) => Some(threads),
         }
     }
 }

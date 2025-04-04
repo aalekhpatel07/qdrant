@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs::{create_dir_all, remove_dir};
 use std::path::PathBuf;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use serde_json::Value;
 
@@ -11,8 +12,8 @@ use super::mmap_inverted_index::MmapInvertedIndex;
 use super::mutable_inverted_index::MutableInvertedIndex;
 use super::text_index::FullTextIndex;
 use super::tokenizers::Tokenizer;
-use crate::common::operation_error::OperationResult;
 use crate::common::Flusher;
+use crate::common::operation_error::OperationResult;
 use crate::data_types::index::TextIndexParams;
 use crate::index::field_index::{FieldIndexBuilderTrait, ValueIndexer};
 
@@ -22,8 +23,9 @@ pub struct MmapFullTextIndex {
 }
 
 impl MmapFullTextIndex {
-    pub fn open(path: PathBuf, config: TextIndexParams) -> OperationResult<Self> {
-        let inverted_index = MmapInvertedIndex::open(path, false)?;
+    pub fn open(path: PathBuf, config: TextIndexParams, is_on_disk: bool) -> OperationResult<Self> {
+        let populate = !is_on_disk;
+        let inverted_index = MmapInvertedIndex::open(path, populate)?;
 
         Ok(Self {
             inverted_index,
@@ -64,14 +66,16 @@ pub struct FullTextMmapIndexBuilder {
     path: PathBuf,
     mutable_index: MutableInvertedIndex,
     config: TextIndexParams,
+    is_on_disk: bool,
 }
 
 impl FullTextMmapIndexBuilder {
-    pub fn new(path: PathBuf, config: TextIndexParams) -> Self {
+    pub fn new(path: PathBuf, config: TextIndexParams, is_on_disk: bool) -> Self {
         Self {
             path,
             mutable_index: MutableInvertedIndex::default(),
             config,
+            is_on_disk,
         }
     }
 }
@@ -90,6 +94,7 @@ impl ValueIndexer for FullTextMmapIndexBuilder {
         &mut self,
         id: PointOffsetType,
         values: Vec<Self::ValueType>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         if values.is_empty() {
             return Ok(());
@@ -104,7 +109,8 @@ impl ValueIndexer for FullTextMmapIndexBuilder {
         }
 
         let document = self.mutable_index.document_from_tokens(&tokens);
-        self.mutable_index.index_document(id, document)?;
+        self.mutable_index
+            .index_document(id, document, hw_counter)?;
 
         Ok(())
     }
@@ -123,8 +129,13 @@ impl FieldIndexBuilderTrait for FullTextMmapIndexBuilder {
         Ok(())
     }
 
-    fn add_point(&mut self, id: PointOffsetType, payload: &[&Value]) -> OperationResult<()> {
-        ValueIndexer::add_point(self, id, payload)
+    fn add_point(
+        &mut self,
+        id: PointOffsetType,
+        payload: &[&Value],
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        ValueIndexer::add_point(self, id, payload, hw_counter)
     }
 
     fn finalize(self) -> OperationResult<Self::FieldIndexType> {
@@ -132,6 +143,7 @@ impl FieldIndexBuilderTrait for FullTextMmapIndexBuilder {
             path,
             mutable_index,
             config,
+            is_on_disk,
         } = self;
 
         let immutable = ImmutableInvertedIndex::from(mutable_index);
@@ -140,13 +152,14 @@ impl FieldIndexBuilderTrait for FullTextMmapIndexBuilder {
 
         MmapInvertedIndex::create(path.clone(), immutable)?;
 
-        let inverted_index = MmapInvertedIndex::open(path, false)?;
+        let populate = !is_on_disk;
+        let inverted_index = MmapInvertedIndex::open(path, populate)?;
 
         let mmap_index = MmapFullTextIndex {
             inverted_index,
             config,
         };
 
-        Ok(FullTextIndex::Mmap(mmap_index))
+        Ok(FullTextIndex::Mmap(Box::new(mmap_index)))
     }
 }

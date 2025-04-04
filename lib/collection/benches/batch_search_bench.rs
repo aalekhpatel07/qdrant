@@ -2,21 +2,21 @@ use std::sync::Arc;
 
 use api::rest::SearchRequestInternal;
 use collection::config::{CollectionConfigInternal, CollectionParams, WalConfig};
+use collection::operations::CollectionUpdateOperations;
 use collection::operations::point_ops::{
     PointInsertOperationsInternal, PointOperations, PointStructPersisted,
 };
 use collection::operations::types::CoreSearchRequestBatch;
 use collection::operations::vector_params_builder::VectorParamsBuilder;
-use collection::operations::CollectionUpdateOperations;
 use collection::optimizers_builder::OptimizersConfig;
 use collection::save_on_disk::SaveOnDisk;
 use collection::shards::local_shard::LocalShard;
 use collection::shards::shard_trait::ShardOperation;
+use common::budget::ResourceBudget;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use common::cpu::CpuBudget;
-use criterion::{criterion_group, criterion_main, Criterion};
-use rand::thread_rng;
-use segment::data_types::vectors::{only_default_vector, VectorStructInternal};
+use criterion::{Criterion, criterion_group, criterion_main};
+use rand::rng;
+use segment::data_types::vectors::{VectorStructInternal, only_default_vector};
 use segment::fixtures::payload_fixtures::random_vector;
 use segment::types::{Condition, Distance, FieldCondition, Filter, Payload, Range};
 use serde_json::Map;
@@ -28,7 +28,7 @@ use tokio::sync::RwLock;
 mod prof;
 
 fn create_rnd_batch() -> CollectionUpdateOperations {
-    let mut rng = thread_rng();
+    let mut rng = rng();
     let num_points = 2000;
     let dim = 100;
     let mut points = Vec::with_capacity(num_points);
@@ -105,7 +105,7 @@ fn batch_search_bench(c: &mut Criterion) {
             payload_index_schema,
             handle.clone(),
             handle.clone(),
-            CpuBudget::default(),
+            ResourceBudget::default(),
             optimizers_config,
         ))
         .unwrap();
@@ -113,7 +113,7 @@ fn batch_search_bench(c: &mut Criterion) {
     let rnd_batch = create_rnd_batch();
 
     handle
-        .block_on(shard.update(rnd_batch.into(), true))
+        .block_on(shard.update(rnd_batch.into(), true, HwMeasurementAcc::new()))
         .unwrap();
 
     let mut group = c.benchmark_group("batch-search-bench");
@@ -142,7 +142,7 @@ fn batch_search_bench(c: &mut Criterion) {
         group.bench_function(format!("search-{fid}"), |b| {
             b.iter(|| {
                 runtime.block_on(async {
-                    let mut rng = thread_rng();
+                    let mut rng = rng();
                     for _i in 0..batch_size {
                         let query = random_vector(&mut rng, 100);
                         let search_query = SearchRequestInternal {
@@ -163,11 +163,10 @@ fn batch_search_bench(c: &mut Criterion) {
                                 }),
                                 search_runtime_handle,
                                 None,
-                                &hw_acc,
+                                hw_acc,
                             )
                             .await
                             .unwrap();
-                        hw_acc.discard();
                         assert!(!result.is_empty());
                     }
                 });
@@ -177,7 +176,7 @@ fn batch_search_bench(c: &mut Criterion) {
         group.bench_function(format!("search-batch-{fid}"), |b| {
             b.iter(|| {
                 runtime.block_on(async {
-                    let mut rng = thread_rng();
+                    let mut rng = rng();
                     let mut searches = Vec::with_capacity(batch_size);
                     for _i in 0..batch_size {
                         let query = random_vector(&mut rng, 100);
@@ -197,11 +196,10 @@ fn batch_search_bench(c: &mut Criterion) {
                     let hw_acc = HwMeasurementAcc::new();
                     let search_query = CoreSearchRequestBatch { searches };
                     let result = shard
-                        .core_search(Arc::new(search_query), search_runtime_handle, None, &hw_acc)
+                        .core_search(Arc::new(search_query), search_runtime_handle, None, hw_acc)
                         .await
                         .unwrap();
                     assert!(!result.is_empty());
-                    hw_acc.discard();
                 });
             })
         });

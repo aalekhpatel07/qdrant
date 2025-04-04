@@ -1,19 +1,19 @@
 use std::time::Instant;
 
 use common::types::PointOffsetType;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use rand::Rng;
-use segment::id_tracker::in_memory_id_tracker::InMemoryIdTracker;
 use segment::id_tracker::IdTracker;
+use segment::id_tracker::in_memory_id_tracker::InMemoryIdTracker;
 use segment::types::ExtendedPointId;
 
 fn benchmark(c: &mut Criterion) {
     c.bench_function("idtracker", |b| {
         b.iter_custom(|i| {
             let mut id_tracker = InMemoryIdTracker::new();
-            let mut rand = rand::thread_rng();
+            let mut rand = rand::rng();
 
-            let ids: Vec<i32> = (0..i).map(|_| rand.gen_range(0..100_000)).collect();
+            let ids: Vec<i32> = (0..i).map(|_| rand.random_range(0..100_000)).collect();
 
             let start = Instant::now();
 

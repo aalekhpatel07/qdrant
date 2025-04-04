@@ -264,8 +264,9 @@ mod tests {
     use std::sync::Arc;
 
     use parking_lot::Mutex as ParkingMutex;
+    use rand::prelude::SliceRandom;
     use rand::rngs::StdRng;
-    use rand::seq::SliceRandom;
+    use rand::seq::IndexedRandom;
     use rand::{Rng, SeedableRng};
     use rstest::rstest;
     use segment::data_types::vectors::VectorStructInternal;
@@ -795,18 +796,22 @@ mod tests {
         c_wal.append_from(&b_wal, delta_from).await.unwrap();
 
         // WAL on node B and C will match, A is in different order
-        assert!(!a_wal
-            .wal
-            .lock()
-            .read(0)
-            .zip(c_wal.wal.lock().read(0))
-            .all(|(a, c)| a == c));
-        assert!(b_wal
-            .wal
-            .lock()
-            .read(0)
-            .zip(c_wal.wal.lock().read(0))
-            .all(|(b, c)| b == c));
+        assert!(
+            !a_wal
+                .wal
+                .lock()
+                .read(0)
+                .zip(c_wal.wal.lock().read(0))
+                .all(|(a, c)| a == c),
+        );
+        assert!(
+            b_wal
+                .wal
+                .lock()
+                .read(0)
+                .zip(c_wal.wal.lock().read(0))
+                .all(|(b, c)| b == c),
+        );
 
         // All WALs should have 3 operations
         assert_eq!(a_wal.wal.lock().read(0).count(), 3);
@@ -1260,8 +1265,8 @@ mod tests {
         // - assert correctness
         for _ in 0..25 {
             // Insert random number of operations on all nodes
-            for _ in 0..rng.gen_range(0..10) {
-                let entrypoint = rng.gen_range(0..node_count);
+            for _ in 0..rng.random_range(0..10) {
+                let entrypoint = rng.random_range(0..node_count);
 
                 let mut clock = clock_sets[entrypoint].get_clock();
                 clock.advance_to(0);
@@ -1273,7 +1278,7 @@ mod tests {
                         PointInsertOperationsInternal::PointsList(vec![PointStructPersisted {
                             id: point_id_source.next().unwrap().into(),
                             vector: VectorStructInternal::from(
-                                std::iter::repeat_with(|| rng.gen::<f32>())
+                                std::iter::repeat_with(|| rng.random::<f32>())
                                     .take(3)
                                     .collect::<Vec<_>>(),
                             )
@@ -1291,7 +1296,7 @@ mod tests {
                 }
 
                 // Maybe keep the clock for some iterations
-                let keep_clock_for = rng.gen_range(0..3);
+                let keep_clock_for = rng.random_range(0..3);
                 if keep_clock_for > 0 {
                     kept_clocks.push((keep_clock_for, clock));
                 }
@@ -1301,11 +1306,11 @@ mod tests {
             let mut alive_nodes = (0..node_count).collect::<Vec<_>>();
             alive_nodes.shuffle(&mut rng);
             let dead_nodes = alive_nodes
-                .drain(0..rng.gen_range(dead_nodes_range.clone()))
+                .drain(0..rng.random_range(dead_nodes_range.clone()))
                 .collect::<HashSet<_>>();
 
             // Insert random number of operations into all alive nodes
-            let operation_count = rng.gen_range(0..100);
+            let operation_count = rng.random_range(0..100);
             for _ in 0..operation_count {
                 let entrypoint = *alive_nodes.choose(&mut rng).unwrap();
 
@@ -1319,7 +1324,7 @@ mod tests {
                         PointInsertOperationsInternal::PointsList(vec![PointStructPersisted {
                             id: point_id_source.next().unwrap().into(),
                             vector: VectorStructInternal::from(
-                                std::iter::repeat_with(|| rng.gen::<f32>())
+                                std::iter::repeat_with(|| rng.random::<f32>())
                                     .take(3)
                                     .collect::<Vec<_>>(),
                             )
@@ -1341,7 +1346,7 @@ mod tests {
                 }
 
                 // Maybe keep the clock for some iterations
-                let keep_clock_for = rng.gen_range(0..10);
+                let keep_clock_for = rng.random_range(0..10);
                 if keep_clock_for > 0 {
                     kept_clocks.push((keep_clock_for, clock));
                 }
@@ -1360,7 +1365,11 @@ mod tests {
                         .expect("failed to resolve WAL delta on alive node");
                     from_deltas.insert(delta_from);
                 }
-                assert_eq!(from_deltas.len(), 1, "found different delta starting points in different WALs, while all should be the same");
+                assert_eq!(
+                    from_deltas.len(),
+                    1,
+                    "found different delta starting points in different WALs, while all should be the same",
+                );
                 let delta_from = from_deltas.into_iter().next().unwrap();
                 assert_eq!(
                     delta_from.is_some(),
@@ -1392,10 +1401,7 @@ mod tests {
                 });
 
             // Release some kept clocks
-            kept_clocks.retain(|(mut keep_for, _)| {
-                keep_for -= 1;
-                keep_for > 0
-            });
+            kept_clocks.retain(|(keep_for, _)| *keep_for > 1);
         }
 
         for (wal, _) in wals {
@@ -1608,7 +1614,7 @@ mod tests {
                 .filter(|clock_tag| {
                     cutoff
                         .current_tick(clock_tag.peer_id, clock_tag.clock_id)
-                        .map_or(true, |cutoff_tick| clock_tag.clock_tick >= cutoff_tick)
+                        .is_none_or(|cutoff_tick| clock_tag.clock_tick >= cutoff_tick)
                 })
                 .collect::<Vec<_>>()
         };
@@ -1667,7 +1673,7 @@ mod tests {
                 // If we don't allow gaps, we only remove this exact tick from the beginning
                 // If we do allow gaps, we remove this tick and all lower ones from the beginning
                 while {
-                    must_see_ticks.front().map_or(false, |&tick| {
+                    must_see_ticks.front().is_some_and(|&tick| {
                         if allow_gaps {
                             tick <= newer.clock_tick
                         } else {
@@ -1683,7 +1689,11 @@ mod tests {
             if !must_see_ticks.is_empty() {
                 return Err(format!(
                     "following clock tags did not cover ticks [{}] in order (peer_id: {}, clock_id: {}, max_tick: {highest})",
-                    must_see_ticks.into_iter().map(|tick| tick.to_string()).collect::<Vec<_>>().join(", "),
+                    must_see_ticks
+                        .into_iter()
+                        .map(|tick| tick.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     clock_tag.peer_id,
                     clock_tag.clock_id,
                 ));

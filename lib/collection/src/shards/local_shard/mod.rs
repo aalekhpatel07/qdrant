@@ -1,6 +1,7 @@
 pub mod clock_map;
 pub mod disk_usage_watcher;
 pub(super) mod facet;
+pub(super) mod formula_rescore;
 pub(super) mod query;
 pub(super) mod scroll;
 pub(super) mod search;
@@ -10,13 +11,16 @@ use std::collections::{BTreeSet, HashMap};
 use std::mem::size_of;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use common::cpu::CpuBudget;
+use common::budget::ResourceBudget;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::rate_limiting::RateLimiter;
 use common::types::TelemetryDetail;
 use common::{panic, tar_ext};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -36,7 +40,7 @@ use segment::vector_storage::common::get_async_scorer;
 use tokio::fs::{create_dir_all, remove_dir_all, remove_file};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock as TokioRwLock};
+use tokio::sync::{Mutex, RwLock as TokioRwLock, mpsc, oneshot};
 use wal::{Wal, WalOptions};
 
 use self::clock_map::{ClockMap, RecoveryPoint};
@@ -51,18 +55,18 @@ use crate::collection_manager::optimizers::TrackerLog;
 use crate::collection_manager::segments_searcher::SegmentsSearcher;
 use crate::common::file_utils::{move_dir, move_file};
 use crate::config::CollectionConfigInternal;
+use crate::operations::OperationWithClockTag;
 use crate::operations::shared_storage_config::SharedStorageConfig;
 use crate::operations::types::{
-    check_sparse_compatible_with_segment_config, CollectionError, CollectionResult,
-    OptimizersStatus, ShardInfoInternal, ShardStatus,
+    CollectionError, CollectionResult, OptimizersStatus, ShardInfoInternal, ShardStatus,
+    check_sparse_compatible_with_segment_config,
 };
-use crate::operations::OperationWithClockTag;
-use crate::optimizers_builder::{build_optimizers, clear_temp_segments, OptimizersConfig};
+use crate::optimizers_builder::{OptimizersConfig, build_optimizers, clear_temp_segments};
 use crate::save_on_disk::SaveOnDisk;
+use crate::shards::CollectionId;
 use crate::shards::shard::ShardId;
 use crate::shards::shard_config::ShardConfig;
 use crate::shards::telemetry::{LocalShardTelemetry, OptimizerTelemetry};
-use crate::shards::CollectionId;
 use crate::update_handler::{Optimizer, UpdateHandler, UpdateSignal};
 use crate::wal::SerdeWal;
 use crate::wal_delta::{LockedWal, RecoverableWal};
@@ -73,6 +77,10 @@ const WAL_LOAD_REPORT_EVERY: Duration = Duration::from_secs(60);
 const WAL_PATH: &str = "wal";
 
 const SEGMENTS_PATH: &str = "segments";
+
+const NEWEST_CLOCKS_PATH: &str = "newest_clocks.json";
+
+const OLDEST_CLOCKS_PATH: &str = "oldest_clocks.json";
 
 /// LocalShard
 ///
@@ -95,11 +103,19 @@ pub struct LocalShard {
     update_runtime: Handle,
     pub(super) search_runtime: Handle,
     disk_usage_watcher: DiskUsageWatcher,
+    read_rate_limiter: Option<ParkingMutex<RateLimiter>>,
 }
 
 /// Shard holds information about segments and WAL.
 impl LocalShard {
+    /// Moves `wal`, `segments` and `clocks` data from one path to another.
     pub async fn move_data(from: &Path, to: &Path) -> CollectionResult<()> {
+        log::debug!(
+            "Moving local shard from {} to {}",
+            from.display(),
+            to.display()
+        );
+
         let wal_from = Self::wal_path(from);
         let wal_to = Self::wal_path(to);
         let segments_from = Self::segments_path(from);
@@ -149,7 +165,7 @@ impl LocalShard {
         payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
         wal: SerdeWal<OperationWithClockTag>,
         optimizers: Arc<Vec<Arc<Optimizer>>>,
-        optimizer_cpu_budget: CpuBudget,
+        optimizer_resource_budget: ResourceBudget,
         shard_path: &Path,
         clocks: LocalShardClocks,
         update_runtime: Handle,
@@ -177,7 +193,7 @@ impl LocalShard {
             optimizers.clone(),
             optimizers_log.clone(),
             total_optimized_points.clone(),
-            optimizer_cpu_budget.clone(),
+            optimizer_resource_budget.clone(),
             update_runtime.clone(),
             segment_holder.clone(),
             locked_wal.clone(),
@@ -192,6 +208,13 @@ impl LocalShard {
         update_handler.run_workers(update_receiver);
 
         let update_tracker = segment_holder.read().update_tracker();
+
+        let read_rate_limiter = config.strict_mode_config.as_ref().and_then(|strict_mode| {
+            strict_mode
+                .read_rate_limit
+                .map(RateLimiter::new_per_minute)
+                .map(ParkingMutex::new)
+        });
 
         drop(config); // release `shared_config` from borrow checker
 
@@ -211,6 +234,7 @@ impl LocalShard {
             optimizers_log,
             total_optimized_points,
             disk_usage_watcher,
+            read_rate_limiter,
         }
     }
 
@@ -230,7 +254,7 @@ impl LocalShard {
         payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
         update_runtime: Handle,
         search_runtime: Handle,
-        optimizer_cpu_budget: CpuBudget,
+        optimizer_resource_budget: ResourceBudget,
     ) -> CollectionResult<LocalShard> {
         let collection_config_read = collection_config.read().await;
 
@@ -243,13 +267,49 @@ impl LocalShard {
         )
         .map_err(|e| CollectionError::service_error(format!("Wal error: {e}")))?;
 
-        let segment_dirs = std::fs::read_dir(&segments_path).map_err(|err| {
-            CollectionError::service_error(format!(
-                "Can't read segments directory due to {}\nat {}",
-                err,
-                segments_path.to_str().unwrap()
-            ))
-        })?;
+        // Walk over segments directory and collect all directory entries now
+        // Collect now and error early to prevent errors while we've already spawned load threads
+        let segment_paths = std::fs::read_dir(&segments_path)
+            .map_err(|err| {
+                CollectionError::service_error(format!(
+                    "Can't read segments directory due to {err}\nat {}",
+                    segments_path.display(),
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| {
+                CollectionError::service_error(format!(
+                    "Failed to read segment path in segment directory: {err}",
+                ))
+            })?;
+
+        // Grab segment paths, filter out hidden entries and non-directories
+        let segment_paths = segment_paths
+            .into_iter()
+            .filter(|entry| {
+                let is_hidden = entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|s| s.starts_with('.'));
+                if is_hidden {
+                    log::debug!(
+                        "Segments path entry prefixed with a period, ignoring: {}",
+                        entry.path().display(),
+                    );
+                }
+                !is_hidden
+            })
+            .filter(|entry| {
+                let is_dir = entry.path().is_dir();
+                if !is_dir {
+                    log::warn!(
+                        "Segments path entry is not a directory, skipping: {}",
+                        entry.path().display(),
+                    );
+                }
+                is_dir
+            })
+            .map(|entry| entry.path());
 
         let mut load_handlers = vec![];
 
@@ -257,8 +317,7 @@ impl LocalShard {
         // Uncomment it if you need to debug segment loading.
         // let semaphore = Arc::new(parking_lot::Mutex::new(()));
 
-        for entry in segment_dirs {
-            let segments_path = entry.unwrap().path();
+        for segment_path in segment_paths {
             let payload_index_schema = payload_index_schema.clone();
             // let semaphore_clone = semaphore.clone();
             load_handlers.push(
@@ -266,17 +325,17 @@ impl LocalShard {
                     .name(format!("shard-load-{collection_id}-{id}"))
                     .spawn(move || {
                         // let _guard = semaphore_clone.lock();
-                        let mut res = load_segment(&segments_path, &AtomicBool::new(false))?;
+                        let mut res = load_segment(&segment_path, &AtomicBool::new(false))?;
                         if let Some(segment) = &mut res {
                             segment.check_consistency_and_repair()?;
                             segment.update_all_field_indices(
                                 &payload_index_schema.read().schema.clone(),
                             )?;
                         } else {
-                            std::fs::remove_dir_all(&segments_path).map_err(|err| {
+                            std::fs::remove_dir_all(&segment_path).map_err(|err| {
                                 CollectionError::service_error(format!(
                                     "Can't remove leftover segment {}, due to {err}",
-                                    segments_path.to_str().unwrap(),
+                                    segment_path.to_str().unwrap(),
                                 ))
                             })?;
                         }
@@ -321,7 +380,7 @@ impl LocalShard {
 
         let res = segment_holder.deduplicate_points().await?;
         if res > 0 {
-            log::debug!("Deduplicated {} points", res);
+            log::debug!("Deduplicated {res} points");
         }
 
         clear_temp_segments(shard_path);
@@ -343,7 +402,9 @@ impl LocalShard {
                 false,
                 "Shard has no appendable segments, this should never happen",
             );
-            log::warn!("Shard has no appendable segments, this should never happen. Creating new appendable segment now");
+            log::warn!(
+                "Shard has no appendable segments, this should never happen. Creating new appendable segment now",
+            );
             let segments_path = LocalShard::segments_path(shard_path);
             let collection_params = collection_config.read().await.params.clone();
             let payload_index_schema = payload_index_schema.read();
@@ -361,7 +422,7 @@ impl LocalShard {
             payload_index_schema,
             wal,
             optimizers,
-            optimizer_cpu_budget,
+            optimizer_resource_budget,
             shard_path,
             clocks,
             update_runtime,
@@ -418,7 +479,7 @@ impl LocalShard {
         payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
         update_runtime: Handle,
         search_runtime: Handle,
-        optimizer_cpu_budget: CpuBudget,
+        optimizer_resource_budget: ResourceBudget,
         effective_optimizers_config: OptimizersConfig,
     ) -> CollectionResult<LocalShard> {
         // initialize local shard config file
@@ -432,7 +493,7 @@ impl LocalShard {
             payload_index_schema,
             update_runtime,
             search_runtime,
-            optimizer_cpu_budget,
+            optimizer_resource_budget,
             effective_optimizers_config,
         )
         .await?;
@@ -451,7 +512,7 @@ impl LocalShard {
         payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
         update_runtime: Handle,
         search_runtime: Handle,
-        optimizer_cpu_budget: CpuBudget,
+        optimizer_resource_budget: ResourceBudget,
         effective_optimizers_config: OptimizersConfig,
     ) -> CollectionResult<LocalShard> {
         let config = collection_config.read().await;
@@ -531,7 +592,7 @@ impl LocalShard {
             payload_index_schema,
             wal,
             optimizers,
-            optimizer_cpu_budget,
+            optimizer_resource_budget,
             shard_path,
             LocalShardClocks::default(),
             update_runtime,
@@ -563,6 +624,12 @@ impl LocalShard {
             .expect("Failed to create progress style");
         bar.set_style(progress_style);
 
+        log::debug!(
+            "Recovering shard {:?} starting reading WAL from {}",
+            &self.path,
+            wal.first_index()
+        );
+
         bar.set_message(format!("Recovering collection {collection_id}"));
         let segments = self.segments();
 
@@ -571,7 +638,8 @@ impl LocalShard {
         let mut last_progress_report = Instant::now();
         if !show_progress_bar {
             log::info!(
-                "Recovering collection {collection_id}: 0/{} (0%)",
+                "Recovering shard {}: 0/{} (0%)",
+                self.path.display(),
                 wal.len(false),
             );
         }
@@ -595,7 +663,12 @@ impl LocalShard {
             }
 
             // Propagate `CollectionError::ServiceError`, but skip other error types.
-            match &CollectionUpdater::update(segments, op_num, update.operation) {
+            match &CollectionUpdater::update(
+                segments,
+                op_num,
+                update.operation,
+                &HardwareCounterCell::disposable(), // Internal operation, no measurement needed.
+            ) {
                 Err(err @ CollectionError::ServiceError { error, backtrace }) => {
                     let path = self.path.display();
 
@@ -607,7 +680,7 @@ impl LocalShard {
                     );
 
                     if let Some(backtrace) = &backtrace {
-                        log::error!("Backtrace: {}", backtrace);
+                        log::error!("Backtrace: {backtrace}");
                     }
 
                     return Err(err.clone());
@@ -730,6 +803,27 @@ impl LocalShard {
         Ok(())
     }
 
+    /// Apply shard's strict mode configuration update
+    /// - Update read rate limiter
+    pub async fn on_strict_mode_config_update(&mut self) {
+        let config = self.collection_config.read().await;
+
+        if let Some(strict_mode_config) = &config.strict_mode_config {
+            if strict_mode_config.enabled == Some(true) {
+                // update read rate limiter
+                if let Some(read_rate_limit_per_min) = strict_mode_config.read_rate_limit {
+                    let new_read_rate_limiter =
+                        RateLimiter::new_per_minute(read_rate_limit_per_min);
+                    self.read_rate_limiter
+                        .replace(parking_lot::Mutex::new(new_read_rate_limiter));
+                    return;
+                }
+            }
+        }
+        // remove read rate limiter for all other situations
+        self.read_rate_limiter.take();
+    }
+
     pub fn trigger_optimizers(&self) {
         // Send a trigger signal and ignore errors because all error cases are acceptable:
         // - If receiver is already dead - we do not care
@@ -740,20 +834,36 @@ impl LocalShard {
     /// Finishes ongoing update tasks
     pub async fn stop_gracefully(&self) {
         if let Err(err) = self.update_sender.load().send(UpdateSignal::Stop).await {
-            log::warn!("Error sending stop signal to update handler: {}", err);
+            log::warn!("Error sending stop signal to update handler: {err}");
         }
 
         self.stop_flush_worker().await;
 
         if let Err(err) = self.wait_update_workers_stop().await {
-            log::warn!("Update workers failed with: {}", err);
+            log::warn!("Update workers failed with: {err}");
         }
     }
 
     pub fn restore_snapshot(snapshot_path: &Path) -> CollectionResult<()> {
-        // Read dir first as the directory contents would change during restore.
+        log::info!("Restoring shard snapshot {}", snapshot_path.display());
+        // Read dir first as the directory contents would change during restore
         let entries = std::fs::read_dir(LocalShard::segments_path(snapshot_path))?
             .collect::<Result<Vec<_>, _>>()?;
+
+        // Filter out hidden entries
+        let entries = entries.into_iter().filter(|entry| {
+            let is_hidden = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|s| s.starts_with('.'));
+            if is_hidden {
+                log::debug!(
+                    "Ignoring hidden segment in local shard during snapshot recovery: {}",
+                    entry.path().display(),
+                );
+            }
+            !is_hidden
+        });
 
         for entry in entries {
             Segment::restore_snapshot_in_place(&entry.path())?;
@@ -885,11 +995,17 @@ impl LocalShard {
     pub fn estimate_cardinality<'a>(
         &'a self,
         filter: Option<&'a Filter>,
+        hw_counter: &HardwareCounterCell,
     ) -> CollectionResult<CardinalityEstimation> {
         let segments = self.segments().read();
         let cardinality = segments
             .iter()
-            .map(|(_id, segment)| segment.get().read().estimate_point_count(filter))
+            .map(|(_id, segment)| {
+                segment
+                    .get()
+                    .read()
+                    .estimate_point_count(filter, hw_counter)
+            })
             .fold(CardinalityEstimation::exact(0), |acc, x| {
                 CardinalityEstimation {
                     primary_clauses: vec![],
@@ -905,9 +1021,10 @@ impl LocalShard {
         &'a self,
         filter: Option<&'a Filter>,
         runtime_handle: &Handle,
+        hw_counter: HwMeasurementAcc,
     ) -> CollectionResult<BTreeSet<PointIdType>> {
         let segments = self.segments.clone();
-        SegmentsSearcher::read_filtered(segments, filter, runtime_handle).await
+        SegmentsSearcher::read_filtered(segments, filter, runtime_handle, hw_counter).await
     }
 
     pub fn get_telemetry_data(&self, detail: TelemetryDetail) -> LocalShardTelemetry {
@@ -1091,6 +1208,32 @@ impl LocalShard {
     pub async fn update_cutoff(&self, cutoff: &RecoveryPoint) {
         self.wal.update_cutoff(cutoff).await
     }
+
+    /// Check if the read rate limiter allows the operation to proceed
+    /// - cost: the cost of the operation
+    ///
+    /// Returns an error if the rate limit is exceeded.
+    fn check_read_rate_limiter(
+        &self,
+        cost: usize,
+        hw_measurement_acc: &HwMeasurementAcc,
+        context: &str,
+    ) -> CollectionResult<()> {
+        // Do not rate limit internal operation tagged with disposable measurement
+        if hw_measurement_acc.is_disposable() {
+            return Ok(());
+        }
+        if let Some(rate_limiter) = &self.read_rate_limiter {
+            rate_limiter
+                .lock()
+                .try_consume(cost as f64)
+                .map_err(|err| {
+                    log::debug!("Read rate limit error on {context} with {err:?}");
+                    CollectionError::rate_limit_error(err, cost, false)
+                })?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for LocalShard {
@@ -1107,10 +1250,6 @@ impl Drop for LocalShard {
         })
     }
 }
-
-const NEWEST_CLOCKS_PATH: &str = "newest_clocks.json";
-
-const OLDEST_CLOCKS_PATH: &str = "oldest_clocks.json";
 
 /// Convenience struct for combining clock maps belonging to a shard
 ///

@@ -24,8 +24,10 @@ pub async fn create_shard_snapshot(
     collection_name: String,
     shard_id: ShardId,
 ) -> Result<SnapshotDescription, StorageError> {
-    let collection_pass = access
-        .check_collection_access(&collection_name, AccessRequirements::new().write().whole())?;
+    let collection_pass = access.check_collection_access(
+        &collection_name,
+        AccessRequirements::new().write().whole().extras(),
+    )?;
     let collection = toc.get_collection(&collection_pass).await?;
 
     let snapshot = collection
@@ -44,8 +46,10 @@ pub async fn stream_shard_snapshot(
     collection_name: String,
     shard_id: ShardId,
 ) -> Result<SnapshotStream, StorageError> {
-    let collection_pass = access
-        .check_collection_access(&collection_name, AccessRequirements::new().write().whole())?;
+    let collection_pass = access.check_collection_access(
+        &collection_name,
+        AccessRequirements::new().write().whole().extras(),
+    )?;
     let collection = toc.get_collection(&collection_pass).await?;
 
     Ok(collection
@@ -62,8 +66,8 @@ pub async fn list_shard_snapshots(
     collection_name: String,
     shard_id: ShardId,
 ) -> Result<Vec<SnapshotDescription>, StorageError> {
-    let collection_pass =
-        access.check_collection_access(&collection_name, AccessRequirements::new().whole())?;
+    let collection_pass = access
+        .check_collection_access(&collection_name, AccessRequirements::new().whole().extras())?;
     let collection = toc.get_collection(&collection_pass).await?;
     let snapshots = collection.list_shard_snapshots(shard_id).await?;
     Ok(snapshots)
@@ -79,8 +83,10 @@ pub async fn delete_shard_snapshot(
     shard_id: ShardId,
     snapshot_name: String,
 ) -> Result<(), StorageError> {
-    let collection_pass = access
-        .check_collection_access(&collection_name, AccessRequirements::new().write().whole())?;
+    let collection_pass = access.check_collection_access(
+        &collection_name,
+        AccessRequirements::new().write().whole().extras(),
+    )?;
     let collection = toc.get_collection(&collection_pass).await?;
     let snapshot_manager = collection.get_snapshots_storage_manager()?;
 
@@ -237,7 +243,17 @@ pub async fn recover_shard_snapshot_impl(
         .replicas
         .iter()
         .map(|(&peer, &state)| (peer, state))
-        .filter(|&(peer, state)| peer != toc.this_peer_id && state == ReplicaState::Active)
+        .filter(|&(peer, state)| {
+            // Check if there are *other* active replicas, after recovering shard snapshot.
+            // This should include `ReshardingScaleDown` replicas.
+
+            let is_active = matches!(
+                state,
+                ReplicaState::Active | ReplicaState::ReshardingScaleDown
+            );
+
+            peer != toc.this_peer_id && is_active
+        })
         .collect();
 
     if other_active_replicas.is_empty() {

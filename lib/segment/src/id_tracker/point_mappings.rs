@@ -1,11 +1,21 @@
 use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::btree_map::Entry;
 use std::iter;
 
 use bitvec::prelude::{BitSlice, BitVec};
 use byteorder::LittleEndian;
+#[cfg(test)]
+use common::bitpacking::make_bitmask;
 use common::types::PointOffsetType;
 use itertools::Itertools;
-use rand::distributions::Distribution;
+#[cfg(test)]
+use rand::Rng as _;
+use rand::distr::Distribution;
+#[cfg(test)]
+use rand::rngs::StdRng;
+#[cfg(test)]
+use rand::seq::SliceRandom as _;
 use uuid::Uuid;
 
 use crate::types::PointIdType;
@@ -15,9 +25,10 @@ pub type FileEndianess = LittleEndian;
 
 #[derive(Clone, PartialEq, Default, Debug)]
 pub struct PointMappings {
-    // `deleted` specifies which points of internal_to_external was deleted.
-    // It is possible that `deleted` can be longer or shorter than `internal_to_external`.
-    // - if `deleted` is longer, then extra bits should be set to `false` and ignored.
+    /// `deleted` specifies which points of internal_to_external was deleted.
+    /// It is possible that `deleted` can be longer or shorter than `internal_to_external`.
+    /// - if `deleted` is longer, then extra bits should be set to `false` and ignored.
+    /// - if `deleted` is shorter, then extra indices are as if the bits were set to `true`.
     deleted: BitVec,
     internal_to_external: Vec<PointIdType>,
 
@@ -39,6 +50,23 @@ impl PointMappings {
             external_to_internal_num,
             external_to_internal_uuid,
         }
+    }
+
+    /// ToDo: this function is temporary and should be removed before PR is merged
+    pub fn deconstruct(
+        self,
+    ) -> (
+        BitVec,
+        Vec<PointIdType>,
+        BTreeMap<u64, PointOffsetType>,
+        BTreeMap<Uuid, PointOffsetType>,
+    ) {
+        (
+            self.deleted,
+            self.internal_to_external,
+            self.external_to_internal_num,
+            self.external_to_internal_uuid,
+        )
     }
 
     /// Number of points, excluding deleted ones.
@@ -75,6 +103,11 @@ impl PointMappings {
             PointIdType::Uuid(uuid) => self.external_to_internal_uuid.remove(&uuid),
         };
 
+        // Also reset inverse mapping
+        if let Some(internal_id) = internal_id {
+            self.internal_to_external[internal_id as usize] = PointIdType::NumId(u64::MAX);
+        }
+
         if let Some(internal_id) = &internal_id {
             self.deleted.set(*internal_id as usize, true);
         }
@@ -85,12 +118,13 @@ impl PointMappings {
     pub(crate) fn iter_random(
         &self,
     ) -> Box<dyn Iterator<Item = (PointIdType, PointOffsetType)> + '_> {
-        let rng = rand::thread_rng();
+        let rng = rand::rng();
         let max_internal = self.internal_to_external.len();
         if max_internal == 0 {
             return Box::new(iter::empty());
         }
-        let uniform = rand::distributions::Uniform::new(0, max_internal);
+        let uniform = rand::distr::Uniform::new(0, max_internal)
+            .expect("above check guarantees max_internal > 0");
         let iter = Distribution::sample_iter(uniform, rng)
             // TODO: this is not efficient if `max_internal` is large and we iterate over most of them,
             // but it's good enough for low limits.
@@ -178,13 +212,14 @@ impl PointMappings {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn iter_internal_raw(
         &self,
     ) -> impl Iterator<Item = (PointOffsetType, PointIdType)> + '_ {
         self.internal_to_external
             .iter()
             .enumerate()
-            .map(|(offset, point_id)| (offset as PointOffsetType, *point_id))
+            .map(|(offset, point_id)| (offset as _, *point_id))
     }
 
     pub(crate) fn is_deleted_point(&self, key: PointOffsetType) -> bool {
@@ -231,5 +266,85 @@ impl PointMappings {
 
     pub(crate) fn total_point_count(&self) -> usize {
         self.internal_to_external.len()
+    }
+
+    /// Generate a random [`PointMappings`].
+    #[cfg(test)]
+    pub fn random(rand: &mut StdRng, total_size: u32) -> Self {
+        Self::random_with_params(rand, total_size, total_size, 128)
+    }
+
+    /// Generate a random [`PointMappings`] using the following parameters:
+    ///
+    /// - `total_size`: total number of points, including deleted ones.
+    /// - `preserved_size`: number of points that are not deleted.
+    /// - `bits_in_id`: number of bits in generated ids.
+    ///   Decrease this value to restrict the amount of unique ids across all
+    ///   multiple invocations of this function.
+    ///   E.g. if `bits_in_id` is 8, then only 512 unique ids will be generated.
+    ///   (256 uuids + 256 u64s)
+    #[cfg(test)]
+    pub fn random_with_params(
+        rand: &mut StdRng,
+        total_size: u32,
+        preserved_size: u32,
+        bits_in_id: u8,
+    ) -> Self {
+        let mask: u128 = make_bitmask(bits_in_id);
+        let mask_u64: u64 = mask as u64;
+
+        const UUID_LIKELYNESS: f64 = 0.5;
+
+        let mut external_to_internal_num = BTreeMap::new();
+        let mut external_to_internal_uuid = BTreeMap::new();
+
+        let mut internal_ids = (0..total_size).collect_vec();
+        internal_ids.shuffle(rand);
+        internal_ids.truncate(preserved_size as usize);
+
+        let mut deleted = BitVec::repeat(true, total_size as usize);
+        for id in &internal_ids {
+            deleted.set(*id as usize, false);
+        }
+
+        let internal_to_external = (0..total_size)
+            .map(|pos| {
+                loop {
+                    if rand.random_bool(UUID_LIKELYNESS) {
+                        let uuid = Uuid::from_u128(rand.random_range(0..=mask));
+                        if let Entry::Vacant(e) = external_to_internal_uuid.entry(uuid) {
+                            e.insert(pos);
+                            return PointIdType::Uuid(uuid);
+                        }
+                    } else {
+                        let num = rand.random_range(0..=mask_u64);
+                        if let Entry::Vacant(e) = external_to_internal_num.entry(num) {
+                            e.insert(pos);
+                            return PointIdType::NumId(num);
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        Self {
+            deleted,
+            internal_to_external,
+            external_to_internal_num,
+            external_to_internal_uuid,
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn assert_mappings(&self) {
+        for (external_id, internal_id) in self.external_to_internal_num.iter() {
+            debug_assert!(
+                self.internal_to_external[*internal_id as usize]
+                    == PointIdType::NumId(*external_id),
+                "Internal id {internal_id} is mapped to external id {}, but should be {}",
+                self.internal_to_external[*internal_id as usize],
+                PointIdType::NumId(*external_id),
+            );
+        }
     }
 }

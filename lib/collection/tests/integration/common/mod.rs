@@ -7,11 +7,11 @@ use collection::config::{CollectionConfigInternal, CollectionParams, WalConfig};
 use collection::operations::types::CollectionError;
 use collection::operations::vector_params_builder::VectorParamsBuilder;
 use collection::optimizers_builder::OptimizersConfig;
+use collection::shards::CollectionId;
 use collection::shards::channel_service::ChannelService;
 use collection::shards::collection_shard_distribution::CollectionShardDistribution;
 use collection::shards::replica_set::{AbortShardTransfer, ChangePeerFromState, ReplicaState};
-use collection::shards::CollectionId;
-use common::cpu::CpuBudget;
+use common::budget::ResourceBudget;
 use segment::types::Distance;
 
 /// Test collections for this upper bound of shards.
@@ -96,13 +96,14 @@ pub async fn new_local_collection(
         config,
         Default::default(),
         CollectionShardDistribution::all_local(Some(config.params.shard_number.into()), 0),
+        None,
         ChannelService::new(REST_PORT, None),
         dummy_on_replica_failure(),
         dummy_request_shard_transfer(),
         dummy_abort_shard_transfer(),
         None,
         None,
-        CpuBudget::default(),
+        ResourceBudget::default(),
         None,
     )
     .await;
@@ -137,7 +138,7 @@ pub async fn load_local_collection(
         dummy_abort_shard_transfer(),
         None,
         None,
-        CpuBudget::default(),
+        ResourceBudget::default(),
         None,
     )
     .await

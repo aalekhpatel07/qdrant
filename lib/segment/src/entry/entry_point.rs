@@ -1,30 +1,32 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use common::tar_ext;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::TelemetryDetail;
 
 use crate::common::operation_error::{OperationResult, SegmentFailedState};
 use crate::data_types::facets::{FacetParams, FacetValue};
 use crate::data_types::named_vectors::NamedVectors;
 use crate::data_types::order_by::{OrderBy, OrderValue};
-use crate::data_types::query_context::{QueryContext, SegmentQueryContext};
+use crate::data_types::query_context::{FormulaContext, QueryContext, SegmentQueryContext};
 use crate::data_types::vectors::{QueryVector, VectorInternal};
+use crate::entry::snapshot_entry::SnapshotEntry;
 use crate::index::field_index::{CardinalityEstimation, FieldIndex};
 use crate::json_path::JsonPath;
 use crate::telemetry::SegmentTelemetry;
 use crate::types::{
     Filter, Payload, PayloadFieldSchema, PayloadKeyType, PayloadKeyTypeRef, PointIdType,
-    ScoredPoint, SearchParams, SegmentConfig, SegmentInfo, SegmentType, SeqNumberType,
-    SnapshotFormat, WithPayload, WithVector,
+    ScoredPoint, SearchParams, SegmentConfig, SegmentInfo, SegmentType, SeqNumberType, VectorName,
+    VectorNameBuf, WithPayload, WithVector,
 };
 
 /// Define all operations which can be performed with Segment or Segment-like entity.
 ///
 /// Assume all operations are idempotent - which means that no matter how many times an operation
 /// is executed - the storage state will be the same.
-pub trait SegmentEntry {
+pub trait SegmentEntry: SnapshotEntry {
     /// Get current update version of the segment
     fn version(&self) -> SeqNumberType;
 
@@ -34,7 +36,7 @@ pub trait SegmentEntry {
     #[allow(clippy::too_many_arguments)]
     fn search_batch(
         &self,
-        vector_name: &str,
+        vector_name: &VectorName,
         query_vectors: &[&QueryVector],
         with_payload: &WithPayload,
         with_vector: &WithVector,
@@ -44,17 +46,28 @@ pub trait SegmentEntry {
         query_context: &SegmentQueryContext,
     ) -> OperationResult<Vec<Vec<ScoredPoint>>>;
 
+    /// Rescore results with a formula that can reference payload values.
+    ///
+    /// A deleted bitslice is passed to exclude points from a wrapped segment.
+    fn rescore_with_formula(
+        &self,
+        formula_ctx: Arc<FormulaContext>,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Vec<ScoredPoint>>;
+
     fn upsert_point(
         &mut self,
         op_num: SeqNumberType,
         point_id: PointIdType,
         vectors: NamedVectors,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<bool>;
 
     fn delete_point(
         &mut self,
         op_num: SeqNumberType,
         point_id: PointIdType,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<bool>;
 
     fn update_vectors(
@@ -62,13 +75,14 @@ pub trait SegmentEntry {
         op_num: SeqNumberType,
         point_id: PointIdType,
         vectors: NamedVectors,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<bool>;
 
     fn delete_vector(
         &mut self,
         op_num: SeqNumberType,
         point_id: PointIdType,
-        vector_name: &str,
+        vector_name: &VectorName,
     ) -> OperationResult<bool>;
 
     fn set_payload(
@@ -77,6 +91,7 @@ pub trait SegmentEntry {
         point_id: PointIdType,
         payload: &Payload,
         key: &Option<JsonPath>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<bool>;
 
     fn set_full_payload(
@@ -84,6 +99,7 @@ pub trait SegmentEntry {
         op_num: SeqNumberType,
         point_id: PointIdType,
         full_payload: &Payload,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<bool>;
 
     fn delete_payload(
@@ -91,17 +107,19 @@ pub trait SegmentEntry {
         op_num: SeqNumberType,
         point_id: PointIdType,
         key: PayloadKeyTypeRef,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<bool>;
 
     fn clear_payload(
         &mut self,
         op_num: SeqNumberType,
         point_id: PointIdType,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<bool>;
 
     fn vector(
         &self,
-        vector_name: &str,
+        vector_name: &VectorName,
         point_id: PointIdType,
     ) -> OperationResult<Option<VectorInternal>>;
 
@@ -109,7 +127,11 @@ pub trait SegmentEntry {
 
     /// Retrieve payload for the point
     /// If not found, return empty payload
-    fn payload(&self, point_id: PointIdType) -> OperationResult<Payload>;
+    fn payload(
+        &self,
+        point_id: PointIdType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Payload>;
 
     /// Iterator over all points in segment in ascending order.
     fn iter_points(&self) -> Box<dyn Iterator<Item = PointIdType> + '_>;
@@ -123,6 +145,7 @@ pub trait SegmentEntry {
         limit: Option<usize>,
         filter: Option<&'a Filter>,
         is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
     ) -> Vec<PointIdType>;
 
     /// Return points which satisfies filtering condition ordered by the `order_by.key` field,
@@ -136,6 +159,7 @@ pub trait SegmentEntry {
         filter: Option<&'a Filter>,
         order_by: &'a OrderBy,
         is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<Vec<(OrderValue, PointIdType)>>;
 
     /// Return random points which satisfies filtering condition.
@@ -146,6 +170,7 @@ pub trait SegmentEntry {
         limit: usize,
         filter: Option<&Filter>,
         is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
     ) -> Vec<PointIdType>;
 
     /// Read points in [from; to) range
@@ -157,6 +182,7 @@ pub trait SegmentEntry {
         key: &JsonPath,
         filter: Option<&Filter>,
         is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<BTreeSet<FacetValue>>;
 
     /// Return the largest counts for the given facet request.
@@ -164,15 +190,31 @@ pub trait SegmentEntry {
         &self,
         request: &FacetParams,
         is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<HashMap<FacetValue, usize>>;
 
     /// Check if there is point with `point_id` in this segment.
+    ///
+    /// Soft deleted points are excluded.
     fn has_point(&self, point_id: PointIdType) -> bool;
 
     /// Estimate available point count in this segment for given filter.
-    fn estimate_point_count<'a>(&'a self, filter: Option<&'a Filter>) -> CardinalityEstimation;
+    fn estimate_point_count<'a>(
+        &'a self,
+        filter: Option<&'a Filter>,
+        hw_counter: &HardwareCounterCell,
+    ) -> CardinalityEstimation;
 
-    fn vector_names(&self) -> HashSet<String>;
+    fn vector_names(&self) -> HashSet<VectorNameBuf>;
+
+    /// Whether this segment is completely empty in terms of points
+    ///
+    /// The segment is considered to not be empty if it contains any points, even if deleted.
+    /// Deleted points still have a version which may be important at time of recovery. Deciding
+    /// this by just the reported point count is not reliable in case a proxy segment is used.
+    ///
+    /// Payload indices or type of storage are not considered here.
+    fn is_empty(&self) -> bool;
 
     /// Number of available points
     ///
@@ -183,7 +225,7 @@ pub trait SegmentEntry {
     fn deleted_point_count(&self) -> usize;
 
     /// Size of all available vectors in storage
-    fn available_vectors_size_in_bytes(&self, vector_name: &str) -> OperationResult<usize>;
+    fn available_vectors_size_in_bytes(&self, vector_name: &VectorName) -> OperationResult<usize>;
 
     /// Max value from all `available_vectors_size_in_bytes`
     fn max_available_vectors_size_in_bytes(&self) -> OperationResult<usize> {
@@ -199,6 +241,10 @@ pub trait SegmentEntry {
 
     /// Get current stats of the segment
     fn info(&self) -> SegmentInfo;
+
+    /// Get size related stats of the segment.
+    /// This returns `SegmentInfo` with some non size-related data (like `schema`) unset to improve performance.
+    fn size_info(&self) -> SegmentInfo;
 
     /// Get segment configuration
     fn config(&self) -> &SegmentConfig;
@@ -231,6 +277,7 @@ pub trait SegmentEntry {
         op_num: SeqNumberType,
         key: PayloadKeyTypeRef,
         field_type: Option<&PayloadFieldSchema>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<Option<(PayloadFieldSchema, Vec<FieldIndex>)>>;
 
     /// Apply a built index. Returns whether it was actually applied or not.
@@ -248,8 +295,11 @@ pub trait SegmentEntry {
         op_num: SeqNumberType,
         key: PayloadKeyTypeRef,
         field_schema: Option<&PayloadFieldSchema>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<bool> {
-        let Some((schema, index)) = self.build_field_index(op_num, key, field_schema)? else {
+        let Some((schema, index)) =
+            self.build_field_index(op_num, key, field_schema, hw_counter)?
+        else {
             return Ok(false);
         };
 
@@ -267,20 +317,8 @@ pub trait SegmentEntry {
         &'a mut self,
         op_num: SeqNumberType,
         filter: &'a Filter,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<usize>;
-
-    /// Take a snapshot of the segment.
-    ///
-    /// Creates a tar archive of the segment directory into `snapshot_dir_path`.
-    /// Uses `temp_path` to prepare files to archive.
-    /// The `snapshotted_segments` set is used to avoid writing the same snapshot twice.
-    fn take_snapshot(
-        &self,
-        temp_path: &Path,
-        tar: &tar_ext::BuilderExt,
-        format: SnapshotFormat,
-        snapshotted_segments: &mut HashSet<String>,
-    ) -> OperationResult<()>;
 
     // Get collected telemetry data of segment
     fn get_telemetry_data(&self, detail: TelemetryDetail) -> SegmentTelemetry;

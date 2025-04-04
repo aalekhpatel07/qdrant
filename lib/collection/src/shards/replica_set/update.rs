@@ -1,15 +1,16 @@
 use std::ops::Deref as _;
 use std::time::Duration;
 
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt as _, StreamExt as _};
 use itertools::Itertools as _;
 
-use super::{clock_set, ReplicaSetState, ReplicaState, ShardReplicaSet};
+use super::{ReplicaSetState, ReplicaState, ShardReplicaSet, clock_set};
 use crate::operations::point_ops::WriteOrdering;
 use crate::operations::types::{CollectionError, CollectionResult, UpdateResult, UpdateStatus};
 use crate::operations::{ClockTag, CollectionUpdateOperations, OperationWithClockTag};
-use crate::shards::shard::PeerId;
+use crate::shards::shard::{PeerId, Shard};
 use crate::shards::shard_trait::ShardOperation as _;
 
 /// Maximum number of attempts for applying an update with a new clock.
@@ -30,37 +31,70 @@ impl ShardReplicaSet {
         &self,
         operation: OperationWithClockTag,
         wait: bool,
+        mut hw_measurement: HwMeasurementAcc,
     ) -> CollectionResult<Option<UpdateResult>> {
         // `ShardOperations::update` is not guaranteed to be cancel safe, so this method is not
         // cancel safe.
 
         let local = self.local.read().await;
 
-        if let Some(local_shard) = local.deref() {
-            match self.peer_state(self.this_peer_id()) {
-                Some(
-                    ReplicaState::Active
-                    | ReplicaState::Partial
-                    | ReplicaState::Initializing
-                    | ReplicaState::Resharding,
-                ) => Ok(Some(local_shard.get().update(operation, wait).await?)),
-                Some(ReplicaState::Listener) => {
-                    Ok(Some(local_shard.get().update(operation, false).await?))
-                }
-                // In recovery state, only allow operations with force flag
-                Some(ReplicaState::PartialSnapshot | ReplicaState::Recovery)
-                    if operation.clock_tag.map_or(false, |tag| tag.force) =>
-                {
-                    Ok(Some(local_shard.get().update(operation, wait).await?))
-                }
-                Some(
-                    ReplicaState::PartialSnapshot | ReplicaState::Recovery | ReplicaState::Dead,
-                )
-                | None => Ok(None),
-            }
-        } else {
-            Ok(None)
+        let Some(local) = local.deref() else {
+            return Ok(None);
+        };
+
+        let Some(state) = self.peer_state(self.this_peer_id()) else {
+            return Ok(None);
+        };
+
+        // Don't measure hw when resharding
+        if state.is_resharding() {
+            hw_measurement = HwMeasurementAcc::disposable();
         }
+
+        let result = match state {
+            ReplicaState::Active => {
+                // Rate limit update operations on Active replica
+                self.check_operation_write_rate_limiter(&hw_measurement, local, &operation)?;
+                local.get().update(operation, wait, hw_measurement).await
+            }
+
+            ReplicaState::Partial
+            | ReplicaState::Initializing
+            | ReplicaState::Resharding
+            | ReplicaState::ReshardingScaleDown => {
+                local.get().update(operation, wait, hw_measurement).await
+            }
+
+            ReplicaState::Listener => local.get().update(operation, false, hw_measurement).await,
+
+            ReplicaState::PartialSnapshot | ReplicaState::Recovery
+                if operation.clock_tag.is_some_and(|tag| tag.force) =>
+            {
+                local.get().update(operation, wait, hw_measurement).await
+            }
+
+            ReplicaState::PartialSnapshot | ReplicaState::Recovery => {
+                if log::log_enabled!(log::Level::Debug) {
+                    if let Some(ids) = operation.operation.point_ids() {
+                        log::debug!(
+                            "Operation affecting point IDs {ids:?} rejected on this peer, force flag required in recovery state",
+                        );
+                    } else {
+                        log::debug!(
+                            "Operation {operation:?} rejected on this peer, force flag required in recovery state",
+                        );
+                    }
+                }
+
+                return Ok(None);
+            }
+
+            ReplicaState::Dead => {
+                return Ok(None);
+            }
+        };
+
+        result.map(Some)
     }
 
     /// # Cancel safety
@@ -72,6 +106,7 @@ impl ShardReplicaSet {
         wait: bool,
         ordering: WriteOrdering,
         update_only_existing: bool,
+        mut hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult> {
         // `ShardReplicaSet::update` is not cancel safe, so this method is not cancel safe.
 
@@ -81,6 +116,12 @@ impl ShardReplicaSet {
                 self.collection_id, self.shard_id
             )));
         };
+
+        // Don't measure hw when resharding
+        let peer_state = self.peer_state(leader_peer);
+        if peer_state.is_some_and(|state| state.is_resharding()) {
+            hw_measurement_acc = HwMeasurementAcc::disposable();
+        }
 
         // If we are the leader, run the update from this replica set
         if leader_peer == self.this_peer_id() {
@@ -92,10 +133,11 @@ impl ShardReplicaSet {
                 WriteOrdering::Weak => None,
             };
 
-            self.update(operation, wait, update_only_existing).await
+            self.update(operation, wait, update_only_existing, hw_measurement_acc)
+                .await
         } else {
             // Forward the update to the designated leader
-            self.forward_update(leader_peer, operation, wait, ordering)
+            self.forward_update(leader_peer, operation, wait, ordering, hw_measurement_acc)
                 .await
                 .map_err(|err| {
                     if err.is_transient() {
@@ -147,6 +189,7 @@ impl ShardReplicaSet {
         operation: CollectionUpdateOperations,
         wait: bool,
         update_only_existing: bool,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult> {
         // `ShardRepilcaSet::update_impl` is not cancel safe, so this method is not cancel safe.
 
@@ -162,7 +205,13 @@ impl ShardReplicaSet {
             let is_non_zero_tick = clock.current_tick().is_some();
 
             let res = self
-                .update_impl(operation.clone(), wait, &mut clock, update_only_existing)
+                .update_impl(
+                    operation.clone(),
+                    wait,
+                    &mut clock,
+                    update_only_existing,
+                    hw_measurement_acc.clone(),
+                )
                 .await?;
 
             if let Some(res) = res {
@@ -171,11 +220,18 @@ impl ShardReplicaSet {
 
             // Log a warning, if operation was rejected... but only if operation had a non-0 tick,
             // because operations with tick 0 should *always* be rejected and rejection is *expected*.
-            if is_non_zero_tick {
-                log::warn!(
-                    "Operation {operation:?} was rejected by some node(s), retrying... \
-                     (attempt {attempt}/{UPDATE_MAX_CLOCK_REJECTED_RETRIES})"
-                );
+            if is_non_zero_tick && log::log_enabled!(log::Level::Warn) {
+                if let Some(ids) = operation.point_ids() {
+                    log::warn!(
+                        "Operation affecting point IDs {ids:?} was rejected by some node(s), retrying... \
+                         (attempt {attempt}/{UPDATE_MAX_CLOCK_REJECTED_RETRIES})"
+                    );
+                } else {
+                    log::warn!(
+                        "Operation {operation:?} was rejected by some node(s), retrying... \
+                         (attempt {attempt}/{UPDATE_MAX_CLOCK_REJECTED_RETRIES})"
+                    );
+                }
             }
         }
 
@@ -195,6 +251,7 @@ impl ShardReplicaSet {
         wait: bool,
         clock: &mut clock_set::ClockGuard,
         update_only_existing: bool,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Option<UpdateResult>> {
         // `LocalShard::update` is not guaranteed to be cancel safe and it's impossible to cancel
         // multiple parallel updates in a way that is *guaranteed* not to introduce inconsistencies
@@ -236,12 +293,22 @@ impl ShardReplicaSet {
                     wait
                 };
 
+                if self.peer_is_active(this_peer_id) {
+                    // Check write rate limiter before proceeding if replica active
+                    self.check_operation_write_rate_limiter(
+                        &hw_measurement_acc,
+                        local,
+                        &operation,
+                    )?;
+                }
+
                 let operation = operation.clone();
 
+                let hw_acc = hw_measurement_acc.clone();
                 let local_update = async move {
                     local
                         .get()
-                        .update(operation, local_wait)
+                        .update(operation, local_wait, hw_acc)
                         .await
                         .map(|ok| (this_peer_id, ok))
                         .map_err(|err| (this_peer_id, err))
@@ -254,9 +321,10 @@ impl ShardReplicaSet {
         for remote in updatable_remote_shards {
             let operation = operation.clone();
 
+            let hw_acc = hw_measurement_acc.clone();
             let remote_update = async move {
                 remote
-                    .update(operation, wait)
+                    .update(operation, wait, hw_acc)
                     .await
                     .map(|ok| (remote.peer_id, ok))
                     .map_err(|err| (remote.peer_id, err))
@@ -340,12 +408,38 @@ impl ShardReplicaSet {
         };
 
         if !failures.is_empty() {
+            for (peer_id, err) in &failures {
+                log::warn!(
+                    "Failed to update shard {}:{} on peer {peer_id}, error: {err}",
+                    self.collection_id,
+                    self.shard_id,
+                );
+            }
+
+            // If there is at least one full-complete operation, we can't ignore non-transient errors (4xx)
+            // And we must deactivate failed replicas to ensure consistency
+            let has_full_completed_updates = successes.iter().any(|(_, res)| match res.status {
+                UpdateStatus::Completed => true,
+                UpdateStatus::Acknowledged => false,
+                UpdateStatus::ClockRejected => false,
+            });
+
             if successes.len() >= minimal_success_count {
                 // If there are enough successes, deactivate failed replicas
                 // Failed replicas will automatically recover from another replica ensuring consistency
 
+                let failures_to_handle: Vec<_> = if !has_full_completed_updates {
+                    // We can only deactivate transient errors
+                    failures
+                        .into_iter()
+                        .filter(|(_, err)| err.is_transient())
+                        .collect()
+                } else {
+                    failures
+                };
+
                 let wait_for_deactivation = self.handle_failed_replicas(
-                    &failures,
+                    &failures_to_handle,
                     &self.replica_state.read(),
                     update_only_existing,
                 );
@@ -356,17 +450,28 @@ impl ShardReplicaSet {
                     let timeout = DEFAULT_SHARD_DEACTIVATION_TIMEOUT;
 
                     let replica_state = self.replica_state.clone();
-                    let peer_ids: Vec<_> = failures.iter().map(|(peer_id, _)| *peer_id).collect();
+                    let peer_ids: Vec<_> = failures_to_handle
+                        .iter()
+                        .map(|(peer_id, _)| *peer_id)
+                        .collect();
 
                     let shards_disabled = tokio::task::spawn_blocking(move || {
                         replica_state.wait_for(
                             |state| {
                                 peer_ids.iter().all(|peer_id| {
-                                    state
-                                        .peers
-                                        .get(peer_id)
-                                        // Not found means that peer is dead
-                                        .map_or(true, |state| state != &ReplicaState::Active)
+                                    // Not found means that peer is dead
+
+                                    // Wait for replica deactivation.
+                                    let is_active = matches!(
+                                        state.peers.get(peer_id),
+                                        Some(
+                                            ReplicaState::Active
+                                                | ReplicaState::Resharding
+                                                | ReplicaState::ReshardingScaleDown
+                                        )
+                                    );
+
+                                    !is_active
                                 })
                             },
                             timeout,
@@ -378,7 +483,8 @@ impl ShardReplicaSet {
                         return Err(CollectionError::service_error(format!(
                             "Some replica of shard {} failed to apply operation and deactivation \
                             timed out after {} seconds. Consistency of this update is not guaranteed. Please retry. {failure_error}",
-                            self.shard_id, timeout.as_secs(),
+                            self.shard_id,
+                            timeout.as_secs(),
                         )));
                     }
                 }
@@ -426,27 +532,60 @@ impl ShardReplicaSet {
         Ok(Some(res))
     }
 
+    /// Check write rate limiter for the operation
+    ///
+    /// Lazily compute the cost of the operation and check against the write rate limiter
+    fn check_operation_write_rate_limiter(
+        &self,
+        hw_measurement: &HwMeasurementAcc,
+        local: &Shard,
+        operation: &OperationWithClockTag,
+    ) -> CollectionResult<()> {
+        self.check_write_rate_limiter(hw_measurement, || {
+            let mut ratelimiter_cost = 1;
+
+            // Estimate the cost based on affected points if filter is available.
+            match local.estimate_request_cardinality(
+                &operation.operation,
+                &hw_measurement.get_counter_cell(),
+            ) {
+                Ok(est) => ratelimiter_cost = 1.max(est.exp),
+                Err(err) => log::error!("Estimating cardinality: {err:?}"),
+            }
+
+            ratelimiter_cost
+        })?;
+        Ok(())
+    }
+
     /// Whether to send updates to the given peer
     ///
     /// A peer in dead state, or a locally disabled peer, will not accept updates.
     fn is_peer_updatable(&self, peer_id: PeerId) -> bool {
-        let res = match self.peer_state(peer_id) {
-            Some(ReplicaState::Active) => true,
-            Some(ReplicaState::Partial) => true,
-            Some(ReplicaState::Initializing) => true,
-            Some(ReplicaState::Listener) => true,
-            // We must not send updates to replicas in recovery state.
-            // If we do we might create gaps in WAL clock tags.
-            Some(ReplicaState::Recovery | ReplicaState::PartialSnapshot) => false,
-            Some(ReplicaState::Resharding) => true,
-            Some(ReplicaState::Dead) | None => false,
+        let Some(state) = self.peer_state(peer_id) else {
+            return false;
         };
+
+        let res = match state {
+            ReplicaState::Active => true,
+            ReplicaState::Partial => true,
+            ReplicaState::Initializing => true,
+            ReplicaState::Listener => true,
+            ReplicaState::Recovery | ReplicaState::PartialSnapshot => false,
+            ReplicaState::Resharding | ReplicaState::ReshardingScaleDown => true,
+            ReplicaState::Dead => false,
+        };
+
         res && !self.is_locally_disabled(peer_id)
     }
 
     fn peer_is_resharding(&self, peer_id: PeerId) -> bool {
-        self.peer_state(peer_id) == Some(ReplicaState::Resharding)
-            && !self.is_locally_disabled(peer_id)
+        let is_resharding = matches!(
+            self.peer_state(peer_id),
+            Some(ReplicaState::Resharding | ReplicaState::ReshardingScaleDown)
+        );
+
+        is_resharding && !self.is_locally_disabled(peer_id)
     }
 
     fn handle_failed_replicas<'a>(
@@ -458,12 +597,6 @@ impl ShardReplicaSet {
         let mut wait_for_deactivation = false;
 
         for (peer_id, err) in failures {
-            log::warn!(
-                "Failed to update shard {}:{} on peer {peer_id}, error: {err}",
-                self.collection_id,
-                self.shard_id,
-            );
-
             let Some(peer_state) = state.get_peer_state(*peer_id) else {
                 continue;
             };
@@ -476,12 +609,21 @@ impl ShardReplicaSet {
                 | ReplicaState::Partial
                 | ReplicaState::Recovery
                 | ReplicaState::PartialSnapshot
-                | ReplicaState::Resharding => (),
+                | ReplicaState::Resharding
+                | ReplicaState::ReshardingScaleDown => (),
             }
 
             // Handle a special case where transfer receiver is not in the expected replica state yet.
             // Data consistency will be handled by the shard transfer and the associated proxies.
             if peer_state.is_partial_or_recovery() && err.is_pre_condition_failed() {
+                continue;
+            }
+
+            // Ignore missing point errors if replica is in partial or recovery state
+            // Partial or recovery state indicates that the replica is receiving a shard transfer,
+            // it might not have received all the points yet
+            // See: <https://github.com/qdrant/qdrant/pull/5991>
+            if peer_state.is_partial_or_recovery() && err.is_missing_point() {
                 continue;
             }
 
@@ -524,6 +666,7 @@ impl ShardReplicaSet {
         operation: CollectionUpdateOperations,
         wait: bool,
         ordering: WriteOrdering,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult> {
         // `RemoteShard::forward_update` is cancel safe, so this method is cancel safe.
 
@@ -537,7 +680,12 @@ impl ShardReplicaSet {
         };
 
         remote_leader
-            .forward_update(OperationWithClockTag::from(operation), wait, ordering) // `clock_tag` *have to* be `None`!
+            .forward_update(
+                OperationWithClockTag::from(operation),
+                wait,
+                ordering,
+                hw_measurement_acc,
+            ) // `clock_tag` *has to* be `None`!
             .await
     }
 }
@@ -548,7 +696,7 @@ mod tests {
     use std::num::NonZeroU32;
     use std::sync::Arc;
 
-    use common::cpu::CpuBudget;
+    use common::budget::ResourceBudget;
     use segment::types::Distance;
     use tempfile::{Builder, TempDir};
     use tokio::runtime::Handle;
@@ -627,6 +775,7 @@ mod tests {
         let remotes = HashSet::from([2, 3, 4, 5]);
         ShardReplicaSet::build(
             1,
+            None,
             "test_collection".to_string(),
             1,
             false,
@@ -641,7 +790,7 @@ mod tests {
             Default::default(),
             update_runtime,
             search_runtime,
-            CpuBudget::default(),
+            ResourceBudget::default(),
             None,
         )
         .await

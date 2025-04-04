@@ -5,12 +5,13 @@ use collection::collection::Collection;
 use collection::config::{self, CollectionConfigInternal, CollectionParams, ShardingMethod};
 use collection::operations::config_diff::DiffConfig as _;
 use collection::operations::types::{
-    check_sparse_compatible, CollectionResult, SparseVectorParams, VectorsConfig,
+    CollectionResult, SparseVectorParams, VectorsConfig, check_sparse_compatible,
 };
+use collection::shards::CollectionId;
 use collection::shards::collection_shard_distribution::CollectionShardDistribution;
 use collection::shards::replica_set::ReplicaState;
 use collection::shards::shard::{PeerId, ShardId};
-use collection::shards::CollectionId;
+use segment::types::VectorNameBuf;
 
 use super::TableOfContent;
 use crate::content_manager::collection_meta_ops::*;
@@ -70,7 +71,9 @@ impl TableOfContent {
         }
 
         let collection_path = self.create_collection_path(collection_name).await?;
-        let snapshots_path = self.create_snapshots_path(collection_name).await?;
+        // derive the snapshots path for the collection to be used across collection operation, the directories for the snapshot
+        // is created only when a create snapshot api is invoked.
+        let snapshots_path = self.snapshots_path_for_collection(collection_name);
 
         let collection_defaults_config = self.storage_config.collection.as_ref();
 
@@ -84,7 +87,7 @@ impl TableOfContent {
                     debug_assert_eq!(
                         shard_number as usize,
                         collection_shard_distribution.shard_count(),
-                        "If shard number was supplied then this exact number should be used in a distribution"
+                        "If shard number was supplied then this exact number should be used in a distribution",
                     );
                     shard_number
                 } else {
@@ -94,7 +97,7 @@ impl TableOfContent {
             ShardingMethod::Custom => {
                 if init_from.is_some() {
                     return Err(StorageError::bad_input(
-                        "Can't initialize collection from another collection with custom sharding method"
+                        "Can't initialize collection from another collection with custom sharding method",
                     ));
                 }
                 if let Some(shard_number) = shard_number {
@@ -139,7 +142,6 @@ impl TableOfContent {
                 .ok_or_else(|| StorageError::bad_input("`shard_number` cannot be 0"))?,
             sharding_method,
             on_disk_payload: on_disk_payload.unwrap_or(self.storage_config.on_disk_payload),
-            on_disk_payload_uses_mmap: self.storage_config.on_disk_payload_uses_mmap,
             replication_factor: NonZeroU32::new(replication_factor).ok_or_else(|| {
                 StorageError::BadInput {
                     description: "`replication_factor` cannot be 0".to_string(),
@@ -208,6 +210,10 @@ impl TableOfContent {
             strict_mode_config,
             uuid,
         };
+
+        // No shard key mapping on creation, shard keys are set up after creating the collection
+        let shard_key_mapping = None;
+
         let collection = Collection::new(
             collection_name.to_string(),
             self.this_peer_id,
@@ -216,6 +222,7 @@ impl TableOfContent {
             &collection_config,
             storage_config,
             collection_shard_distribution,
+            shard_key_mapping,
             self.channel_service.clone(),
             Self::change_peer_from_state_callback(
                 self.consensus_proposal_sender.clone(),
@@ -232,7 +239,7 @@ impl TableOfContent {
             ),
             Some(self.search_runtime.handle().clone()),
             Some(self.update_runtime.handle().clone()),
-            self.optimizer_cpu_budget.clone(),
+            self.optimizer_resource_budget.clone(),
             self.storage_config.optimizers_overwrite.clone(),
         )
         .await?;
@@ -264,7 +271,7 @@ impl TableOfContent {
     async fn check_collections_compatibility(
         &self,
         vectors: &VectorsConfig,
-        sparse_vectors: &Option<BTreeMap<String, SparseVectorParams>>,
+        sparse_vectors: &Option<BTreeMap<VectorNameBuf, SparseVectorParams>>,
         source_collection: &CollectionId,
     ) -> Result<(), StorageError> {
         let collection = self.get_collection_unchecked(source_collection).await?;
@@ -291,12 +298,8 @@ impl TableOfContent {
                 ConsensusOperations::initialize_replica(collection_name.clone(), shard_id, peer_id);
             if let Err(send_error) = proposal_sender.send(operation) {
                 log::error!(
-                        "Can't send proposal to deactivate replica on peer {} of shard {} of collection {}. Error: {}",
-                        peer_id,
-                        shard_id,
-                        collection_name,
-                        send_error
-                    );
+                    "Can't send proposal to deactivate replica on peer {peer_id} of shard {shard_id} of collection {collection_name}. Error: {send_error}",
+                );
             }
         } else {
             // Just activate the shard
@@ -334,7 +337,7 @@ impl TableOfContent {
             {
                 Ok(_) => {}
                 Err(err) => {
-                    log::error!("Initialization failed: {}", err)
+                    log::error!("Initialization failed: {err}")
                 }
             }
 
@@ -348,11 +351,9 @@ impl TableOfContent {
             .await
             {
                 Ok(_) => log::info!(
-                    "Collection {} initialized with data from {}",
-                    to_collection,
-                    from_collection
+                    "Collection {to_collection} initialized with data from {from_collection}"
                 ),
-                Err(err) => log::error!("Initialization failed: {}", err),
+                Err(err) => log::error!("Initialization failed: {err}"),
             }
         });
     }

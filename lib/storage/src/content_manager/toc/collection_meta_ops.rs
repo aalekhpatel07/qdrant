@@ -7,7 +7,8 @@ use collection::events::{CollectionDeletedEvent, IndexCreatedEvent};
 use collection::shards::collection_shard_distribution::CollectionShardDistribution;
 use collection::shards::replica_set::ReplicaState;
 use collection::shards::transfer::ShardTransfer;
-use collection::shards::{transfer, CollectionId};
+use collection::shards::{CollectionId, transfer};
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use tempfile::Builder;
 
 use super::TableOfContent;
@@ -80,33 +81,33 @@ impl TableOfContent {
                     .map(|_| true)
             }
             CollectionMetaOperations::TransferShard(collection, operation) => {
-                log::debug!("Transfer shard {:?} of {}", operation, collection);
+                log::debug!("Transfer shard {operation:?} of {collection}");
 
                 self.handle_transfer(collection, operation)
                     .await
                     .map(|()| true)
             }
             CollectionMetaOperations::SetShardReplicaState(operation) => {
-                log::debug!("Set shard replica state {:?}", operation);
+                log::debug!("Set shard replica state {operation:?}");
                 self.set_shard_replica_state(operation).await.map(|()| true)
             }
             CollectionMetaOperations::Nop { .. } => Ok(true),
             CollectionMetaOperations::CreateShardKey(create_shard_key) => {
-                log::debug!("Create shard key {:?}", create_shard_key);
+                log::debug!("Create shard key {create_shard_key:?}");
                 self.create_shard_key(create_shard_key).await.map(|()| true)
             }
             CollectionMetaOperations::DropShardKey(drop_shard_key) => {
-                log::debug!("Drop shard key {:?}", drop_shard_key);
+                log::debug!("Drop shard key {drop_shard_key:?}");
                 self.drop_shard_key(drop_shard_key).await.map(|()| true)
             }
             CollectionMetaOperations::CreatePayloadIndex(create_payload_index) => {
-                log::debug!("Create payload index {:?}", create_payload_index);
+                log::debug!("Create payload index {create_payload_index:?}");
                 self.create_payload_index(create_payload_index)
                     .await
                     .map(|()| true)
             }
             CollectionMetaOperations::DropPayloadIndex(drop_payload_index) => {
-                log::debug!("Drop payload index {:?}", drop_payload_index);
+                log::debug!("Drop payload index {drop_payload_index:?}");
                 self.drop_payload_index(drop_payload_index)
                     .await
                     .map(|()| true)
@@ -240,8 +241,7 @@ impl TableOfContent {
             let path = self.get_collection_path(collection_name);
             if path.exists() {
                 log::warn!(
-                    "Collection {} is not loaded, but its directory still exists. Deleting it.",
-                    collection_name
+                    "Collection {collection_name} is not loaded, but its directory still exists. Deleting it."
                 );
                 tokio::fs::remove_dir_all(path).await?;
             }
@@ -310,7 +310,7 @@ impl TableOfContent {
                     None => {
                         return Err(StorageError::service_error(
                             "Can't handle transfer, this is a single node deployment",
-                        ))
+                        ));
                     }
                 };
 
@@ -363,86 +363,6 @@ impl TableOfContent {
         Ok(())
     }
 
-    /// Resume all resharding tasks
-    ///
-    /// Starts driving all registered resharding tasks to continue the resharding process.
-    pub async fn resume_resharding_tasks(&self) {
-        let collections = self
-            .collections
-            .read()
-            .await
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-
-        for collection_id in collections {
-            if let Err(err) = self.resume_resharding_task(collection_id.clone()).await {
-                log::error!("Failed to resume resharding task for collection {collection_id}, ignoring: {err}");
-            }
-        }
-    }
-
-    /// Resume resharding task for a collection
-    ///
-    /// Starts driving the registered resharding task on the given collection. Returns early
-    /// without error if no resharding task is registered.
-    async fn resume_resharding_task(
-        &self,
-        collection_id: CollectionId,
-    ) -> Result<(), StorageError> {
-        let collection = self.get_collection_unchecked(&collection_id).await?;
-        let Some(proposal_sender) = self.consensus_proposal_sender.clone() else {
-            return Err(StorageError::service_error(
-                "Can't handle resharding, this is a single node deployment",
-            ));
-        };
-
-        // Get current resharding state and key, or return early if there is none
-        let Some(resharding_state) = collection.resharding_state().await else {
-            return Ok(());
-        };
-        let key = resharding_state.key();
-
-        let consensus = match self.toc_dispatcher.lock().as_ref() {
-            Some(consensus) => Box::new(consensus.clone()),
-            None => {
-                return Err(StorageError::service_error(
-                    "Can't handle transfer, this is a single node deployment",
-                ))
-            }
-        };
-
-        let on_finish = {
-            let collection_id = collection_id.clone();
-            let key = key.clone();
-            let proposal_sender = proposal_sender.clone();
-            async move {
-                let operation = ConsensusOperations::finish_resharding(collection_id, key);
-                if let Err(error) = proposal_sender.send(operation) {
-                    log::error!("Can't report resharding progress to consensus: {error}");
-                };
-            }
-        };
-
-        let on_failure = {
-            let collection_id = collection_id.clone();
-            let key = key.clone();
-            async move {
-                if let Err(error) =
-                    proposal_sender.send(ConsensusOperations::abort_resharding(collection_id, key))
-                {
-                    log::error!("Can't report resharding progress to consensus: {error}");
-                };
-            }
-        };
-
-        collection
-            .resume_resharding_unchecked(consensus, on_finish, on_failure)
-            .await?;
-
-        Ok(())
-    }
-
     async fn handle_transfer(
         &self,
         collection_id: CollectionId,
@@ -470,7 +390,13 @@ impl TableOfContent {
                     .keys()
                     .cloned()
                     .collect();
-                let shard_state = shards.get(&transfer.shard_id).map(|info| &info.replicas);
+
+                let source_replicas = shards.get(&transfer.shard_id).map(|info| &info.replicas);
+
+                let destination_replicas = transfer
+                    .to_shard_id
+                    .and_then(|to_shard_id| shards.get(&to_shard_id))
+                    .map(|info| &info.replicas);
 
                 // Valid transfer:
                 // All peers: 123, 321, 111, 222, 333
@@ -485,7 +411,8 @@ impl TableOfContent {
                 transfer::helpers::validate_transfer(
                     &transfer,
                     &all_peers,
-                    shard_state,
+                    source_replicas,
+                    destination_replicas,
                     &transfers,
                     &shards_key_mapping,
                 )?;
@@ -525,7 +452,7 @@ impl TableOfContent {
                     None => {
                         return Err(StorageError::service_error(
                             "Can't handle transfer, this is a single node deployment",
-                        ))
+                        ));
                     }
                 };
 
@@ -632,7 +559,7 @@ impl TableOfContent {
                             transfer.shard_id,
                             ReplicaState::PartialSnapshot,
                             ReplicaState::Recovery,
-                        )))
+                        )));
                     }
                 }
 
@@ -699,9 +626,19 @@ impl TableOfContent {
         &self,
         operation: CreatePayloadIndex,
     ) -> Result<(), StorageError> {
+        // We measure hardware on collection level here to not touch consensus for measurements but still
+        // measure hw for payload index creation on all nodes.
+        let collection_hw_acc = HwMeasurementAcc::new_with_metrics_drain(
+            self.get_collection_hw_metrics(operation.collection_name.clone()),
+        );
+
         self.get_collection_unchecked(&operation.collection_name)
             .await?
-            .create_payload_index(operation.field_name.clone(), operation.field_schema)
+            .create_payload_index(
+                operation.field_name.clone(),
+                operation.field_schema,
+                collection_hw_acc,
+            )
             .await?;
 
         // We can solve issues related to this missing index

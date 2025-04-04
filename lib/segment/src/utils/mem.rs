@@ -49,7 +49,7 @@ impl Mem {
 
 #[cfg(target_os = "linux")]
 mod cgroups_mem {
-    use cgroups_rs::{hierarchies, memory, Cgroup};
+    use cgroups_rs::{Cgroup, hierarchies, memory};
     use procfs::process::Process;
 
     #[derive(Clone, Debug)]
@@ -142,7 +142,7 @@ mod sysinfo_mem {
     impl SysinfoMem {
         pub fn new() -> Self {
             let system = System::new_with_specifics(
-                RefreshKind::new().with_memory(MemoryRefreshKind::everything()),
+                RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
             );
             Self { system }
         }

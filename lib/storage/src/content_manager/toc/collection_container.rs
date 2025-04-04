@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use collection::collection::Collection;
 use collection::collection_state;
+use collection::shards::CollectionId;
 use collection::shards::collection_shard_distribution::CollectionShardDistribution;
 use collection::shards::replica_set::ReplicaState;
 use collection::shards::shard::PeerId;
-use collection::shards::CollectionId;
 
 use super::TableOfContent;
 use crate::content_manager::collection_meta_ops::*;
@@ -14,7 +14,7 @@ use crate::content_manager::collections_ops::Checker as _;
 use crate::content_manager::consensus::operation_sender::OperationSender;
 use crate::content_manager::consensus_ops::ConsensusOperations;
 use crate::content_manager::errors::StorageError;
-use crate::content_manager::{consensus_manager, CollectionContainer};
+use crate::content_manager::{CollectionContainer, consensus_manager};
 
 impl CollectionContainer for TableOfContent {
     fn perform_collection_meta_op(
@@ -186,6 +186,7 @@ impl TableOfContent {
                             .to_shared_storage_config(self.is_distributed())
                             .into(),
                         shard_distribution,
+                        Some(state.shards_key_mapping.clone()),
                         self.channel_service.clone(),
                         Self::change_peer_from_state_callback(
                             self.consensus_proposal_sender.clone(),
@@ -202,7 +203,7 @@ impl TableOfContent {
                         ),
                         Some(self.search_runtime.handle().clone()),
                         Some(self.update_runtime.handle().clone()),
-                        self.optimizer_cpu_budget.clone(),
+                        self.optimizer_resource_budget.clone(),
                         self.storage_config.optimizers_overwrite.clone(),
                     )
                     .await?;
@@ -227,8 +228,7 @@ impl TableOfContent {
                                 ))
                             {
                                 log::error!(
-                                    "Can't report transfer progress to consensus: {}",
-                                    error
+                                    "Can't report transfer progress to consensus: {error}"
                                 )
                             };
                         };
@@ -292,7 +292,7 @@ impl TableOfContent {
         Ok(())
     }
 
-    #[allow(dead_code)] // Currently unused ¯\_(ツ)_/¯
+    #[allow(dead_code)]
     fn remove_shards_at_peer_sync(&self, peer_id: PeerId) -> Result<(), StorageError> {
         self.general_runtime
             .block_on(self.remove_shards_at_peer(peer_id))

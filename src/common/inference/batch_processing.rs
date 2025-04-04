@@ -98,7 +98,7 @@ fn collect_query(query: &Query, batch: &mut BatchAccum) {
                 }
             }
         }
-        Query::OrderBy(_) | Query::Fusion(_) | Query::Sample(_) => {}
+        Query::OrderBy(_) | Query::Fusion(_) | Query::Formula(_) | Query::Sample(_) => {}
     }
 }
 
@@ -193,8 +193,8 @@ pub fn collect_query_request(request: &QueryRequestInternal) -> BatchAccum {
 
 #[cfg(test)]
 mod tests {
-    use api::rest::schema::{DiscoverQuery, Document, Image, InferenceObject, NearestQuery};
     use api::rest::QueryBaseGroupRequest;
+    use api::rest::schema::{DiscoverQuery, Document, Image, InferenceObject, NearestQuery};
     use serde_json::json;
 
     use super::*;

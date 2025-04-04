@@ -8,6 +8,7 @@ use collection::operations::point_ops::{
 use collection::operations::vector_ops::PointVectorsPersisted;
 use storage::content_manager::errors::StorageError;
 
+use crate::common::inference::InferenceToken;
 use crate::common::inference::batch_processing::BatchAccum;
 use crate::common::inference::infer_processing::BatchAccumInferred;
 use crate::common::inference::service::{InferenceData, InferenceType};
@@ -15,6 +16,7 @@ use crate::common::inference::service::{InferenceData, InferenceType};
 pub async fn convert_point_struct(
     point_structs: Vec<PointStruct>,
     inference_type: InferenceType,
+    inference_token: InferenceToken,
 ) -> Result<Vec<PointStructPersisted>, StorageError> {
     let mut batch_accum = BatchAccum::new();
 
@@ -40,7 +42,10 @@ pub async fn convert_point_struct(
     }
 
     let inferred = if !batch_accum.objects.is_empty() {
-        Some(BatchAccumInferred::from_batch_accum(batch_accum, inference_type).await?)
+        Some(
+            BatchAccumInferred::from_batch_accum(batch_accum, inference_type, &inference_token)
+                .await?,
+        )
     } else {
         None
     };
@@ -68,7 +73,7 @@ pub async fn convert_point_struct(
                             Vector::Document(_) | Vector::Image(_) | Vector::Object(_) => {
                                 return Err(StorageError::inference_error(
                                     "Inference required but service returned no results",
-                                ))
+                                ));
                             }
                         },
                     };
@@ -84,7 +89,7 @@ pub async fn convert_point_struct(
                     None => {
                         return Err(StorageError::inference_error(
                             "Inference required but service returned no results",
-                        ))
+                        ));
                     }
                 };
                 match vector {
@@ -101,7 +106,7 @@ pub async fn convert_point_struct(
                     None => {
                         return Err(StorageError::inference_error(
                             "Inference required but service returned no results",
-                        ))
+                        ));
                     }
                 };
                 match vector {
@@ -118,7 +123,7 @@ pub async fn convert_point_struct(
                     None => {
                         return Err(StorageError::inference_error(
                             "Inference required but service returned no results",
-                        ))
+                        ));
                     }
                 };
                 match vector {
@@ -143,7 +148,10 @@ pub async fn convert_point_struct(
     Ok(converted_points)
 }
 
-pub async fn convert_batch(batch: Batch) -> Result<BatchPersisted, StorageError> {
+pub async fn convert_batch(
+    batch: Batch,
+    inference_token: InferenceToken,
+) -> Result<BatchPersisted, StorageError> {
     let Batch {
         ids,
         vectors,
@@ -159,7 +167,9 @@ pub async fn convert_batch(batch: Batch) -> Result<BatchPersisted, StorageError>
                 let mut named_vectors = HashMap::new();
 
                 for (name, vectors) in named {
-                    let converted_vectors = convert_vectors(vectors, InferenceType::Update).await?;
+                    let converted_vectors =
+                        convert_vectors(vectors, InferenceType::Update, inference_token.clone())
+                            .await?;
                     named_vectors.insert(name, converted_vectors);
                 }
 
@@ -168,17 +178,17 @@ pub async fn convert_batch(batch: Batch) -> Result<BatchPersisted, StorageError>
             BatchVectorStruct::Document(_) => {
                 return Err(StorageError::inference_error(
                     "Document processing is not supported in batch operations.",
-                ))
+                ));
             }
             BatchVectorStruct::Image(_) => {
                 return Err(StorageError::inference_error(
                     "Image processing is not supported in batch operations.",
-                ))
+                ));
             }
             BatchVectorStruct::Object(_) => {
                 return Err(StorageError::inference_error(
                     "Object processing is not supported in batch operations.",
-                ))
+                ));
             }
         },
         payloads,
@@ -190,6 +200,7 @@ pub async fn convert_batch(batch: Batch) -> Result<BatchPersisted, StorageError>
 pub async fn convert_point_vectors(
     point_vectors_list: Vec<PointVectors>,
     inference_type: InferenceType,
+    inference_token: InferenceToken,
 ) -> Result<Vec<PointVectorsPersisted>, StorageError> {
     let mut converted_point_vectors = Vec::new();
     let mut batch_accum = BatchAccum::new();
@@ -208,7 +219,10 @@ pub async fn convert_point_vectors(
     }
 
     let inferred = if !batch_accum.objects.is_empty() {
-        Some(BatchAccumInferred::from_batch_accum(batch_accum, inference_type).await?)
+        Some(
+            BatchAccumInferred::from_batch_accum(batch_accum, inference_type, &inference_token)
+                .await?,
+        )
     } else {
         None
     };
@@ -232,7 +246,7 @@ pub async fn convert_point_vectors(
                             Vector::Document(_) | Vector::Image(_) | Vector::Object(_) => {
                                 return Err(StorageError::inference_error(
                                     "Inference required but service returned no results",
-                                ))
+                                ));
                             }
                         },
                     };
@@ -244,17 +258,17 @@ pub async fn convert_point_vectors(
             VectorStruct::Document(_) => {
                 return Err(StorageError::inference_error(
                     "Document processing is not supported for point vectors.",
-                ))
+                ));
             }
             VectorStruct::Image(_) => {
                 return Err(StorageError::inference_error(
                     "Image processing is not supported for point vectors.",
-                ))
+                ));
             }
             VectorStruct::Object(_) => {
                 return Err(StorageError::inference_error(
                     "Object processing is not supported for point vectors.",
-                ))
+                ));
             }
         };
 
@@ -297,7 +311,7 @@ fn convert_point_struct_with_inferred(
                     match vector {
                         VectorPersisted::Dense(dense) => VectorStructPersisted::Single(dense),
                         VectorPersisted::Sparse(_) => {
-                            return Err(StorageError::bad_request("Sparse vector should be named"))
+                            return Err(StorageError::bad_request("Sparse vector should be named"));
                         }
                         VectorPersisted::MultiDense(multi) => {
                             VectorStructPersisted::MultiDense(multi)
@@ -309,7 +323,7 @@ fn convert_point_struct_with_inferred(
                     match vector {
                         VectorPersisted::Dense(dense) => VectorStructPersisted::Single(dense),
                         VectorPersisted::Sparse(_) => {
-                            return Err(StorageError::bad_request("Sparse vector should be named"))
+                            return Err(StorageError::bad_request("Sparse vector should be named"));
                         }
                         VectorPersisted::MultiDense(multi) => {
                             VectorStructPersisted::MultiDense(multi)
@@ -321,7 +335,7 @@ fn convert_point_struct_with_inferred(
                     match vector {
                         VectorPersisted::Dense(dense) => VectorStructPersisted::Single(dense),
                         VectorPersisted::Sparse(_) => {
-                            return Err(StorageError::bad_request("Sparse vector should be named"))
+                            return Err(StorageError::bad_request("Sparse vector should be named"));
                         }
                         VectorPersisted::MultiDense(multi) => {
                             VectorStructPersisted::MultiDense(multi)
@@ -342,6 +356,7 @@ fn convert_point_struct_with_inferred(
 pub async fn convert_vectors(
     vectors: Vec<Vector>,
     inference_type: InferenceType,
+    inference_token: InferenceToken,
 ) -> Result<Vec<VectorPersisted>, StorageError> {
     let mut batch_accum = BatchAccum::new();
     for vector in &vectors {
@@ -354,7 +369,10 @@ pub async fn convert_vectors(
     }
 
     let inferred = if !batch_accum.objects.is_empty() {
-        Some(BatchAccumInferred::from_batch_accum(batch_accum, inference_type).await?)
+        Some(
+            BatchAccumInferred::from_batch_accum(batch_accum, inference_type, &inference_token)
+                .await?,
+        )
     } else {
         None
     };

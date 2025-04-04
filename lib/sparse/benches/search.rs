@@ -3,24 +3,25 @@ use std::io;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use criterion::measurement::Measurement;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use dataset::Dataset;
 use indicatif::{ProgressBar, ProgressDrawTarget};
 use itertools::Itertools;
-use rand::rngs::StdRng;
 use rand::SeedableRng as _;
+use rand::rngs::StdRng;
 use sparse::common::scores_memory_pool::ScoresMemoryPool;
 use sparse::common::sparse_vector::{RemappedSparseVector, SparseVector};
 use sparse::common::sparse_vector_fixture::{random_positive_sparse_vector, random_sparse_vector};
 use sparse::common::types::QuantizedU8;
+use sparse::index::inverted_index::InvertedIndex;
 use sparse::index::inverted_index::inverted_index_compressed_immutable_ram::InvertedIndexCompressedImmutableRam;
 use sparse::index::inverted_index::inverted_index_compressed_mmap::InvertedIndexCompressedMmap;
 use sparse::index::inverted_index::inverted_index_mmap::InvertedIndexMmap;
 use sparse::index::inverted_index::inverted_index_ram::InvertedIndexRam;
 use sparse::index::inverted_index::inverted_index_ram_builder::InvertedIndexBuilder;
-use sparse::index::inverted_index::InvertedIndex;
 use sparse::index::loaders::{self, Csr};
 use sparse::index::search_context::SearchContext;
 mod prof;
@@ -197,19 +198,30 @@ fn run_bench2(
     let stopped = AtomicBool::new(false);
 
     let mut it = query_vectors.iter().cycle();
+
+    let hardware_counter = HardwareCounterCell::new();
+
     group.bench_function("basic", |b| {
         b.iter_batched(
             || it.next().unwrap().clone().into_remapped(),
-            |vec| SearchContext::new(vec, TOP, index, pool.get(), &stopped).search(&|_| true),
+            |vec| {
+                SearchContext::new(vec, TOP, index, pool.get(), &stopped, &hardware_counter)
+                    .search(&|_| true)
+            },
             criterion::BatchSize::SmallInput,
         )
     });
+
+    let hardware_counter = HardwareCounterCell::new();
 
     let mut it = hottest_query_vectors.iter().cycle();
     group.bench_function("hottest", |b| {
         b.iter_batched(
             || it.next().unwrap().clone(),
-            |vec| SearchContext::new(vec, TOP, index, pool.get(), &stopped).search(&|_| true),
+            |vec| {
+                SearchContext::new(vec, TOP, index, pool.get(), &stopped, &hardware_counter)
+                    .search(&|_| true)
+            },
             criterion::BatchSize::SmallInput,
         )
     });

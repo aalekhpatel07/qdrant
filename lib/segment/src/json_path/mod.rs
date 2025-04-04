@@ -1,32 +1,34 @@
 use std::fmt::{Display, Formatter};
+use std::hash::Hash;
 
 use data_encoding::BASE32_DNSSEC;
 use itertools::Itertools as _;
-use schemars::gen::SchemaGenerator;
-use schemars::schema::Schema;
 use schemars::JsonSchema;
+use schemars::r#gen::SchemaGenerator;
+use schemars::schema::Schema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::common::anonymize::Anonymize;
-use crate::common::utils::{merge_map, MultiValue};
+use crate::common::utils::{MultiValue, merge_map};
 
 mod parse;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Anonymize)]
 pub struct JsonPath {
     pub first_key: String,
     pub rest: Vec<JsonPathItem>,
 }
 
-#[derive(Debug, PartialEq, Clone, Hash, Eq)]
+#[derive(Debug, PartialEq, Clone, Hash, Eq, Anonymize)]
 pub enum JsonPathItem {
-    /// A key in a JSON object, e.g. ".foo"
+    /// A key in a JSON object, e.g. `.foo`
     Key(String),
-    /// An index in a JSON array, e.g. "[3]"
+    /// An index in a JSON array, e.g. `[3]`
+    #[anonymize(false)]
     Index(usize),
-    /// All indices in a JSON array, i.e. "[]"
+    /// All indices in a JSON array, i.e. `[]`
     WildcardIndex,
 }
 
@@ -129,7 +131,7 @@ impl JsonPath {
                     return Some(JsonPath {
                         first_key: k.clone(),
                         rest: self_it.skip(1).cloned().collect(),
-                    })
+                    });
                 }
                 (Some(_), None) => {
                     // We don't support json paths starting with `[`. So
@@ -169,6 +171,10 @@ impl JsonPath {
             result.rest.push(JsonPathItem::WildcardIndex);
         }
         result
+    }
+
+    pub fn has_wildcard_suffix(&self) -> bool {
+        self.rest.last() == Some(&JsonPathItem::WildcardIndex)
     }
 
     /// Check if a path is included in a list of patterns.
@@ -270,10 +276,10 @@ impl JsonPath {
                 // Types are not compatible. This means that `value_set` could override the
                 // subtree, deleting indexed fields.
                 (JsonPathItem::Key(_), JsonPathItem::Index(_) | JsonPathItem::WildcardIndex) => {
-                    return true
+                    return true;
                 }
                 (JsonPathItem::Index(_) | JsonPathItem::WildcardIndex, JsonPathItem::Key(_)) => {
-                    return true
+                    return true;
                 }
             }
         }
@@ -525,14 +531,8 @@ impl JsonSchema for JsonPath {
         "JsonPath".to_string()
     }
 
-    fn json_schema(gen: &mut SchemaGenerator) -> Schema {
-        String::json_schema(gen)
-    }
-}
-
-impl Anonymize for JsonPath {
-    fn anonymize(&self) -> Self {
-        self.clone()
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        String::json_schema(generator)
     }
 }
 

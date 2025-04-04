@@ -5,7 +5,9 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 
 use ahash::HashMap;
-use common::mmap_hashmap::{Key, MmapHashMap};
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::counter::iterator_hw_measurement::HwMeasurementIteratorExt;
+use common::mmap_hashmap::{Key, MmapHashMap, READ_ENTRY_OVERHEAD};
 use common::types::PointOffsetType;
 use io::file_operations::{atomic_save_json, read_json};
 use itertools::Itertools;
@@ -16,9 +18,9 @@ use memory::mmap_type::MmapBitSlice;
 use serde::{Deserialize, Serialize};
 
 use super::{IdIter, MapIndexKey};
+use crate::common::Flusher;
 use crate::common::mmap_bitslice_buffered_update_wrapper::MmapBitSliceBufferedUpdateWrapper;
 use crate::common::operation_error::OperationResult;
-use crate::common::Flusher;
 use crate::index::field_index::mmap_point_to_values::MmapPointToValues;
 
 const DELETED_PATH: &str = "deleted.bin";
@@ -40,7 +42,7 @@ struct MmapMapIndexConfig {
 }
 
 impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
-    pub fn load(path: &Path) -> OperationResult<Self> {
+    pub fn load(path: &Path, is_on_disk: bool) -> OperationResult<Self> {
         let hashmap_path = path.join(HASHMAP_PATH);
         let deleted_path = path.join(DELETED_PATH);
         let config_path = path.join(CONFIG_PATH);
@@ -50,7 +52,8 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         let hashmap = MmapHashMap::open(&hashmap_path)?;
         let point_to_values = MmapPointToValues::open(path)?;
 
-        let deleted = mmap_ops::open_write_mmap(&deleted_path, AdviceSetting::Global, false)?;
+        let do_populate = !is_on_disk;
+        let deleted = mmap_ops::open_write_mmap(&deleted_path, AdviceSetting::Global, do_populate)?;
         let deleted = MmapBitSlice::from(deleted, 0);
         let deleted_count = deleted.count_ones();
 
@@ -68,6 +71,7 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         path: &Path,
         point_to_values: Vec<Vec<N::Owned>>,
         values_to_points: HashMap<N::Owned, Vec<PointOffsetType>>,
+        is_on_disk: bool,
     ) -> OperationResult<Self> {
         create_dir_all(path)?;
 
@@ -117,7 +121,7 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
             }
         }
 
-        Self::load(path)
+        Self::load(path, is_on_disk)
     }
 
     pub fn flusher(&self) -> Flusher {
@@ -154,13 +158,26 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         }
     }
 
-    pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&N) -> bool) -> bool {
+    pub fn check_values_any(
+        &self,
+        idx: PointOffsetType,
+        hw_acc: &HardwareCounterCell,
+        check_fn: impl Fn(&N) -> bool,
+    ) -> bool {
+        // Measure self.deleted access.
+        hw_acc
+            .payload_index_io_read_counter()
+            .incr_delta(size_of::<bool>());
+
         self.deleted
             .get(idx as usize)
             .filter(|b| !b)
-            .map_or(false, |_| {
-                self.point_to_values
-                    .check_values_any(idx, |v| check_fn(N::from_referenced(&v)))
+            .is_some_and(|_| {
+                self.point_to_values.check_values_any(
+                    idx,
+                    |v| check_fn(N::from_referenced(&v)),
+                    hw_acc,
+                )
             })
     }
 
@@ -197,7 +214,17 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         self.value_to_points.keys_count()
     }
 
-    pub fn get_count_for_value(&self, value: &N) -> Option<usize> {
+    pub fn get_count_for_value(
+        &self,
+        value: &N,
+        hw_counter: &HardwareCounterCell,
+    ) -> Option<usize> {
+        // Since `value_to_points.get` doesn't actually force read from disk for all values
+        // we need to only account for the overhead of hashmap lookup
+        hw_counter
+            .payload_index_io_read_counter()
+            .incr_delta(READ_ENTRY_OVERHEAD);
+
         match self.value_to_points.get(value) {
             Ok(Some(points)) => Some(points.len()),
             Ok(None) => None,
@@ -212,14 +239,31 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         }
     }
 
-    pub fn get_iterator(&self, value: &N) -> Box<dyn Iterator<Item = &PointOffsetType> + '_> {
+    pub fn get_iterator(
+        &self,
+        value: &N,
+        hw_counter: &HardwareCounterCell,
+    ) -> Box<dyn Iterator<Item = &PointOffsetType> + '_> {
         match self.value_to_points.get(value) {
-            Ok(Some(slice)) => Box::new(
-                slice
-                    .iter()
-                    .filter(|idx| !self.deleted.get(**idx as usize).unwrap_or(false)),
-            ),
-            Ok(None) => Box::new(iter::empty()),
+            Ok(Some(slice)) => {
+                // We're iterating over the whole (mmapped) slice
+                hw_counter
+                    .payload_index_io_read_counter()
+                    .incr_delta(size_of_val(slice) + READ_ENTRY_OVERHEAD);
+
+                Box::new(
+                    slice
+                        .iter()
+                        .filter(|idx| !self.deleted.get(**idx as usize).unwrap_or(false)),
+                )
+            }
+            Ok(None) => {
+                hw_counter
+                    .payload_index_io_read_counter()
+                    .incr_delta(READ_ENTRY_OVERHEAD);
+
+                Box::new(iter::empty())
+            }
             Err(err) => {
                 debug_assert!(
                     false,
@@ -246,9 +290,26 @@ impl<N: MapIndexKey + Key + ?Sized> MmapMapIndex<N> {
         })
     }
 
-    pub fn iter_values_map(&self) -> impl Iterator<Item = (&N, IdIter<'_>)> + '_ {
-        self.value_to_points
-            .iter()
-            .map(|(k, v)| (k, Box::new(v.iter().copied()) as IdIter))
+    pub fn iter_values_map<'a>(
+        &'a self,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> impl Iterator<Item = (&'a N, IdIter<'a>)> + 'a {
+        self.value_to_points.iter().map(move |(k, v)| {
+            hw_counter
+                .payload_index_io_read_counter()
+                .incr_delta(k.write_bytes());
+
+            (
+                k,
+                Box::new(
+                    v.iter()
+                        .copied()
+                        .filter(|idx| !self.deleted.get(*idx as usize).unwrap_or(true))
+                        .measure_hw_with_cell(hw_counter, size_of::<PointOffsetType>(), |i| {
+                            i.payload_index_io_read_counter()
+                        }),
+                ) as IdIter,
+            )
+        })
     }
 }

@@ -9,6 +9,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use ::api::grpc::QDRANT_DESCRIPTOR_SET;
 use ::api::grpc::grpc_health_v1::health_check_response::ServingStatus;
 use ::api::grpc::grpc_health_v1::health_server::{Health, HealthServer};
 use ::api::grpc::grpc_health_v1::{
@@ -27,7 +28,6 @@ use ::api::grpc::qdrant::{
     GetConsensusCommitRequest, GetConsensusCommitResponse, HealthCheckReply, HealthCheckRequest,
     WaitOnConsensusCommitRequest, WaitOnConsensusCommitResponse,
 };
-use ::api::grpc::QDRANT_DESCRIPTOR_SET;
 use ::api::rest::models::VersionInfo;
 use collection::operations::verification::new_unchecked_verification_pass;
 use storage::content_manager::consensus_manager::ConsensusStateRef;
@@ -174,7 +174,7 @@ pub fn init(
             .build()
             .unwrap();
 
-        log::info!("Qdrant gRPC listening on {}", grpc_port);
+        log::info!("Qdrant gRPC listening on {grpc_port}");
 
         let mut server = Server::builder();
 
@@ -282,9 +282,10 @@ pub fn init_internal(
                 QdrantInternalService::new(settings, consensus_state.clone());
             let collections_internal_service = CollectionsInternalService::new(toc.clone());
             let shard_snapshots_service = ShardSnapshotsService::new(toc.clone(), http_client);
-            let raft_service = RaftService::new(to_consensus, consensus_state);
+            let raft_service =
+                RaftService::new(to_consensus, consensus_state, tls_config.is_some());
 
-            log::debug!("Qdrant internal gRPC listening on {}", internal_grpc_port);
+            log::debug!("Qdrant internal gRPC listening on {internal_grpc_port}");
 
             let mut server = Server::builder()
                 // Internally use a high limit for pending accept streams.

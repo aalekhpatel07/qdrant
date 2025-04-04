@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use actix_multipart::form::tempfile::TempFile;
 use actix_multipart::form::MultipartForm;
-use actix_web::{delete, get, post, put, web, Responder, Result};
+use actix_multipart::form::tempfile::TempFile;
+use actix_web::{Responder, Result, delete, get, post, put, web};
 use actix_web_validator as valid;
 use collection::common::file_utils::move_file;
 use collection::common::sha_256::{hash_file, hashes_equal};
@@ -91,10 +91,7 @@ pub async fn do_save_uploaded_snapshot(
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let collection_snapshot_path = toc.snapshots_path_for_collection(collection_name);
     if !collection_snapshot_path.exists() {
-        log::debug!(
-            "Creating missing collection snapshots directory for {}",
-            collection_name
-        );
+        log::debug!("Creating missing collection snapshots directory for {collection_name}");
         toc.create_snapshots_path(collection_name).await?;
     }
 
@@ -121,8 +118,8 @@ pub async fn do_get_snapshot(
     collection_name: &str,
     snapshot_name: &str,
 ) -> Result<SnapshotStream, HttpError> {
-    let collection_pass =
-        access.check_collection_access(collection_name, AccessRequirements::new().whole())?;
+    let collection_pass = access
+        .check_collection_access(collection_name, AccessRequirements::new().whole().extras())?;
     let collection: tokio::sync::RwLockReadGuard<collection::collection::Collection> =
         toc.get_collection(&collection_pass).await?;
     let snapshot_storage_manager = collection.get_snapshots_storage_manager()?;
@@ -521,7 +518,7 @@ async fn download_shard_snapshot(
 
     let (collection, shard, snapshot) = path.into_inner();
     let collection_pass =
-        access.check_collection_access(&collection, AccessRequirements::new().whole())?;
+        access.check_collection_access(&collection, AccessRequirements::new().whole().extras())?;
     let collection = dispatcher
         .toc(&access, &pass)
         .get_collection(&collection_pass)

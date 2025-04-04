@@ -1,6 +1,7 @@
 use std::fmt::Debug;
 
 use schemars::JsonSchema;
+use segment::common::anonymize::Anonymize;
 use serde;
 use serde::Serialize;
 
@@ -48,10 +49,17 @@ pub struct ApiResponse<D> {
 }
 
 /// Usage of the hardware resources, spent to process the request
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, JsonSchema, Anonymize, Clone)]
 #[serde(rename_all = "snake_case")]
+#[anonymize(false)]
 pub struct HardwareUsage {
     pub cpu: usize,
+    pub payload_io_read: usize,
+    pub payload_io_write: usize,
+    pub payload_index_io_read: usize,
+    pub payload_index_io_write: usize,
+    pub vector_io_read: usize,
+    pub vector_io_write: usize,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -60,7 +68,7 @@ pub struct CollectionDescription {
     pub name: String,
 }
 
-fn example_collectios_response() -> CollectionsResponse {
+fn example_collections_response() -> CollectionsResponse {
     CollectionsResponse {
         collections: vec![
             CollectionDescription {
@@ -81,7 +89,7 @@ fn example_collectios_response() -> CollectionsResponse {
 
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-#[schemars(example = "example_collectios_response")]
+#[schemars(example = "example_collections_response")]
 pub struct CollectionsResponse {
     pub collections: Vec<CollectionDescription>,
 }

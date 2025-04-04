@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use ash::vk;
@@ -33,6 +34,10 @@ pub struct Instance {
 
     /// Shader compiler.
     compiler: Mutex<shaderc::Compiler>,
+
+    /// Debug messenger for the instance. It contains validation error callbacks.
+    /// Should be kept alive while the instance is alive because it contains raw pointers to callbacks.
+    _debug_messenger: Option<Box<dyn DebugMessenger>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,9 +58,55 @@ pub struct PhysicalDevice {
     pub device_type: PhysicalDeviceType,
 }
 
+#[derive(Default)]
+pub struct InstanceBuilder {
+    debug_messenger: Option<Box<dyn DebugMessenger>>,
+    allocation_callbacks: Option<Box<dyn AllocationCallbacks>>,
+    dump_api: bool,
+}
+
+impl InstanceBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set debug messenger for the instance.
+    pub fn with_debug_messenger(mut self, debug_messenger: Box<dyn DebugMessenger>) -> Self {
+        self.debug_messenger = Some(debug_messenger);
+        self
+    }
+
+    /// Set CPU allocation callbacks for the instance.
+    pub fn with_allocation_callbacks(
+        mut self,
+        allocation_callbacks: Box<dyn AllocationCallbacks>,
+    ) -> Self {
+        self.allocation_callbacks = Some(allocation_callbacks);
+        self
+    }
+
+    // Enable API dump layer.
+    pub fn with_dump_api(mut self, dump_api: bool) -> Self {
+        self.dump_api = dump_api;
+        self
+    }
+
+    pub fn build(self) -> GpuResult<Arc<Instance>> {
+        Instance::new(
+            self.debug_messenger,
+            self.allocation_callbacks,
+            self.dump_api,
+        )
+    }
+}
+
 impl Instance {
-    pub fn new(
-        debug_messenger: Option<&dyn DebugMessenger>,
+    pub fn builder() -> InstanceBuilder {
+        InstanceBuilder::new()
+    }
+
+    fn new(
+        debug_messenger: Option<Box<dyn DebugMessenger>>,
         allocation_callbacks: Option<Box<dyn AllocationCallbacks>>,
         dump_api: bool,
     ) -> GpuResult<Arc<Self>> {
@@ -69,7 +120,7 @@ impl Instance {
         // Create Vulkan API entry point.
         let entry = unsafe {
             ash::Entry::load().map_err(|e| {
-                GpuError::Other(format!("Failed to create Vulkan API entry point {:?}", e))
+                GpuError::Other(format!("Failed to create Vulkan API entry point {e:?}"))
             })?
         };
 
@@ -109,7 +160,9 @@ impl Instance {
             .collect();
 
         // If we provide debug messenger, we need to create a debug messenger info.
-        let mut debug_utils_create_info = debug_messenger.map(Self::debug_messenger_create_info);
+        let mut debug_utils_create_info = debug_messenger
+            .as_deref()
+            .map(Self::debug_messenger_create_info);
 
         let create_flags = if cfg!(any(target_os = "macos")) {
             // On MacOS we need to enable portability extension to enable MoltenVK.
@@ -166,7 +219,7 @@ impl Instance {
                     _ => PhysicalDeviceType::Other,
                 };
 
-                log::info!("Foung GPU device: {device_name}");
+                log::info!("Found GPU device: {device_name}");
                 PhysicalDevice {
                     vk_physical_device,
                     name: device_name,
@@ -187,10 +240,10 @@ impl Instance {
 
         // If we have a debug messenger, we need to create it.
         let (vk_debug_utils_loader, vk_debug_messenger) = if let Some(debug_messenger) =
-            debug_messenger
+            debug_messenger.as_ref()
         {
             let debug_utils_loader = ash::ext::debug_utils::Instance::new(&entry, &vk_instance);
-            let messenger_create_info = Self::debug_messenger_create_info(debug_messenger);
+            let messenger_create_info = Self::debug_messenger_create_info(debug_messenger.deref());
             let utils_messenger_result = unsafe {
                 debug_utils_loader
                     .create_debug_utils_messenger(&messenger_create_info, vk_allocation_callbacks)
@@ -219,6 +272,7 @@ impl Instance {
             vk_debug_utils_loader,
             vk_debug_messenger,
             compiler,
+            _debug_messenger: debug_messenger,
         }))
     }
 
@@ -249,6 +303,7 @@ impl Instance {
     pub fn compile_shader(
         &self,
         shader: &str,
+        shader_name: &str,
         defines: Option<&HashMap<String, Option<String>>>,
         includes: Option<&HashMap<String, String>>,
     ) -> GpuResult<Vec<u8>> {
@@ -283,7 +338,7 @@ impl Instance {
                         content: code.to_owned(),
                     })
                 } else {
-                    Err(format!("Include file not found: {}", filename))
+                    Err(format!("Include file not found: {filename}"))
                 }
             });
         }
@@ -293,11 +348,11 @@ impl Instance {
             .compile_into_spirv(
                 shader,
                 shaderc::ShaderKind::Compute,
-                "shader.glsl",
+                shader_name,
                 "main",
                 Some(&options),
             )
-            .map_err(|e| GpuError::Other(format!("Failed to compile shader: {:?}", e)))?;
+            .map_err(|e| GpuError::Other(format!("Failed to compile shader: {e:?}")))?;
         Ok(result.as_binary_u8().to_owned())
     }
 
@@ -340,10 +395,7 @@ impl Instance {
                 name.to_str().unwrap_or("") == extension
             });
             if !extension_found {
-                return Err(GpuError::Other(format!(
-                    "Extension {} not found",
-                    extension
-                )));
+                return Err(GpuError::Other(format!("Extension {extension} not found")));
             }
         }
         Ok(())
@@ -357,7 +409,7 @@ impl Instance {
                 name.to_str().unwrap_or("") == layer
             });
             if !layer_found {
-                return Err(GpuError::Other(format!("Layer {} not found", layer)));
+                return Err(GpuError::Other(format!("Layer {layer} not found")));
             }
         }
         Ok(())

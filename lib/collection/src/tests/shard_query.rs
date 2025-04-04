@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use common::budget::ResourceBudget;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use common::cpu::CpuBudget;
-use segment::data_types::vectors::{NamedVectorStruct, VectorInternal, DEFAULT_VECTOR_NAME};
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, NamedVectorStruct, VectorInternal};
 use segment::types::{PointIdType, WithPayloadInterface, WithVector};
 use tempfile::Builder;
 use tokio::runtime::Handle;
@@ -42,7 +42,7 @@ async fn test_shard_query_rrf_rescoring() {
         payload_index_schema,
         current_runtime.clone(),
         current_runtime.clone(),
-        CpuBudget::default(),
+        ResourceBudget::default(),
         config.optimizer_config.clone(),
     )
     .await
@@ -50,7 +50,10 @@ async fn test_shard_query_rrf_rescoring() {
 
     let upsert_ops = upsert_operation();
 
-    shard.update(upsert_ops.into(), true).await.unwrap();
+    shard
+        .update(upsert_ops.into(), true, HwMeasurementAcc::new())
+        .await
+        .unwrap();
 
     // RRF query without prefetches
     let query = ShardQueryRequest {
@@ -67,7 +70,7 @@ async fn test_shard_query_rrf_rescoring() {
 
     let hw_acc = HwMeasurementAcc::new();
     let sources_scores = shard
-        .query_batch(Arc::new(vec![query]), &current_runtime, None, &hw_acc)
+        .query_batch(Arc::new(vec![query]), &current_runtime, None, hw_acc)
         .await;
     let expected_error =
         CollectionError::bad_request("cannot apply Fusion without prefetches".to_string());
@@ -100,8 +103,9 @@ async fn test_shard_query_rrf_rescoring() {
         with_payload: WithPayloadInterface::Bool(false),
     };
 
+    let hw_acc = HwMeasurementAcc::new();
     let sources_scores = shard
-        .query_batch(Arc::new(vec![query]), &current_runtime, None, &hw_acc)
+        .query_batch(Arc::new(vec![query]), &current_runtime, None, hw_acc)
         .await
         .unwrap()
         .pop()
@@ -146,8 +150,9 @@ async fn test_shard_query_rrf_rescoring() {
         with_payload: WithPayloadInterface::Bool(false),
     };
 
+    let hw_acc = HwMeasurementAcc::new();
     let sources_scores = shard
-        .query_batch(Arc::new(vec![query]), &current_runtime, None, &hw_acc)
+        .query_batch(Arc::new(vec![query]), &current_runtime, None, hw_acc)
         .await
         .unwrap()
         .pop()
@@ -189,8 +194,9 @@ async fn test_shard_query_rrf_rescoring() {
         with_payload: WithPayloadInterface::Bool(false),
     };
 
+    let hw_acc = HwMeasurementAcc::new();
     let sources_scores = shard
-        .query_batch(Arc::new(vec![query]), &current_runtime, None, &hw_acc)
+        .query_batch(Arc::new(vec![query]), &current_runtime, None, hw_acc)
         .await
         .unwrap()
         .pop()
@@ -202,7 +208,6 @@ async fn test_shard_query_rrf_rescoring() {
     assert_eq!(sources_scores[0][0].id, PointIdType::NumId(1));
     assert_eq!(sources_scores[1][0].id, PointIdType::NumId(2));
     assert_eq!(sources_scores[2][0].id, PointIdType::NumId(3));
-    hw_acc.discard();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -229,7 +234,7 @@ async fn test_shard_query_vector_rescoring() {
         payload_index_schema,
         current_runtime.clone(),
         current_runtime.clone(),
-        CpuBudget::default(),
+        ResourceBudget::default(),
         config.optimizer_config.clone(),
     )
     .await
@@ -237,7 +242,10 @@ async fn test_shard_query_vector_rescoring() {
 
     let upsert_ops = upsert_operation();
 
-    shard.update(upsert_ops.into(), true).await.unwrap();
+    shard
+        .update(upsert_ops.into(), true, HwMeasurementAcc::new())
+        .await
+        .unwrap();
 
     let nearest_query = QueryEnum::Nearest(NamedVectorStruct::new_from_vector(
         VectorInternal::Dense(vec![1.0, 2.0, 3.0, 4.0]),
@@ -270,7 +278,7 @@ async fn test_shard_query_vector_rescoring() {
 
     let hw_acc = HwMeasurementAcc::new();
     let sources_scores = shard
-        .query_batch(Arc::new(vec![query]), &current_runtime, None, &hw_acc)
+        .query_batch(Arc::new(vec![query]), &current_runtime, None, hw_acc)
         .await
         .unwrap()
         .pop()
@@ -295,8 +303,9 @@ async fn test_shard_query_vector_rescoring() {
         with_payload: WithPayloadInterface::Bool(false),
     };
 
+    let hw_acc = HwMeasurementAcc::new();
     let sources_scores = shard
-        .query_batch(Arc::new(vec![query]), &current_runtime, None, &hw_acc)
+        .query_batch(Arc::new(vec![query]), &current_runtime, None, hw_acc)
         .await
         .unwrap()
         .pop()
@@ -324,8 +333,9 @@ async fn test_shard_query_vector_rescoring() {
         with_payload: WithPayloadInterface::Bool(false),
     };
 
+    let hw_acc = HwMeasurementAcc::new();
     let sources_scores = shard
-        .query_batch(Arc::new(vec![query]), &current_runtime, None, &hw_acc)
+        .query_batch(Arc::new(vec![query]), &current_runtime, None, hw_acc)
         .await
         .unwrap()
         .pop()
@@ -336,7 +346,6 @@ async fn test_shard_query_vector_rescoring() {
     // merging taking place
     // number of results is limited by the outer limit for vector rescoring
     assert_eq!(sources_scores[0].len(), outer_limit);
-    hw_acc.discard();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -363,7 +372,7 @@ async fn test_shard_query_payload_vector() {
         payload_index_schema,
         current_runtime.clone(),
         current_runtime.clone(),
-        CpuBudget::default(),
+        ResourceBudget::default(),
         config.optimizer_config.clone(),
     )
     .await
@@ -371,7 +380,10 @@ async fn test_shard_query_payload_vector() {
 
     let upsert_ops = upsert_operation();
 
-    shard.update(upsert_ops.into(), true).await.unwrap();
+    shard
+        .update(upsert_ops.into(), true, HwMeasurementAcc::new())
+        .await
+        .unwrap();
 
     let nearest_query = QueryEnum::Nearest(NamedVectorStruct::new_from_vector(
         VectorInternal::Dense(vec![1.0, 2.0, 3.0, 4.0]),
@@ -394,12 +406,11 @@ async fn test_shard_query_payload_vector() {
 
     let hw_acc = HwMeasurementAcc::new();
     let sources_scores = shard
-        .query_batch(Arc::new(vec![query]), &current_runtime, None, &hw_acc)
+        .query_batch(Arc::new(vec![query]), &current_runtime, None, hw_acc)
         .await
         .unwrap()
         .pop()
         .unwrap();
-    hw_acc.discard();
 
     // only one inner result in absence of prefetches
     assert_eq!(sources_scores.len(), 1);

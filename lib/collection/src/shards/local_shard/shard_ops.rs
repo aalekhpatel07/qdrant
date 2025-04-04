@@ -13,6 +13,7 @@ use tokio::sync::oneshot;
 use tokio::time::error::Elapsed;
 
 use crate::collection_manager::segments_searcher::SegmentsSearcher;
+use crate::operations::OperationWithClockTag;
 use crate::operations::types::{
     CollectionError, CollectionInfo, CollectionResult, CoreSearchRequestBatch,
     CountRequestInternal, CountResult, PointRequestInternal, RecordInternal, UpdateResult,
@@ -20,7 +21,6 @@ use crate::operations::types::{
 };
 use crate::operations::universal_query::planned_query::PlannedQuery;
 use crate::operations::universal_query::shard_query::{ShardQueryRequest, ShardQueryResponse};
-use crate::operations::OperationWithClockTag;
 use crate::shards::local_shard::LocalShard;
 use crate::shards::shard_trait::ShardOperation;
 use crate::update_handler::{OperationData, UpdateSignal};
@@ -38,6 +38,7 @@ impl ShardOperation for LocalShard {
         &self,
         mut operation: OperationWithClockTag,
         wait: bool,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult> {
         // `LocalShard::update` only has a single cancel safe `await`, WAL operations are blocking,
         // and update is applied by a separate task, so, surprisingly, this method is cancel safe. :D
@@ -87,6 +88,7 @@ impl ShardOperation for LocalShard {
                 operation: operation.operation,
                 sender: callback_sender,
                 wait,
+                hw_measurements: hw_measurement_acc.clone(),
             }));
 
             operation_id
@@ -108,6 +110,7 @@ impl ShardOperation for LocalShard {
         }
     }
 
+    /// This call is rate limited by the read rate limiter.
     async fn scroll_by(
         &self,
         offset: Option<ExtendedPointId>,
@@ -118,7 +121,10 @@ impl ShardOperation for LocalShard {
         search_runtime_handle: &Handle,
         order_by: Option<&OrderBy>,
         timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<RecordInternal>> {
+        // Check read rate limiter before proceeding
+        self.check_read_rate_limiter(1, &hw_measurement_acc, "scroll_by")?;
         match order_by {
             None => {
                 self.scroll_by_id(
@@ -129,33 +135,22 @@ impl ShardOperation for LocalShard {
                     filter,
                     search_runtime_handle,
                     timeout,
+                    hw_measurement_acc,
                 )
                 .await
             }
             Some(order_by) => {
-                let (mut records, values) = self
-                    .scroll_by_field(
-                        limit,
-                        with_payload_interface,
-                        with_vector,
-                        filter,
-                        search_runtime_handle,
-                        order_by,
-                        timeout,
-                    )
-                    .await?;
-
-                records.iter_mut().zip(values).for_each(|(record, value)| {
-                    // TODO(1.11): stop inserting the value in the payload, only use the order_value
-                    // Add order_by value to the payload. It will be removed in the next step, after crossing the shard boundary.
-                    let new_payload =
-                        OrderBy::insert_order_value_in_payload(record.payload.take(), value);
-
-                    record.payload = Some(new_payload);
-                    record.order_value = Some(value);
-                });
-
-                Ok(records)
+                self.scroll_by_field(
+                    limit,
+                    with_payload_interface,
+                    with_vector,
+                    filter,
+                    search_runtime_handle,
+                    order_by,
+                    timeout,
+                    hw_measurement_acc,
+                )
+                .await
             }
         }
     }
@@ -165,29 +160,39 @@ impl ShardOperation for LocalShard {
         Ok(self.local_shard_info().await.into())
     }
 
+    /// This call is rate limited by the read rate limiter.
     async fn core_search(
         &self,
         request: Arc<CoreSearchRequestBatch>,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
-        hw_measurement_acc: &HwMeasurementAcc,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
+        // Check read rate limiter before proceeding
+        self.check_read_rate_limiter(request.searches.len(), &hw_measurement_acc, "core_search")?;
         self.do_search(request, search_runtime_handle, timeout, hw_measurement_acc)
             .await
     }
 
+    /// This call is rate limited by the read rate limiter.
     async fn count(
         &self,
         request: Arc<CountRequestInternal>,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
-        _hw_measurement_acc: &HwMeasurementAcc, // TODO: measure hardware when counting
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<CountResult> {
+        // Check read rate limiter before proceeding
+        self.check_read_rate_limiter(1, &hw_measurement_acc, "count")?;
         let total_count = if request.exact {
             let timeout = timeout.unwrap_or(self.shared_storage_config.search_timeout);
             let all_points = tokio::time::timeout(
                 timeout,
-                self.read_filtered(request.filter.as_ref(), search_runtime_handle),
+                self.read_filtered(
+                    request.filter.as_ref(),
+                    search_runtime_handle,
+                    hw_measurement_acc,
+                ),
             )
             .await
             .map_err(|_: Elapsed| {
@@ -195,11 +200,16 @@ impl ShardOperation for LocalShard {
             })??;
             all_points.len()
         } else {
-            self.estimate_cardinality(request.filter.as_ref())?.exp
+            self.estimate_cardinality(
+                request.filter.as_ref(),
+                &hw_measurement_acc.get_counter_cell(),
+            )?
+            .exp
         };
         Ok(CountResult { count: total_count })
     }
 
+    /// This call is rate limited by the read rate limiter.
     async fn retrieve(
         &self,
         request: Arc<PointRequestInternal>,
@@ -207,7 +217,10 @@ impl ShardOperation for LocalShard {
         with_vector: &WithVector,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<RecordInternal>> {
+        // Check read rate limiter before proceeding
+        self.check_read_rate_limiter(1, &hw_measurement_acc, "retrieve")?;
         let timeout = timeout.unwrap_or(self.shared_storage_config.search_timeout);
         let records_map = tokio::time::timeout(
             timeout,
@@ -217,6 +230,7 @@ impl ShardOperation for LocalShard {
                 with_payload,
                 with_vector,
                 search_runtime_handle,
+                hw_measurement_acc,
             ),
         )
         .await
@@ -231,15 +245,18 @@ impl ShardOperation for LocalShard {
         Ok(ordered_records)
     }
 
+    /// This call is rate limited by the read rate limiter.
     async fn query_batch(
         &self,
         requests: Arc<Vec<ShardQueryRequest>>,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
-        hw_measurement_acc: &HwMeasurementAcc,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<ShardQueryResponse>> {
         let planned_query = PlannedQuery::try_from(requests.as_ref().to_owned())?;
-
+        // Check read rate limiter before proceeding
+        let cost = planned_query.searches.len() + planned_query.scrolls.len();
+        self.check_read_rate_limiter(cost, &hw_measurement_acc, "query_batch")?;
         self.do_planned_query(
             planned_query,
             search_runtime_handle,
@@ -249,17 +266,21 @@ impl ShardOperation for LocalShard {
         .await
     }
 
+    /// This call is rate limited by the read rate limiter.
     async fn facet(
         &self,
         request: Arc<FacetParams>,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<FacetResponse> {
+        // Check read rate limiter before proceeding
+        self.check_read_rate_limiter(1, &hw_measurement_acc, "facet")?;
         let hits = if request.exact {
-            self.exact_facet(request, search_runtime_handle, timeout)
+            self.exact_facet(request, search_runtime_handle, timeout, hw_measurement_acc)
                 .await?
         } else {
-            self.approx_facet(request, search_runtime_handle, timeout)
+            self.approx_facet(request, search_runtime_handle, timeout, hw_measurement_acc)
                 .await?
         };
         Ok(FacetResponse { hits })

@@ -1,5 +1,8 @@
 log_level: DEBUG
 
+feature_flags:
+  all: true
+
 inference:
   address: "http://localhost:2114/api/v1/infer"
   timeout: 10
@@ -12,6 +15,8 @@ service:
   #grpc_port: 6334
   #api_key: your_secret_api_key_here
 
+cluster:
+  resharding_enabled: true
 
 storage:
   performance:
@@ -26,4 +31,3 @@ storage:
     default_segment_number: 2
 
   handle_collection_load_errors: true
-

@@ -1,29 +1,32 @@
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use common::cpu::CpuPermit;
+use common::budget::ResourcePermit;
+use common::counter::hardware_counter::HardwareCounterCell;
 use itertools::Itertools;
 use segment::common::operation_error::OperationError;
 use segment::data_types::named_vectors::NamedVectors;
-use segment::data_types::vectors::{only_default_vector, VectorRef, DEFAULT_VECTOR_NAME};
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, VectorRef, only_default_vector};
 use segment::entry::entry_point::SegmentEntry;
 use segment::index::hnsw_index::num_rayon_threads;
 use segment::json_path::JsonPath;
 use segment::segment::Segment;
 use segment::segment_constructor::segment_builder::SegmentBuilder;
+use segment::segment_constructor::simple_segment_constructor::build_simple_segment_with_payload_storage;
 use segment::types::{
-    Indexes, PayloadContainer, PayloadKeyType, SegmentConfig, VectorDataConfig, VectorStorageType,
+    Distance, Indexes, PayloadContainer, PayloadKeyType, PayloadStorageType, SegmentConfig,
+    VectorDataConfig, VectorStorageType,
 };
 use serde_json::Value;
 use sparse::common::sparse_vector::SparseVector;
 use tempfile::Builder;
 
 use crate::fixtures::segment::{
-    build_segment_1, build_segment_2, build_segment_sparse_1, build_segment_sparse_2,
-    empty_segment, PAYLOAD_KEY,
+    PAYLOAD_KEY, SPARSE_VECTOR_NAME, build_segment_1, build_segment_2, build_segment_sparse_1,
+    build_segment_sparse_2, empty_segment,
 };
 
 #[test]
@@ -39,9 +42,16 @@ fn test_building_new_segment() {
     let mut builder =
         SegmentBuilder::new(dir.path(), temp_dir.path(), &segment1.segment_config).unwrap();
 
+    let hw_counter = HardwareCounterCell::new();
+
     // Include overlapping with segment1 to check the
     segment2
-        .upsert_point(100, 3.into(), only_default_vector(&[0., 0., 0., 0.]))
+        .upsert_point(
+            100,
+            3.into(),
+            only_default_vector(&[0., 0., 0., 0.]),
+            &hw_counter,
+        )
         .unwrap();
 
     builder
@@ -61,9 +71,10 @@ fn test_building_new_segment() {
     // Now we finalize building
 
     let permit_cpu_count = num_rayon_threads(0);
-    let permit = CpuPermit::dummy(permit_cpu_count as u32);
+    let permit = ResourcePermit::dummy(permit_cpu_count as u32);
+    let hw_counter = HardwareCounterCell::new();
 
-    let merged_segment: Segment = builder.build(permit, &stopped).unwrap();
+    let merged_segment: Segment = builder.build(permit, &stopped, &hw_counter).unwrap();
 
     let new_segment_count = dir.path().read_dir().unwrap().count();
 
@@ -94,14 +105,16 @@ fn test_building_new_defragmented_segment() {
 
     let defragment_key = JsonPath::from_str(PAYLOAD_KEY).unwrap();
 
+    let hw_counter = HardwareCounterCell::new();
+
     let mut segment1 = build_segment_1(dir.path());
     segment1
-        .create_field_index(7, &defragment_key, None)
+        .create_field_index(7, &defragment_key, None, &hw_counter)
         .unwrap();
 
     let mut segment2 = build_segment_2(dir.path());
     segment2
-        .create_field_index(17, &defragment_key, None)
+        .create_field_index(17, &defragment_key, None, &hw_counter)
         .unwrap();
 
     let mut builder =
@@ -109,7 +122,12 @@ fn test_building_new_defragmented_segment() {
 
     // Include overlapping with segment1 to check the
     segment2
-        .upsert_point(100, 3.into(), only_default_vector(&[0., 0., 0., 0.]))
+        .upsert_point(
+            100,
+            3.into(),
+            only_default_vector(&[0., 0., 0., 0.]),
+            &hw_counter,
+        )
         .unwrap();
 
     builder.set_defragment_keys(vec![defragment_key.clone()]);
@@ -129,9 +147,10 @@ fn test_building_new_defragmented_segment() {
     // Now we finalize building
 
     let permit_cpu_count = num_rayon_threads(0);
-    let permit = CpuPermit::dummy(permit_cpu_count as u32);
+    let permit = ResourcePermit::dummy(permit_cpu_count as u32);
+    let hw_counter = HardwareCounterCell::new();
 
-    let merged_segment: Segment = builder.build(permit, &stopped).unwrap();
+    let merged_segment: Segment = builder.build(permit, &stopped, &hw_counter).unwrap();
 
     let new_segment_count = dir.path().read_dir().unwrap().count();
 
@@ -171,9 +190,11 @@ fn check_points_defragmented(
     // keeps track of groups/values that have already been seen while iterating
     let mut seen_values: Vec<Value> = vec![];
 
+    let hw_counter = HardwareCounterCell::new();
+
     for internal_id in id_tracker.iter_internal() {
         let external_id = id_tracker.external_id(internal_id).unwrap();
-        let payload = segment.payload(external_id).unwrap();
+        let payload = segment.payload(external_id, &hw_counter).unwrap();
         let values = payload.get_value(defragment_key);
 
         if values.is_empty() {
@@ -215,6 +236,8 @@ fn test_building_new_sparse_segment() {
 
     let stopped = AtomicBool::new(false);
 
+    let hw_counter = HardwareCounterCell::new();
+
     let segment1 = build_segment_sparse_1(dir.path());
     let mut segment2 = build_segment_sparse_2(dir.path());
 
@@ -227,7 +250,8 @@ fn test_building_new_sparse_segment() {
         .upsert_point(
             100,
             3.into(),
-            NamedVectors::from_ref("sparse", VectorRef::Sparse(&vec)),
+            NamedVectors::from_ref(SPARSE_VECTOR_NAME, VectorRef::Sparse(&vec)),
+            &hw_counter,
         )
         .unwrap();
 
@@ -248,9 +272,10 @@ fn test_building_new_sparse_segment() {
     // Now we finalize building
 
     let permit_cpu_count = num_rayon_threads(0);
-    let permit = CpuPermit::dummy(permit_cpu_count as u32);
+    let permit = ResourcePermit::dummy(permit_cpu_count as u32);
+    let hw_counter = HardwareCounterCell::new();
 
-    let merged_segment: Segment = builder.build(permit, &stopped).unwrap();
+    let merged_segment: Segment = builder.build(permit, &stopped, &hw_counter).unwrap();
 
     let new_segment_count = dir.path().read_dir().unwrap().count();
 
@@ -314,9 +339,10 @@ fn estimate_build_time(segment: &Segment, stop_delay_millis: Option<u64>) -> (u6
     }
 
     let permit_cpu_count = num_rayon_threads(0);
-    let permit = CpuPermit::dummy(permit_cpu_count as u32);
+    let permit = ResourcePermit::dummy(permit_cpu_count as u32);
+    let hw_counter = HardwareCounterCell::new();
 
-    let res = builder.build(permit, &stopped);
+    let res = builder.build(permit, &stopped, &hw_counter);
 
     let is_cancelled = match res {
         Ok(_) => false,
@@ -328,6 +354,71 @@ fn estimate_build_time(segment: &Segment, stop_delay_millis: Option<u64>) -> (u6
     };
 
     (now.elapsed().as_millis() as u64, is_cancelled)
+}
+
+/// Unit test for a specific bug we caught before.
+///
+/// See: <https://github.com/qdrant/qdrant/pull/5614>
+#[test]
+fn test_building_new_segment_bug_5614() {
+    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let temp_dir = Builder::new().prefix("segment_temp_dir").tempdir().unwrap();
+
+    let stopped = AtomicBool::new(false);
+
+    let mut segment1 = build_segment_1(dir.path());
+    let mut segment2 = build_segment_2(dir.path());
+
+    let mut builder =
+        SegmentBuilder::new(dir.path(), temp_dir.path(), &segment1.segment_config).unwrap();
+
+    let vector_100_low = only_default_vector(&[1., 1., 0., 0.]);
+    let vector_101_low = only_default_vector(&[2., 2., 0., 0.]);
+    let vector_100_high = only_default_vector(&[3., 3., 0., 0.]);
+    let vector_101_high = only_default_vector(&[4., 4., 0., 0.]);
+
+    let hw_counter = HardwareCounterCell::new();
+
+    // Insert point 100 and 101 in both segments
+    // Do this in a specific order so that:
+    // - the latter segment has a higher point version
+    // - the internal point IDs don't match across segments
+    segment1
+        .upsert_point(123, 100.into(), vector_100_low, &hw_counter)
+        .unwrap();
+    segment1
+        .upsert_point(123, 101.into(), vector_101_low, &hw_counter)
+        .unwrap();
+
+    segment2
+        .upsert_point(124, 101.into(), vector_101_high.clone(), &hw_counter)
+        .unwrap();
+    segment2
+        .upsert_point(124, 100.into(), vector_100_high.clone(), &hw_counter)
+        .unwrap();
+
+    builder.update(&[&segment1, &segment2], &stopped).unwrap();
+
+    let permit_cpu_count = num_rayon_threads(0);
+    let permit = ResourcePermit::dummy(permit_cpu_count as u32);
+    let hw_counter = HardwareCounterCell::new();
+
+    let merged_segment: Segment = builder.build(permit, &stopped, &hw_counter).unwrap();
+
+    // Assert correct point versions - must have latest
+    assert_eq!(merged_segment.point_version(100.into()), Some(124));
+    assert_eq!(merged_segment.point_version(101.into()), Some(124));
+
+    // Assert correct vectors still belong to the point
+    // This was broken before <https://github.com/qdrant/qdrant/pull/5543>
+    assert_eq!(
+        merged_segment.all_vectors(100.into()).unwrap(),
+        vector_100_high,
+    );
+    assert_eq!(
+        merged_segment.all_vectors(101.into()).unwrap(),
+        vector_101_high,
+    );
 }
 
 #[test]
@@ -343,15 +434,32 @@ fn test_building_cancellation() {
     let mut segment = empty_segment(dir.path());
     let mut segment_2 = empty_segment(dir_2.path());
 
+    let hw_counter = HardwareCounterCell::new();
+
     for idx in 0..2000 {
         baseline_segment
-            .upsert_point(1, idx.into(), only_default_vector(&[0., 0., 0., 0.]))
+            .upsert_point(
+                1,
+                idx.into(),
+                only_default_vector(&[0., 0., 0., 0.]),
+                &hw_counter,
+            )
             .unwrap();
         segment
-            .upsert_point(1, idx.into(), only_default_vector(&[0., 0., 0., 0.]))
+            .upsert_point(
+                1,
+                idx.into(),
+                only_default_vector(&[0., 0., 0., 0.]),
+                &hw_counter,
+            )
             .unwrap();
         segment_2
-            .upsert_point(1, idx.into(), only_default_vector(&[0., 0., 0., 0.]))
+            .upsert_point(
+                1,
+                idx.into(),
+                only_default_vector(&[0., 0., 0., 0.]),
+                &hw_counter,
+            )
             .unwrap();
     }
 
@@ -384,4 +492,63 @@ fn test_building_cancellation() {
         time_fast < time_long,
         "time_early: {time_fast}, time_later: {time_long}, was_cancelled_later: {was_cancelled_later}",
     );
+}
+
+#[test]
+fn test_building_new_segment_with_mmap_payload() {
+    let segment_dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let temp_dir = Builder::new().prefix("segment_temp_dir").tempdir().unwrap();
+
+    let stopped = AtomicBool::new(false);
+
+    let mut segment1 = build_simple_segment_with_payload_storage(
+        segment_dir.path(),
+        4,
+        Distance::Dot,
+        PayloadStorageType::Mmap,
+    )
+    .unwrap();
+
+    assert_eq!(
+        segment1.segment_config.payload_storage_type,
+        PayloadStorageType::Mmap
+    );
+
+    let hw_counter = HardwareCounterCell::new();
+
+    // add one point
+    segment1
+        .upsert_point(
+            1,
+            1.into(),
+            only_default_vector(&[1.0, 0.0, 1.0, 1.0]),
+            &hw_counter,
+        )
+        .unwrap();
+
+    let builder = SegmentBuilder::new(
+        segment_dir.path(),
+        temp_dir.path(),
+        &segment1.segment_config,
+    )
+    .unwrap();
+
+    let temp_segment_count = temp_dir.path().read_dir().unwrap().count();
+
+    assert_eq!(temp_segment_count, 1);
+
+    // Now we finalize building
+    let permit_cpu_count = num_rayon_threads(0);
+    let permit = ResourcePermit::dummy(permit_cpu_count as u32);
+    let hw_counter = HardwareCounterCell::new();
+
+    let new_segment: Segment = builder.build(permit, &stopped, &hw_counter).unwrap();
+    assert_eq!(
+        new_segment.segment_config.payload_storage_type,
+        PayloadStorageType::Mmap
+    );
+
+    let new_segment_count = segment_dir.path().read_dir().unwrap().count();
+
+    assert_eq!(new_segment_count, 2);
 }

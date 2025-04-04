@@ -1,5 +1,6 @@
 mod fix_payload_indices;
 pub mod fixtures;
+mod hw_metrics;
 mod payload;
 mod points_dedup;
 mod sha_256_test;
@@ -8,11 +9,12 @@ mod snapshot_test;
 mod sparse_vectors_validation_tests;
 mod wal_recovery_test;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use common::cpu::CpuBudget;
+use common::budget::ResourceBudget;
+use common::counter::hardware_counter::HardwareCounterCell;
 use futures::future::join_all;
 use itertools::Itertools;
 use parking_lot::{Mutex, RwLock};
@@ -21,16 +23,16 @@ use segment::data_types::vectors::only_default_vector;
 use segment::index::hnsw_index::num_rayon_threads;
 use segment::types::{Distance, PointIdType};
 use tempfile::Builder;
-use tokio::time::{sleep, Instant};
+use tokio::time::{Instant, sleep};
 
-use crate::collection::payload_index_schema::PayloadIndexSchema;
 use crate::collection::Collection;
+use crate::collection::payload_index_schema::PayloadIndexSchema;
 use crate::collection_manager::fixtures::{
-    get_indexing_optimizer, get_merge_optimizer, random_segment, PointIdGenerator,
+    PointIdGenerator, get_indexing_optimizer, get_merge_optimizer, random_segment,
 };
 use crate::collection_manager::holders::segment_holder::{LockedSegment, SegmentHolder, SegmentId};
-use crate::collection_manager::optimizers::segment_optimizer::OptimizerThresholds;
 use crate::collection_manager::optimizers::TrackerStatus;
+use crate::collection_manager::optimizers::segment_optimizer::OptimizerThresholds;
 use crate::config::CollectionParams;
 use crate::operations::types::VectorsConfig;
 use crate::operations::vector_params_builder::VectorParamsBuilder;
@@ -71,7 +73,7 @@ async fn test_optimization_process() {
         optimizers.clone(),
         optimizers_log.clone(),
         total_optimized_points.clone(),
-        &CpuBudget::default(),
+        &ResourceBudget::default(),
         segments.clone(),
         |_| {},
         None,
@@ -114,7 +116,7 @@ async fn test_optimization_process() {
         optimizers.clone(),
         optimizers_log.clone(),
         total_optimized_points.clone(),
-        &CpuBudget::default(),
+        &ResourceBudget::default(),
         segments.clone(),
         |_| {},
         None,
@@ -171,7 +173,7 @@ async fn test_cancel_optimization() {
         optimizers.clone(),
         optimizers_log.clone(),
         total_optimized_points.clone(),
-        &CpuBudget::default(),
+        &ResourceBudget::default(),
         segments.clone(),
         |_| {},
         None,
@@ -272,6 +274,8 @@ async fn test_new_segment_when_all_over_capacity() {
 
     assert_eq!(segments.read().len(), 6);
 
+    let hw_counter = HardwareCounterCell::new();
+
     // Insert some points in the smallest segment to fill capacity
     {
         let segments_read = segments.read();
@@ -286,14 +290,19 @@ async fn test_new_segment_when_all_over_capacity() {
             })
             .unwrap();
 
-        let mut rnd = rand::thread_rng();
+        let mut rnd = rand::rng();
         for _ in 0..10 {
             let point_id: PointIdType = PointIdGenerator::default().unique();
-            let random_vector: Vec<_> = (0..dim).map(|_| rnd.gen()).collect();
+            let random_vector: Vec<_> = (0..dim).map(|_| rnd.random()).collect();
             segment
                 .get()
                 .write()
-                .upsert_point(101, point_id, only_default_vector(&random_vector))
+                .upsert_point(
+                    101,
+                    point_id,
+                    only_default_vector(&random_vector),
+                    &hw_counter,
+                )
                 .unwrap();
         }
     }

@@ -2,11 +2,15 @@ use std::path::PathBuf;
 
 use bitvec::prelude::BitSlice;
 use common::types::PointOffsetType;
+#[cfg(test)]
+use rand::Rng as _;
+#[cfg(test)]
+use rand::rngs::StdRng;
 
-use crate::common::operation_error::OperationResult;
 use crate::common::Flusher;
-use crate::id_tracker::point_mappings::PointMappings;
+use crate::common::operation_error::OperationResult;
 use crate::id_tracker::IdTracker;
+use crate::id_tracker::point_mappings::PointMappings;
 use crate::types::{PointIdType, SeqNumberType};
 
 /// A non-persistent ID tracker for faster and more efficient building of `ImmutableIdTracker`.
@@ -23,6 +27,15 @@ impl InMemoryIdTracker {
 
     pub fn into_internal(self) -> (Vec<SeqNumberType>, PointMappings) {
         (self.internal_to_version, self.mappings)
+    }
+
+    /// Generate a random [`InMemoryIdTracker`].
+    #[cfg(test)]
+    pub fn random(rand: &mut StdRng, size: u32, preserved_size: u32, bits_in_id: u8) -> Self {
+        Self {
+            internal_to_version: vec![rand.random(); size as usize],
+            mappings: PointMappings::random_with_params(rand, size, preserved_size, bits_in_id),
+        }
     }
 }
 
@@ -144,7 +157,7 @@ impl IdTracker for InMemoryIdTracker {
             self.drop(external_id)?;
             #[cfg(debug_assertions)] // Only for dev builds
             {
-                log::debug!("dropped version for point {} without version", external_id);
+                log::debug!("dropped version for point {external_id} without version");
             }
         }
         Ok(())

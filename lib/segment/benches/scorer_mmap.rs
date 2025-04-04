@@ -1,18 +1,18 @@
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use atomic_refcell::AtomicRefCell;
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use rand::distributions::Standard;
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use rand::Rng;
+use rand::distr::StandardUniform;
 use segment::data_types::named_vectors::CowVector;
 use segment::data_types::vectors::{DenseVector, QueryVector};
 use segment::fixtures::payload_context_fixture::FixtureIdTracker;
 use segment::id_tracker::IdTrackerSS;
 use segment::types::Distance;
 use segment::vector_storage::dense::memmap_dense_vector_storage::open_memmap_vector_storage;
-use segment::vector_storage::{new_raw_scorer, VectorStorage, VectorStorageEnum};
+use segment::vector_storage::{VectorStorage, VectorStorageEnum, new_raw_scorer_for_test};
 use tempfile::Builder;
 
 #[cfg(not(target_os = "windows"))]
@@ -22,8 +22,8 @@ const NUM_VECTORS: usize = 10_000;
 const DIM: usize = 1024;
 
 fn random_vector(size: usize) -> DenseVector {
-    let rng = rand::thread_rng();
-    rng.sample_iter(Standard).take(size).collect()
+    let rng = rand::rng();
+    rng.sample_iter(StandardUniform).take(size).collect()
 }
 
 fn init_mmap_vector_storage(
@@ -62,7 +62,7 @@ fn benchmark_scorer_mmap(c: &mut Criterion) {
         b.iter_batched(
             || QueryVector::from(random_vector(DIM)),
             |vector| {
-                new_raw_scorer(
+                new_raw_scorer_for_test(
                     vector,
                     &storage,
                     borrowed_id_tracker.deleted_point_bitslice(),

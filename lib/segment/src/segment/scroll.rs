@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::iterator_ext::IteratorExt;
 
 use super::Segment;
@@ -14,10 +15,15 @@ impl Segment {
     ///
     /// If the filter is restrictive enough to yield fewer points than the amount of points a streaming
     /// approach would need to advance, it returns true.
-    pub(super) fn should_pre_filter(&self, filter: &Filter, limit: Option<usize>) -> bool {
+    pub(super) fn should_pre_filter(
+        &self,
+        filter: &Filter,
+        limit: Option<usize>,
+        hw_counter: &HardwareCounterCell,
+    ) -> bool {
         let query_cardinality = {
             let payload_index = self.payload_index.borrow();
-            payload_index.estimate_cardinality(filter)
+            payload_index.estimate_cardinality(filter, hw_counter)
         };
 
         // ToDo: Add telemetry for this heuristics
@@ -58,9 +64,10 @@ impl Segment {
         limit: Option<usize>,
         condition: &Filter,
         is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
     ) -> Vec<PointIdType> {
         let payload_index = self.payload_index.borrow();
-        let filter_context = payload_index.filter_context(condition);
+        let filter_context = payload_index.filter_context(condition, hw_counter);
         self.id_tracker
             .borrow()
             .iter_from(offset)
@@ -90,13 +97,14 @@ impl Segment {
         limit: Option<usize>,
         condition: &Filter,
         is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
     ) -> Vec<PointIdType> {
         let payload_index = self.payload_index.borrow();
         let id_tracker = self.id_tracker.borrow();
-        let cardinality_estimation = payload_index.estimate_cardinality(condition);
+        let cardinality_estimation = payload_index.estimate_cardinality(condition, hw_counter);
 
         let ids_iterator = payload_index
-            .iter_filtered_points(condition, &*id_tracker, &cardinality_estimation)
+            .iter_filtered_points(condition, &*id_tracker, &cardinality_estimation, hw_counter)
             .check_stop(|| is_stopped.load(Ordering::Relaxed))
             .filter_map(|internal_id| {
                 let external_id = id_tracker.external_id(internal_id);

@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use schemars::JsonSchema;
+use segment::common::anonymize::Anonymize;
 use segment::index::hnsw_index::num_rayon_threads;
 use segment::types::{HnswConfig, QuantizationConfig};
 use serde::{Deserialize, Serialize};
@@ -20,7 +21,8 @@ pub const DEFAULT_INDEXING_THRESHOLD_KB: usize = 20_000;
 const SEGMENTS_PATH: &str = "segments";
 const TEMP_SEGMENTS_PATH: &str = "temp_segments";
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Anonymize, Clone, PartialEq)]
+#[anonymize(false)]
 pub struct OptimizersConfig {
     /// The minimal fraction of deleted vectors in a segment, required to perform segment optimization
     #[validate(range(min = 0.0, max = 1.0))]
@@ -47,9 +49,10 @@ pub struct OptimizersConfig {
     /// If not set, will be automatically selected considering the number of available CPUs.
     #[serde(alias = "max_segment_size_kb")]
     #[serde(default)]
+    #[validate(range(min = 1))]
     pub max_segment_size: Option<usize>,
     /// Maximum size (in kilobytes) of vectors to store in-memory per segment.
-    /// Segments larger than this threshold will be stored as read-only memmaped file.
+    /// Segments larger than this threshold will be stored as read-only memmapped file.
     ///
     /// Memmap storage is disabled by default, to enable it, set this threshold to a reasonable value.
     ///
@@ -136,12 +139,10 @@ impl OptimizersConfig {
 pub fn clear_temp_segments(shard_path: &Path) {
     let temp_segments_path = shard_path.join(TEMP_SEGMENTS_PATH);
     if temp_segments_path.exists() {
-        log::debug!("Removing temp_segments directory: {:?}", temp_segments_path);
+        log::debug!("Removing temp_segments directory: {temp_segments_path:?}");
         if let Err(err) = std::fs::remove_dir_all(&temp_segments_path) {
             log::warn!(
-                "Failed to remove temp_segments directory: {:?}, error: {:?}",
-                temp_segments_path,
-                err
+                "Failed to remove temp_segments directory: {temp_segments_path:?}, error: {err:?}"
             );
         }
     }

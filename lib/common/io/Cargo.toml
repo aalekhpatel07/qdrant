@@ -6,7 +6,7 @@ authors = [
     "Qdrant Team <info@qdrant.tech>",
 ]
 license = "Apache-2.0"
-edition = "2021"
+edition = "2024"
 publish = false
 
 [lints]
@@ -14,7 +14,7 @@ workspace = true
 
 [dependencies]
 atomicwrites = { workspace = true }
-bincode = "1.3.3"
+bincode = { workspace = true }
 nix = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }

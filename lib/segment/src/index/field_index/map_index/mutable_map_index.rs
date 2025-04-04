@@ -3,6 +3,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::iter;
 use std::sync::Arc;
 
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::counter::iterator_hw_measurement::HwMeasurementIteratorExt;
 use common::types::PointOffsetType;
 use parking_lot::RwLock;
 use rocksdb::DB;
@@ -11,6 +13,7 @@ use super::{IdIter, IdRefIter, MapIndex, MapIndexKey};
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
 use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
+use crate::index::field_index::mmap_point_to_values::{MMAP_PTV_ACCESS_OVERHEAD, MmapValue};
 
 pub struct MutableMapIndex<N: MapIndexKey + ?Sized> {
     pub(super) map: HashMap<N::Owned, BTreeSet<PointOffsetType>>,
@@ -41,6 +44,7 @@ impl<N: MapIndexKey + ?Sized> MutableMapIndex<N> {
         &mut self,
         idx: PointOffsetType,
         values: Vec<Q>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()>
     where
         Q: Into<N::Owned>,
@@ -60,6 +64,9 @@ impl<N: MapIndexKey + ?Sized> MutableMapIndex<N> {
             self.point_to_values[idx as usize].push(entry.key().clone());
             let db_record = MapIndex::encode_db_record(entry.key().borrow(), idx);
             entry.or_default().insert(idx);
+            hw_counter
+                .payload_index_io_write_counter()
+                .incr_delta(db_record.len());
             self.db_wrapper.put(db_record, [])?;
         }
         self.indexed_points += 1;
@@ -120,11 +127,36 @@ impl<N: MapIndexKey + ?Sized> MutableMapIndex<N> {
         Ok(true)
     }
 
-    pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&N) -> bool) -> bool {
-        self.point_to_values
+    pub fn check_values_any(
+        &self,
+        idx: PointOffsetType,
+        hw_acc: &HardwareCounterCell,
+        check_fn: impl Fn(&N) -> bool,
+    ) -> bool {
+        // Overhead of accessing the index.
+        hw_acc
+            .payload_index_io_read_counter()
+            .incr_delta(MMAP_PTV_ACCESS_OVERHEAD);
+
+        let mut hw_counter_val = 0;
+
+        let res = self
+            .point_to_values
             .get(idx as usize)
-            .map(|values| values.iter().any(|v| check_fn(v.borrow())))
-            .unwrap_or(false)
+            .map(|values| {
+                values.iter().any(|v| {
+                    let item: &N = v.borrow();
+                    hw_counter_val += N::mmapped_size(item.as_referenced());
+                    check_fn(item)
+                })
+            })
+            .unwrap_or(false);
+
+        hw_acc
+            .payload_index_io_read_counter()
+            .incr_delta(hw_counter_val);
+
+        res
     }
 
     pub fn get_values(&self, idx: PointOffsetType) -> Option<impl Iterator<Item = &N> + '_> {
@@ -152,24 +184,51 @@ impl<N: MapIndexKey + ?Sized> MutableMapIndex<N> {
         self.map.len()
     }
 
-    pub fn get_count_for_value(&self, value: &N) -> Option<usize> {
-        self.map.get(value).map(|p| p.len())
+    pub fn get_count_for_value(
+        &self,
+        value: &N,
+        hw_counter: &HardwareCounterCell,
+    ) -> Option<usize> {
+        let counter = hw_counter.payload_index_io_read_counter();
+        self.map.get(value).map(|p| {
+            counter.incr_delta(size_of_val(p));
+            p.len()
+        })
     }
 
     pub fn iter_counts_per_value(&self) -> impl Iterator<Item = (&N, usize)> + '_ {
         self.map.iter().map(|(k, v)| (k.borrow(), v.len()))
     }
 
-    pub fn iter_values_map(&self) -> impl Iterator<Item = (&N, IdIter<'_>)> + '_ {
-        self.map
-            .iter()
-            .map(|(k, v)| (k.borrow(), Box::new(v.iter().copied()) as IdIter))
+    pub fn iter_values_map<'a>(
+        &'a self,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> impl Iterator<Item = (&'a N, IdIter<'a>)> + 'a {
+        self.map.iter().map(move |(k, v)| {
+            hw_counter
+                .payload_index_io_read_counter()
+                .incr_delta(N::mmapped_size(MmapValue::as_referenced(k.borrow())));
+
+            (
+                k.borrow(),
+                Box::new(v.iter().copied().measure_hw_with_cell(
+                    hw_counter,
+                    size_of::<PointOffsetType>(),
+                    |i| i.payload_index_io_read_counter(),
+                )) as IdIter,
+            )
+        })
     }
 
-    pub fn get_iterator(&self, value: &N) -> IdRefIter<'_> {
+    pub fn get_iterator(&self, value: &N, hw_counter: &HardwareCounterCell) -> IdRefIter<'_> {
         self.map
             .get(value)
-            .map(|ids| Box::new(ids.iter()) as Box<dyn Iterator<Item = &PointOffsetType>>)
+            .map(|ids| {
+                hw_counter
+                    .payload_index_io_read_counter()
+                    .incr_delta(size_of_val(ids));
+                Box::new(ids.iter()) as Box<dyn Iterator<Item = &PointOffsetType>>
+            })
             .unwrap_or_else(|| Box::new(iter::empty::<&PointOffsetType>()))
     }
 

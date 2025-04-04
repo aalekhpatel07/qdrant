@@ -2,12 +2,14 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use common::counter::hardware_accumulator::HwMeasurementAcc;
+use common::counter::hardware_counter::HardwareCounterCell;
 use futures::future::try_join_all;
 use itertools::Itertools as _;
-use rand::distributions::WeightedIndex;
+use rand::distr::weighted::WeightedIndex;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use segment::data_types::order_by::{Direction, OrderBy, OrderValue};
+use segment::data_types::order_by::{Direction, OrderBy};
 use segment::types::{
     ExtendedPointId, Filter, ScoredPoint, WithPayload, WithPayloadInterface, WithVector,
 };
@@ -29,10 +31,16 @@ impl LocalShard {
         batch: Arc<Vec<QueryScrollRequestInternal>>,
         search_runtime_handle: &Handle,
         timeout: Duration,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
-        let scrolls = batch
-            .iter()
-            .map(|request| self.query_scroll(request, search_runtime_handle, Some(timeout)));
+        let scrolls = batch.iter().map(|request| {
+            self.query_scroll(
+                request,
+                search_runtime_handle,
+                Some(timeout),
+                hw_measurement_acc.clone(),
+            )
+        });
 
         // execute all the scrolls concurrently
         let all_scroll_results = try_join_all(scrolls);
@@ -53,6 +61,7 @@ impl LocalShard {
         request: &QueryScrollRequestInternal,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<ScoredPoint>> {
         let QueryScrollRequestInternal {
             limit,
@@ -66,9 +75,9 @@ impl LocalShard {
 
         let offset_id = None;
 
-        let point_results = match scroll_order {
-            ScrollOrder::ById => self
-                .scroll_by_id(
+        let record_results = match scroll_order {
+            ScrollOrder::ById => {
+                self.scroll_by_id(
                     offset_id,
                     limit,
                     with_payload,
@@ -76,72 +85,49 @@ impl LocalShard {
                     filter.as_ref(),
                     search_runtime_handle,
                     timeout,
+                    hw_measurement_acc,
                 )
                 .await?
-                .into_iter()
-                .map(|record| ScoredPoint {
-                    id: record.id,
-                    version: 0,
-                    score: 0.0,
-                    payload: record.payload,
-                    vector: record.vector,
-                    shard_key: record.shard_key,
-                    order_value: None,
-                })
-                .collect(),
+            }
             ScrollOrder::ByField(order_by) => {
-                let (records, values) = self
-                    .scroll_by_field(
-                        limit,
-                        with_payload,
-                        with_vector,
-                        filter.as_ref(),
-                        search_runtime_handle,
-                        order_by,
-                        timeout,
-                    )
-                    .await?;
-
-                records
-                    .into_iter()
-                    .zip(values)
-                    .map(|(record, value)| ScoredPoint {
-                        id: record.id,
-                        version: 0,
-                        score: 0.0,
-                        payload: record.payload,
-                        vector: record.vector,
-                        shard_key: record.shard_key,
-                        order_value: Some(value),
-                    })
-                    .collect()
+                self.scroll_by_field(
+                    limit,
+                    with_payload,
+                    with_vector,
+                    filter.as_ref(),
+                    search_runtime_handle,
+                    order_by,
+                    timeout,
+                    hw_measurement_acc,
+                )
+                .await?
             }
             ScrollOrder::Random => {
-                let records = self
-                    .scroll_randomly(
-                        limit,
-                        with_payload,
-                        with_vector,
-                        filter.as_ref(),
-                        search_runtime_handle,
-                        timeout,
-                    )
-                    .await?;
-
-                records
-                    .into_iter()
-                    .map(|record| ScoredPoint {
-                        id: record.id,
-                        version: 0,
-                        score: 0.0,
-                        payload: record.payload,
-                        vector: record.vector,
-                        shard_key: record.shard_key,
-                        order_value: None,
-                    })
-                    .collect()
+                self.scroll_randomly(
+                    limit,
+                    with_payload,
+                    with_vector,
+                    filter.as_ref(),
+                    search_runtime_handle,
+                    timeout,
+                    hw_measurement_acc,
+                )
+                .await?
             }
         };
+
+        let point_results = record_results
+            .into_iter()
+            .map(|record| ScoredPoint {
+                id: record.id,
+                version: 0,
+                score: 0.0,
+                payload: record.payload,
+                vector: record.vector,
+                shard_key: record.shard_key,
+                order_value: record.order_value,
+            })
+            .collect();
 
         Ok(point_results)
     }
@@ -156,6 +142,7 @@ impl LocalShard {
         filter: Option<&Filter>,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<RecordInternal>> {
         let start = Instant::now();
         let timeout = timeout.unwrap_or(self.shared_storage_config.search_timeout);
@@ -164,7 +151,7 @@ impl LocalShard {
 
         let (non_appendable, appendable) = segments.read().split_segments();
 
-        let read_filtered = |segment: LockedSegment| {
+        let read_filtered = |segment: LockedSegment, hw_counter: HardwareCounterCell| {
             let filter = filter.cloned();
             let is_stopped = stopping_guard.get_is_stopped();
             search_runtime_handle.spawn_blocking(move || {
@@ -173,17 +160,19 @@ impl LocalShard {
                     Some(limit),
                     filter.as_ref(),
                     &is_stopped,
+                    &hw_counter,
                 )
             })
         };
 
+        let hw_counter = hw_measurement_acc.get_counter_cell();
         let all_reads = tokio::time::timeout(
             timeout,
             try_join_all(
                 non_appendable
                     .into_iter()
                     .chain(appendable)
-                    .map(read_filtered),
+                    .map(|segment| read_filtered(segment, hw_counter.fork())),
             ),
         )
         .await
@@ -210,6 +199,7 @@ impl LocalShard {
                 &with_payload,
                 with_vector,
                 search_runtime_handle,
+                hw_measurement_acc,
             ),
         )
         .await
@@ -234,7 +224,8 @@ impl LocalShard {
         search_runtime_handle: &Handle,
         order_by: &OrderBy,
         timeout: Option<Duration>,
-    ) -> CollectionResult<(Vec<RecordInternal>, Vec<OrderValue>)> {
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> CollectionResult<Vec<RecordInternal>> {
         let start = Instant::now();
         let timeout = timeout.unwrap_or(self.shared_storage_config.search_timeout);
         let stopping_guard = StoppingGuard::new();
@@ -242,20 +233,24 @@ impl LocalShard {
 
         let (non_appendable, appendable) = segments.read().split_segments();
 
-        let read_ordered_filtered = |segment: LockedSegment| {
+        let read_ordered_filtered = |segment: LockedSegment, hw_counter: &HardwareCounterCell| {
             let is_stopped = stopping_guard.get_is_stopped();
             let filter = filter.cloned();
             let order_by = order_by.clone();
 
+            let hw_counter = hw_counter.fork();
             search_runtime_handle.spawn_blocking(move || {
                 segment.get().read().read_ordered_filtered(
                     Some(limit),
                     filter.as_ref(),
                     &order_by,
                     &is_stopped,
+                    &hw_counter,
                 )
             })
         };
+
+        let hw_counter = hw_measurement_acc.get_counter_cell();
 
         let all_reads = tokio::time::timeout(
             timeout,
@@ -263,7 +258,7 @@ impl LocalShard {
                 non_appendable
                     .into_iter()
                     .chain(appendable)
-                    .map(read_ordered_filtered),
+                    .map(|segment| read_ordered_filtered(segment, &hw_counter)),
             ),
         )
         .await
@@ -297,6 +292,7 @@ impl LocalShard {
                 &with_payload,
                 with_vector,
                 search_runtime_handle,
+                hw_measurement_acc,
             ),
         )
         .await
@@ -304,12 +300,18 @@ impl LocalShard {
 
         let ordered_records = point_ids
             .iter()
-            .filter_map(|point_id| records_map.get(point_id).cloned())
+            .zip(values)
+            .filter_map(|(point_id, value)| {
+                let mut record = records_map.get(point_id).cloned()?;
+                record.order_value = Some(value);
+                Some(record)
+            })
             .collect();
 
-        Ok((ordered_records, values))
+        Ok(ordered_records)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn scroll_randomly(
         &self,
         limit: usize,
@@ -318,6 +320,7 @@ impl LocalShard {
         filter: Option<&Filter>,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<RecordInternal>> {
         let start = Instant::now();
         let timeout = timeout.unwrap_or(self.shared_storage_config.search_timeout);
@@ -326,20 +329,28 @@ impl LocalShard {
 
         let (non_appendable, appendable) = segments.read().split_segments();
 
-        let read_filtered = |segment: LockedSegment| {
+        let read_filtered = |segment: LockedSegment, hw_counter: &HardwareCounterCell| {
             let is_stopped = stopping_guard.get_is_stopped();
             let filter = filter.cloned();
 
+            let hw_counter = hw_counter.fork();
             search_runtime_handle.spawn_blocking(move || {
                 let get_segment = segment.get();
                 let read_segment = get_segment.read();
 
                 (
                     read_segment.available_point_count(),
-                    read_segment.read_random_filtered(limit, filter.as_ref(), &is_stopped),
+                    read_segment.read_random_filtered(
+                        limit,
+                        filter.as_ref(),
+                        &is_stopped,
+                        &hw_counter,
+                    ),
                 )
             })
         };
+
+        let hw_counter = hw_measurement_acc.get_counter_cell();
 
         let all_reads = tokio::time::timeout(
             timeout,
@@ -347,7 +358,7 @@ impl LocalShard {
                 non_appendable
                     .into_iter()
                     .chain(appendable)
-                    .map(read_filtered),
+                    .map(|segment| read_filtered(segment, &hw_counter)),
             ),
         )
         .await
@@ -368,7 +379,7 @@ impl LocalShard {
             ))
         })?;
 
-        let mut rng = StdRng::from_entropy();
+        let mut rng = StdRng::from_os_rng();
         let mut random_points = HashSet::with_capacity(limit);
 
         // Randomly sample points in two stages
@@ -418,6 +429,7 @@ impl LocalShard {
                 &with_payload,
                 with_vector,
                 search_runtime_handle,
+                hw_measurement_acc,
             ),
         )
         .await

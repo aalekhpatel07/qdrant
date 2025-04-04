@@ -3,6 +3,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::counter::iterator_hw_measurement::HwMeasurementIteratorExt;
+use common::mmap_hashmap::BUCKET_OFFSET_OVERHEAD;
 use common::types::PointOffsetType;
 use delegate::delegate;
 use parking_lot::RwLock;
@@ -13,7 +16,7 @@ use super::GeoMapIndex;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
 use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
-use crate::index::field_index::geo_hash::{encode_max_precision, GeoHash};
+use crate::index::field_index::geo_hash::{GeoHash, encode_max_precision};
 use crate::types::GeoPoint;
 
 pub struct MutableGeoMapIndex {
@@ -138,6 +141,7 @@ impl MutableGeoMapIndex {
         &mut self,
         idx: PointOffsetType,
         values: &[GeoPoint],
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         for added_point in values {
             let added_geo_hash: GeoHash = encode_max_precision(added_point.lon, added_point.lat)
@@ -148,7 +152,8 @@ impl MutableGeoMapIndex {
 
             self.db_wrapper.put(key, value)?;
         }
-        self.in_memory_index.add_many_geo_points(idx, values)
+        self.in_memory_index
+            .add_many_geo_points(idx, values, hw_counter)
     }
 
     pub fn points_count(&self) -> usize {
@@ -167,17 +172,24 @@ impl MutableGeoMapIndex {
         self.in_memory_index
     }
 
+    pub fn get_values(&self, idx: u32) -> Option<impl Iterator<Item = &GeoPoint> + '_> {
+        self.in_memory_index
+            .point_to_values
+            .get(idx as usize)
+            .map(|v| v.iter())
+    }
+
     delegate! {
         to self.in_memory_index {
-            pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&GeoPoint) -> bool) -> bool;
+            pub fn check_values_any(&self, idx: PointOffsetType, hw_counter: &HardwareCounterCell, check_fn: impl Fn(&GeoPoint) -> bool) -> bool;
             pub fn values_count(&self, idx: PointOffsetType) -> usize;
             pub fn points_per_hash(&self) -> impl Iterator<Item = (&GeoHash, usize)>;
-            pub fn points_of_hash(&self, hash: &GeoHash) -> usize;
-            pub fn values_of_hash(&self, hash: &GeoHash) -> usize;
+            pub fn points_of_hash(&self, hash: &GeoHash, hw_counter: &HardwareCounterCell) -> usize;
+            pub fn values_of_hash(&self, hash: &GeoHash, hw_counter: &HardwareCounterCell) -> usize;
             pub fn stored_sub_regions(
                 &self,
-                geo: &GeoHash,
-            ) -> impl Iterator<Item = PointOffsetType> + '_;
+                geo: GeoHash,
+            ) -> impl Iterator<Item = PointOffsetType>;
         }
     }
 }
@@ -204,11 +216,23 @@ impl InMemoryGeoMapIndex {
     pub fn check_values_any(
         &self,
         idx: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
         check_fn: impl Fn(&GeoPoint) -> bool,
     ) -> bool {
+        hw_counter
+            .payload_index_io_read_counter()
+            .incr_delta(BUCKET_OFFSET_OVERHEAD);
+
         self.point_to_values
             .get(idx as usize)
-            .map(|values| values.iter().any(check_fn))
+            .map(|values| {
+                values
+                    .iter()
+                    .measure_hw_with_cell(hw_counter, size_of::<GeoPoint>(), |i| {
+                        i.payload_index_io_read_counter()
+                    })
+                    .any(check_fn)
+            })
             .unwrap_or(false)
     }
 
@@ -225,11 +249,17 @@ impl InMemoryGeoMapIndex {
             .map(|(hash, count)| (hash, *count))
     }
 
-    pub fn points_of_hash(&self, hash: &GeoHash) -> usize {
+    pub fn points_of_hash(&self, hash: &GeoHash, hw_counter: &HardwareCounterCell) -> usize {
+        hw_counter
+            .payload_index_io_read_counter()
+            .incr_delta(size_of::<GeoHash>());
         self.points_per_hash.get(hash).copied().unwrap_or(0)
     }
 
-    pub fn values_of_hash(&self, hash: &GeoHash) -> usize {
+    pub fn values_of_hash(&self, hash: &GeoHash, hw_counter: &HardwareCounterCell) -> usize {
+        hw_counter
+            .payload_index_io_read_counter()
+            .incr_delta(size_of::<GeoHash>());
         self.values_per_hash.get(hash).copied().unwrap_or(0)
     }
 
@@ -281,6 +311,7 @@ impl InMemoryGeoMapIndex {
         &mut self,
         idx: PointOffsetType,
         values: &[GeoPoint],
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         if values.is_empty() {
             return Ok(());
@@ -295,9 +326,14 @@ impl InMemoryGeoMapIndex {
 
         let mut geo_hashes = vec![];
 
+        let counter = hw_counter.payload_index_io_write_counter();
+
         for added_point in values {
             let added_geo_hash: GeoHash = encode_max_precision(added_point.lon, added_point.lat)
                 .map_err(|e| OperationError::service_error(format!("Malformed geo points: {e}")))?;
+
+            counter.incr_delta(size_of_val(&added_geo_hash));
+
             geo_hashes.push(added_geo_hash);
         }
 
@@ -310,6 +346,8 @@ impl InMemoryGeoMapIndex {
             self.increment_hash_value_counts(geo_hash);
         }
 
+        counter.incr_delta(geo_hashes.len() * size_of::<PointOffsetType>());
+
         self.increment_hash_point_counts(&geo_hashes);
 
         self.points_values_count += values.len();
@@ -320,11 +358,10 @@ impl InMemoryGeoMapIndex {
 
     /// Returns an iterator over all point IDs which have the `geohash` prefix.
     /// Note. Point ID may be repeated multiple times in the iterator.
-    pub fn stored_sub_regions(&self, geo: &GeoHash) -> impl Iterator<Item = PointOffsetType> + '_ {
-        let geo_clone = *geo;
+    pub fn stored_sub_regions(&self, geo: GeoHash) -> impl Iterator<Item = PointOffsetType> + '_ {
         self.points_map
-            .range(*geo..)
-            .take_while(move |(p, _h)| p.starts_with(geo_clone))
+            .range(geo..)
+            .take_while(move |(p, _h)| p.starts_with(geo))
             .flat_map(|(_, points)| points.iter().copied())
     }
 

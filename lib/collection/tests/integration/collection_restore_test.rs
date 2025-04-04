@@ -1,17 +1,18 @@
+use collection::operations::CollectionUpdateOperations;
 use collection::operations::point_ops::{
     BatchPersisted, BatchVectorStructPersisted, PointInsertOperationsInternal, PointOperations,
     WriteOrdering,
 };
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::types::ScrollRequestInternal;
-use collection::operations::CollectionUpdateOperations;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use itertools::Itertools;
 use segment::json_path::JsonPath;
 use segment::types::{PayloadContainer, PayloadSelectorExclude, WithPayloadInterface};
 use serde_json::Value;
 use tempfile::Builder;
 
-use crate::common::{load_local_collection, simple_collection_fixture, N_SHARDS};
+use crate::common::{N_SHARDS, load_local_collection, simple_collection_fixture};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_collection_reloading() {
@@ -43,8 +44,9 @@ async fn test_collection_reloading_with_shards(shard_number: u32) {
                     payloads: None,
                 }),
             ));
+        let hw_counter = HwMeasurementAcc::new();
         collection
-            .update_from_client_simple(insert_points, true, WriteOrdering::default())
+            .update_from_client_simple(insert_points, true, WriteOrdering::default(), hw_counter)
             .await
             .unwrap();
     }
@@ -87,8 +89,9 @@ async fn test_collection_payload_reloading_with_shards(shard_number: u32) {
                     payloads: serde_json::from_str(r#"[{ "k": "v1" } , { "k": "v2"}]"#).unwrap(),
                 }),
             ));
+        let hw_counter = HwMeasurementAcc::new();
         collection
-            .update_from_client_simple(insert_points, true, WriteOrdering::default())
+            .update_from_client_simple(insert_points, true, WriteOrdering::default(), hw_counter)
             .await
             .unwrap();
     }
@@ -113,6 +116,7 @@ async fn test_collection_payload_reloading_with_shards(shard_number: u32) {
             None,
             &ShardSelectorInternal::All,
             None,
+            HwMeasurementAcc::new(),
         )
         .await
         .unwrap();
@@ -166,8 +170,9 @@ async fn test_collection_payload_custom_payload_with_shards(shard_number: u32) {
                     .unwrap(),
                 }),
             ));
+        let hw_counter = HwMeasurementAcc::new();
         collection
-            .update_from_client_simple(insert_points, true, WriteOrdering::default())
+            .update_from_client_simple(insert_points, true, WriteOrdering::default(), hw_counter)
             .await
             .unwrap();
     }
@@ -194,14 +199,17 @@ async fn test_collection_payload_custom_payload_with_shards(shard_number: u32) {
             None,
             &ShardSelectorInternal::All,
             None,
+            HwMeasurementAcc::new(),
         )
         .await
         .unwrap();
-    assert!(res_with_custom_payload.points[0]
-        .payload
-        .as_ref()
-        .expect("has payload")
-        .is_empty());
+    assert!(
+        res_with_custom_payload.points[0]
+            .payload
+            .as_ref()
+            .expect("has payload")
+            .is_empty(),
+    );
 
     match res_with_custom_payload.points[1]
         .payload
@@ -230,14 +238,17 @@ async fn test_collection_payload_custom_payload_with_shards(shard_number: u32) {
             None,
             &ShardSelectorInternal::All,
             None,
+            HwMeasurementAcc::new(),
         )
         .await
         .unwrap();
-    assert!(res_with_custom_payload.points[0]
-        .payload
-        .as_ref()
-        .expect("has payload")
-        .is_empty());
+    assert!(
+        res_with_custom_payload.points[0]
+            .payload
+            .as_ref()
+            .expect("has payload")
+            .is_empty(),
+    );
 
     assert_eq!(
         res_with_custom_payload.points[1]

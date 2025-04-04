@@ -6,6 +6,7 @@ use schemars::JsonSchema;
 use segment::common::anonymize::Anonymize;
 use serde::Serialize;
 use storage::dispatcher::Dispatcher;
+use storage::rbac::{Access, AccessRequirements};
 use storage::types::{ClusterStatus, ConsensusThreadStatus, PeerInfo, StateRole};
 
 use crate::settings::Settings;
@@ -22,7 +23,8 @@ pub struct ConsensusConfigTelemetry {
     bootstrap_timeout_sec: u64,
 }
 
-#[derive(Serialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Clone, Debug, JsonSchema, Anonymize)]
+#[anonymize(false)]
 pub struct ClusterConfigTelemetry {
     grpc_timeout_ms: u64,
     p2p: P2pConfigTelemetry,
@@ -45,19 +47,24 @@ impl From<&Settings> for ClusterConfigTelemetry {
     }
 }
 
-#[derive(Serialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Clone, Debug, JsonSchema, Anonymize)]
 pub struct ClusterStatusTelemetry {
+    #[anonymize(false)]
     pub number_of_peers: usize,
+    #[anonymize(false)]
     pub term: u64,
+    #[anonymize(false)]
     pub commit: u64,
+    #[anonymize(false)]
     pub pending_operations: usize,
     pub role: Option<StateRole>,
     pub is_voter: bool,
+    #[anonymize(value = None)]
     pub peer_id: Option<PeerId>,
     pub consensus_thread_status: ConsensusThreadStatus,
 }
 
-#[derive(Serialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Clone, Debug, JsonSchema, Anonymize)]
 pub struct ClusterTelemetry {
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,6 +72,7 @@ pub struct ClusterTelemetry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config: Option<ClusterConfigTelemetry>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[anonymize(false)]
     pub peers: Option<HashMap<PeerId, PeerInfo>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, serde_json::Value>>,
@@ -72,11 +80,17 @@ pub struct ClusterTelemetry {
 
 impl ClusterTelemetry {
     pub fn collect(
+        access: &Access,
         detail: TelemetryDetail,
         dispatcher: &Dispatcher,
         settings: &Settings,
-    ) -> ClusterTelemetry {
-        ClusterTelemetry {
+    ) -> Option<ClusterTelemetry> {
+        let global_access = AccessRequirements::new().whole();
+        if access.check_global_access(global_access).is_err() {
+            return None;
+        }
+
+        Some(ClusterTelemetry {
             enabled: settings.cluster.enabled,
             status: (detail.level >= DetailsLevel::Level1)
                 .then(|| match dispatcher.cluster_status() {
@@ -109,39 +123,6 @@ impl ClusterTelemetry {
                         .filter(|metadata| !metadata.is_empty())
                 })
                 .flatten(),
-        }
-    }
-}
-
-impl Anonymize for ClusterTelemetry {
-    fn anonymize(&self) -> Self {
-        ClusterTelemetry {
-            enabled: self.enabled,
-            status: self.status.clone().map(|x| x.anonymize()),
-            config: self.config.clone().map(|x| x.anonymize()),
-            peers: None,
-            metadata: None,
-        }
-    }
-}
-
-impl Anonymize for ClusterStatusTelemetry {
-    fn anonymize(&self) -> Self {
-        ClusterStatusTelemetry {
-            number_of_peers: self.number_of_peers,
-            term: self.term,
-            commit: self.commit,
-            pending_operations: self.pending_operations,
-            role: self.role,
-            is_voter: self.is_voter,
-            peer_id: None,
-            consensus_thread_status: self.consensus_thread_status.clone(),
-        }
-    }
-}
-
-impl Anonymize for ClusterConfigTelemetry {
-    fn anonymize(&self) -> Self {
-        self.clone()
+        })
     }
 }

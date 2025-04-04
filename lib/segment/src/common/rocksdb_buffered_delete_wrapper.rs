@@ -6,9 +6,9 @@ use parking_lot::{Mutex, RwLock};
 use rocksdb::DB;
 
 use super::rocksdb_wrapper::DatabaseColumnIterator;
+use crate::common::Flusher;
 use crate::common::operation_error::OperationResult;
 use crate::common::rocksdb_wrapper::{DatabaseColumnWrapper, LockedDatabaseColumnWrapper};
-use crate::common::Flusher;
 
 /// Wrapper around `DatabaseColumnWrapper` that ensures, that keys that were removed from the
 /// database are only persisted on flush explicitly.
@@ -114,6 +114,10 @@ impl DatabaseColumnScheduledDeleteWrapper {
     pub fn remove_column_family(&self) -> OperationResult<()> {
         self.db.remove_column_family()
     }
+
+    pub fn get_storage_size_bytes(&self) -> OperationResult<usize> {
+        self.db.get_storage_size_bytes()
+    }
 }
 
 pub struct LockedDatabaseColumnScheduledDeleteWrapper<'a> {
@@ -135,7 +139,7 @@ pub struct DatabaseColumnScheduledDeleteIterator<'a> {
     deleted_pending_persistence: &'a Mutex<HashSet<Vec<u8>>>,
 }
 
-impl<'a> Iterator for DatabaseColumnScheduledDeleteIterator<'a> {
+impl Iterator for DatabaseColumnScheduledDeleteIterator<'_> {
     type Item = (Box<[u8]>, Box<[u8]>);
 
     fn next(&mut self) -> Option<Self::Item> {

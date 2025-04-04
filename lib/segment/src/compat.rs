@@ -7,14 +7,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{
     Distance, HnswConfig, Indexes, PayloadStorageType, QuantizationConfig, SegmentConfig,
-    SegmentState, SeqNumberType, VectorDataConfig, VectorStorageType,
+    SegmentState, SeqNumberType, VectorDataConfig, VectorNameBuf, VectorStorageType,
 };
 
 #[derive(Default, Debug, Deserialize, Serialize, JsonSchema, Clone)]
 #[serde(rename_all = "snake_case")]
 #[deprecated = "use SegmentConfig instead"]
 pub struct SegmentConfigV5 {
-    pub vector_data: HashMap<String, VectorDataConfigV5>,
+    pub vector_data: HashMap<VectorNameBuf, VectorDataConfigV5>,
     /// Type of index used for search
     pub index: Indexes,
     /// Type of vector storage
@@ -124,9 +124,10 @@ pub struct SegmentStateV5 {
 
 impl From<SegmentStateV5> for SegmentState {
     fn from(old: SegmentStateV5) -> Self {
+        let SegmentStateV5 { version, config } = old;
         Self {
-            version: old.version,
-            config: old.config.into(),
+            version,
+            config: config.into(),
         }
     }
 }
@@ -141,7 +142,7 @@ mod tests {
         let old_segment = SegmentConfigV5 {
             vector_data: vec![
                 (
-                    "vec1".to_string(),
+                    "vec1".into(),
                     VectorDataConfigV5 {
                         size: 10,
                         distance: Distance::Dot,
@@ -158,7 +159,7 @@ mod tests {
                     },
                 ),
                 (
-                    "vec2".to_string(),
+                    "vec2".into(),
                     VectorDataConfigV5 {
                         size: 10,
                         distance: Distance::Dot,
@@ -223,7 +224,7 @@ mod tests {
         let old_segment = SegmentConfigV5 {
             vector_data: vec![
                 (
-                    "vec1".to_string(),
+                    "vec1".into(),
                     VectorDataConfigV5 {
                         size: 10,
                         distance: Distance::Dot,
@@ -233,7 +234,7 @@ mod tests {
                     },
                 ),
                 (
-                    "vec2".to_string(),
+                    "vec2".into(),
                     VectorDataConfigV5 {
                         size: 10,
                         distance: Distance::Dot,

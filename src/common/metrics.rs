@@ -1,7 +1,9 @@
-use prometheus::proto::{Counter, Gauge, LabelPair, Metric, MetricFamily, MetricType};
+use api::rest::models::HardwareUsage;
 use prometheus::TextEncoder;
+use prometheus::proto::{Counter, Gauge, LabelPair, Metric, MetricFamily, MetricType};
 use segment::common::operation_time_statistics::OperationDurationStatistics;
 
+use super::telemetry_ops::hardware::HardwareTelemetry;
 use crate::common::telemetry::TelemetryData;
 use crate::common::telemetry_ops::app_telemetry::{AppBuildTelemetry, AppFeaturesTelemetry};
 use crate::common::telemetry_ops::cluster_telemetry::{ClusterStatusTelemetry, ClusterTelemetry};
@@ -108,8 +110,15 @@ impl MetricsProvider for TelemetryData {
     fn add_metrics(&self, metrics: &mut Vec<MetricFamily>) {
         self.app.add_metrics(metrics);
         self.collections.add_metrics(metrics);
-        self.cluster.add_metrics(metrics);
-        self.requests.add_metrics(metrics);
+        if let Some(cluster) = &self.cluster {
+            cluster.add_metrics(metrics);
+        }
+        if let Some(requests) = &self.requests {
+            requests.add_metrics(metrics);
+        }
+        if let Some(hardware) = &self.hardware {
+            hardware.add_metrics(metrics);
+        }
         if let Some(mem) = &self.memory {
             mem.add_metrics(metrics);
         }
@@ -185,7 +194,7 @@ impl MetricsProvider for ClusterTelemetry {
             vec![gauge(if *enabled { 1.0 } else { 0.0 }, &[])],
         ));
 
-        if let Some(ref status) = status {
+        if let Some(status) = status {
             status.add_metrics(metrics);
         }
     }
@@ -312,6 +321,77 @@ impl MetricsProvider for MemoryTelemetry {
             MetricType::GAUGE,
             vec![gauge(self.retained_bytes as f64, &[])],
         ));
+    }
+}
+
+impl MetricsProvider for HardwareTelemetry {
+    fn add_metrics(&self, metrics: &mut Vec<MetricFamily>) {
+        for (collection, hw_info) in self.collection_data.iter() {
+            let HardwareUsage {
+                cpu,
+                payload_io_read,
+                payload_io_write,
+                payload_index_io_read,
+                payload_index_io_write,
+                vector_io_read,
+                vector_io_write,
+            } = hw_info;
+
+            metrics.push(metric_family(
+                "collection_hardware_metric_cpu",
+                "CPU measurements of a collection",
+                MetricType::COUNTER,
+                vec![counter(*cpu as f64, &[("id", collection)])],
+            ));
+
+            metrics.push(metric_family(
+                "collection_hardware_metric_payload_io_read",
+                "Total IO payload read metrics of a collection",
+                MetricType::COUNTER,
+                vec![counter(*payload_io_read as f64, &[("id", collection)])],
+            ));
+
+            metrics.push(metric_family(
+                "collection_hardware_metric_payload_index_io_read",
+                "Total IO payload index read metrics of a collection",
+                MetricType::COUNTER,
+                vec![counter(
+                    *payload_index_io_read as f64,
+                    &[("id", collection)],
+                )],
+            ));
+
+            metrics.push(metric_family(
+                "collection_hardware_metric_payload_index_io_write",
+                "Total IO payload index write metrics of a collection",
+                MetricType::COUNTER,
+                vec![counter(
+                    *payload_index_io_write as f64,
+                    &[("id", collection)],
+                )],
+            ));
+
+            metrics.push(metric_family(
+                "collection_hardware_metric_payload_io_write",
+                "Total IO payload write metrics of a collection",
+                MetricType::COUNTER,
+                vec![counter(*payload_io_write as f64, &[("id", collection)])],
+            ));
+
+            metrics.push(metric_family(
+                "collection_hardware_metric_vector_io_read",
+                "Total IO vector read metrics of a collection",
+                MetricType::COUNTER,
+                vec![counter(*vector_io_read as f64, &[("id", collection)])],
+            ));
+
+            metrics.push(metric_family(
+                "collection_hardware_metric_vector_io_write",
+                "Total IO vector write metrics of a collection",
+                MetricType::COUNTER,
+                vec![counter(*vector_io_write as f64, &[("id", collection)])],
+            ));
+        }
     }
 }
 

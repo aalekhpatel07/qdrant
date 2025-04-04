@@ -1,8 +1,9 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use bitvec::slice::BitSlice;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use io::file_operations::{atomic_save_json, read_json};
 use quantization::encoded_vectors_binary::{EncodedBinVector, EncodedVectorsBin};
@@ -12,8 +13,8 @@ use quantization::{
 use serde::{Deserialize, Serialize};
 
 use super::quantized_multivector_storage::{
-    create_offsets_file_from_iter, MultivectorOffset, MultivectorOffsetsStorage,
-    MultivectorOffsetsStorageMmap, QuantizedMultivectorStorage,
+    MultivectorOffset, MultivectorOffsetsStorage, MultivectorOffsetsStorageMmap,
+    QuantizedMultivectorStorage, create_offsets_file_from_iter,
 };
 use super::quantized_scorer_builder::QuantizedScorerBuilder;
 use crate::common::operation_error::{OperationError, OperationResult};
@@ -149,6 +150,7 @@ impl QuantizedVectors {
         point_deleted: &'a BitSlice,
         vec_deleted: &'a BitSlice,
         is_stopped: &'a AtomicBool,
+        hardware_counter: HardwareCounterCell,
     ) -> OperationResult<Box<dyn RawScorer + 'a>> {
         QuantizedScorerBuilder::new(
             &self.storage_impl,
@@ -159,6 +161,7 @@ impl QuantizedVectors {
             is_stopped,
             &self.distance,
             self.datatype,
+            hardware_counter,
         )
         .build()
     }
@@ -211,6 +214,10 @@ impl QuantizedVectors {
         files
     }
 
+    pub fn versioned_files(&self) -> Vec<(PathBuf, u64)> {
+        Vec::new() // TODO
+    }
+
     pub fn create(
         vector_storage: &VectorStorageEnum,
         quantization_config: &QuantizationConfig,
@@ -256,6 +263,7 @@ impl QuantizedVectors {
                 Self::create_impl(v.as_ref(), quantization_config, path, max_threads, stopped)
             }
             VectorStorageEnum::SparseSimple(_) => Err(OperationError::WrongSparse),
+            VectorStorageEnum::SparseMmap(_) => Err(OperationError::WrongSparse),
             VectorStorageEnum::MultiDenseSimple(v) => {
                 Self::create_multi_impl(v, quantization_config, path, max_threads, stopped)
             }
@@ -619,7 +627,7 @@ impl QuantizedVectors {
                 storage_builder,
                 vector_parameters,
                 scalar_config.quantile,
-                || stopped.load(Ordering::Relaxed),
+                stopped,
             )?))
         } else {
             let mmap_data_path = path.join(QUANTIZED_DATA_PATH);
@@ -634,7 +642,7 @@ impl QuantizedVectors {
                     storage_builder,
                     vector_parameters,
                     scalar_config.quantile,
-                    || stopped.load(Ordering::Relaxed),
+                    stopped,
                 )?,
             ))
         }
@@ -662,7 +670,7 @@ impl QuantizedVectors {
                 storage_builder,
                 vector_parameters,
                 scalar_config.quantile,
-                || stopped.load(Ordering::Relaxed),
+                stopped,
             )?;
             Ok(QuantizedVectorStorage::ScalarRamMulti(
                 QuantizedMultivectorStorage::new(
@@ -684,7 +692,7 @@ impl QuantizedVectors {
                 storage_builder,
                 vector_parameters,
                 scalar_config.quantile,
-                || stopped.load(Ordering::Relaxed),
+                stopped,
             )?;
             let offsets_path = path.join(QUANTIZED_OFFSETS_PATH);
             create_offsets_file_from_iter(&offsets_path, vector_parameters.count, offsets)?;
@@ -724,7 +732,7 @@ impl QuantizedVectors {
                 vector_parameters,
                 bucket_size,
                 max_threads,
-                || stopped.load(Ordering::Relaxed),
+                stopped,
             )?))
         } else {
             let mmap_data_path = path.join(QUANTIZED_DATA_PATH);
@@ -739,7 +747,7 @@ impl QuantizedVectors {
                 vector_parameters,
                 bucket_size,
                 max_threads,
-                || stopped.load(Ordering::Relaxed),
+                stopped,
             )?))
         }
     }
@@ -772,7 +780,7 @@ impl QuantizedVectors {
                 vector_parameters,
                 bucket_size,
                 max_threads,
-                || stopped.load(Ordering::Relaxed),
+                stopped,
             )?;
             Ok(QuantizedVectorStorage::PQRamMulti(
                 QuantizedMultivectorStorage::new(
@@ -795,7 +803,7 @@ impl QuantizedVectors {
                 vector_parameters,
                 bucket_size,
                 max_threads,
-                || stopped.load(Ordering::Relaxed),
+                stopped,
             )?;
             let offsets_path = path.join(QUANTIZED_OFFSETS_PATH);
             create_offsets_file_from_iter(&offsets_path, vector_parameters.count, offsets)?;
@@ -827,9 +835,7 @@ impl QuantizedVectors {
             let mut storage_builder = ChunkedVectors::<u8>::new(quantized_vector_size);
             storage_builder.try_set_capacity_exact(vector_parameters.count)?;
             Ok(QuantizedVectorStorage::BinaryRam(
-                EncodedVectorsBin::encode(vectors, storage_builder, vector_parameters, || {
-                    stopped.load(Ordering::Relaxed)
-                })?,
+                EncodedVectorsBin::encode(vectors, storage_builder, vector_parameters, stopped)?,
             ))
         } else {
             let mmap_data_path = path.join(QUANTIZED_DATA_PATH);
@@ -839,9 +845,7 @@ impl QuantizedVectors {
                 quantized_vector_size,
             )?;
             Ok(QuantizedVectorStorage::BinaryMmap(
-                EncodedVectorsBin::encode(vectors, storage_builder, vector_parameters, || {
-                    stopped.load(Ordering::Relaxed)
-                })?,
+                EncodedVectorsBin::encode(vectors, storage_builder, vector_parameters, stopped)?,
             ))
         }
     }
@@ -866,9 +870,7 @@ impl QuantizedVectors {
             let mut storage_builder = ChunkedVectors::<u8>::new(quantized_vector_size);
             storage_builder.try_set_capacity_exact(vector_parameters.count)?;
             let quantized_storage =
-                EncodedVectorsBin::encode(vectors, storage_builder, vector_parameters, || {
-                    stopped.load(Ordering::Relaxed)
-                })?;
+                EncodedVectorsBin::encode(vectors, storage_builder, vector_parameters, stopped)?;
             Ok(QuantizedVectorStorage::BinaryRamMulti(
                 QuantizedMultivectorStorage::new(
                     vector_parameters.dim,
@@ -885,9 +887,7 @@ impl QuantizedVectors {
                 quantized_vector_size,
             )?;
             let quantized_storage =
-                EncodedVectorsBin::encode(vectors, storage_builder, vector_parameters, || {
-                    stopped.load(Ordering::Relaxed)
-                })?;
+                EncodedVectorsBin::encode(vectors, storage_builder, vector_parameters, stopped)?;
             let offsets_path = path.join(QUANTIZED_OFFSETS_PATH);
             create_offsets_file_from_iter(&offsets_path, vector_parameters.count, offsets)?;
             Ok(QuantizedVectorStorage::BinaryMmapMulti(
@@ -931,5 +931,9 @@ impl QuantizedVectors {
             CompressionRatio::X32 => 8,
             CompressionRatio::X64 => 16,
         }
+    }
+
+    pub fn get_storage(&self) -> &QuantizedVectorStorage {
+        &self.storage_impl
     }
 }

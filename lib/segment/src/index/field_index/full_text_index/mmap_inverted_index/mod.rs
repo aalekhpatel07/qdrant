@@ -1,10 +1,9 @@
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use bitvec::vec::BitVec;
-use common::mmap_hashmap::MmapHashMap;
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::mmap_hashmap::{MmapHashMap, READ_ENTRY_OVERHEAD};
 use common::types::PointOffsetType;
 use memory::madvise::AdviceSetting;
 use memory::mmap_ops;
@@ -146,6 +145,7 @@ impl InvertedIndex for MmapInvertedIndex {
         &mut self,
         _idx: PointOffsetType,
         _document: super::inverted_index::Document,
+        _hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         Err(OperationError::service_error(
             "Can't add values to mmap immutable text index",
@@ -162,19 +162,28 @@ impl InvertedIndex for MmapInvertedIndex {
         }
 
         self.deleted_points.set(idx as usize, true);
-        self.point_to_tokens_count[idx as usize] = 0;
-        self.active_points_count -= 1;
+        if let Some(count) = self.point_to_tokens_count.get_mut(idx as usize) {
+            *count = 0;
+
+            // `deleted_points`'s length can be larger than `point_to_tokens_count`'s length.
+            // Only if the index is within bounds of `point_to_tokens_count`, we decrement the active points count.
+            self.active_points_count -= 1;
+        }
         true
     }
 
-    fn filter(&self, query: &ParsedQuery) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
+    fn filter<'a>(
+        &'a self,
+        query: ParsedQuery,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> Box<dyn Iterator<Item = PointOffsetType> + 'a> {
         let postings_opt: Option<Vec<_>> = query
             .tokens
             .iter()
             .map(|&token_id| match token_id {
                 None => None,
                 // if a ParsedQuery token was given an index, then it must exist in the vocabulary
-                Some(idx) => self.postings.get(idx),
+                Some(idx) => self.postings.get(idx, hw_counter),
             })
             .collect();
         let Some(posting_readers) = postings_opt else {
@@ -193,19 +202,30 @@ impl InvertedIndex for MmapInvertedIndex {
         intersect_compressed_postings_iterator(posting_readers, filter)
     }
 
-    fn get_posting_len(&self, token_id: TokenId) -> Option<usize> {
-        self.postings.get(token_id).map(|p| p.len())
+    fn get_posting_len(
+        &self,
+        token_id: TokenId,
+        hw_counter: &HardwareCounterCell,
+    ) -> Option<usize> {
+        self.postings.get(token_id, hw_counter).map(|p| p.len())
     }
 
     fn vocab_with_postings_len_iter(&self) -> impl Iterator<Item = (&str, usize)> + '_ {
-        self.iter_vocab().filter_map(|(token, &token_id)| {
+        let hw_counter = HardwareCounterCell::disposable(); // No propagation needed here because this function is only used for building HNSW index.
+
+        self.iter_vocab().filter_map(move |(token, &token_id)| {
             self.postings
-                .get(token_id)
+                .get(token_id, &hw_counter)
                 .map(|posting| (token, posting.len()))
         })
     }
 
-    fn check_match(&self, parsed_query: &ParsedQuery, point_id: PointOffsetType) -> bool {
+    fn check_match(
+        &self,
+        parsed_query: &ParsedQuery,
+        point_id: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> bool {
         if parsed_query.tokens.contains(&None) {
             return false;
         }
@@ -220,7 +240,7 @@ impl InvertedIndex for MmapInvertedIndex {
             // unwrap safety: all tokens exist in the vocabulary if it passes the above check
             .all(|query_token| {
                 self.postings
-                    .get(query_token.unwrap())
+                    .get(query_token.unwrap(), hw_counter)
                     .unwrap()
                     .contains(point_id)
             })
@@ -252,7 +272,11 @@ impl InvertedIndex for MmapInvertedIndex {
         self.active_points_count
     }
 
-    fn get_token_id(&self, token: &str) -> Option<TokenId> {
+    fn get_token_id(&self, token: &str, hw_counter: &HardwareCounterCell) -> Option<TokenId> {
+        hw_counter.payload_index_io_read_counter().incr_delta(
+            READ_ENTRY_OVERHEAD + size_of::<TokenId>(), // Avoid check overhead and assume token is always read
+        );
+
         self.vocab
             .get(token)
             .ok()

@@ -6,8 +6,8 @@ use api::rest::RecommendStrategy;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use itertools::Itertools;
 use segment::data_types::vectors::{
-    DenseVector, NamedQuery, NamedVectorStruct, TypedMultiDenseVector, VectorElementType,
-    VectorInternal, VectorRef, DEFAULT_VECTOR_NAME,
+    DEFAULT_VECTOR_NAME, DenseVector, NamedQuery, NamedVectorStruct, TypedMultiDenseVector,
+    VectorElementType, VectorInternal, VectorRef,
 };
 use segment::types::{
     Condition, ExtendedPointId, Filter, HasIdCondition, PointIdType, ScoredPoint,
@@ -19,8 +19,8 @@ use tokio::sync::RwLockReadGuard;
 use crate::collection::Collection;
 use crate::common::batching::batch_requests;
 use crate::common::fetch_vectors::{
-    convert_to_vectors, convert_to_vectors_owned, resolve_referenced_vectors_batch,
-    ReferencedVectors,
+    ReferencedVectors, convert_to_vectors, convert_to_vectors_owned,
+    resolve_referenced_vectors_batch,
 };
 use crate::common::retrieve_request_trait::RetrieveRequest;
 use crate::operations::consistency_params::ReadConsistency;
@@ -152,7 +152,7 @@ pub async fn recommend_by<'a, F, Fut>(
     read_consistency: Option<ReadConsistency>,
     shard_selector: ShardSelectorInternal,
     timeout: Option<Duration>,
-    hw_measurement_acc: &HwMeasurementAcc,
+    hw_measurement_acc: HwMeasurementAcc,
 ) -> CollectionResult<Vec<ScoredPoint>>
 where
     F: Fn(String) -> Fut,
@@ -242,7 +242,7 @@ pub async fn recommend_batch_by<'a, F, Fut>(
     collection_by_name: F,
     read_consistency: Option<ReadConsistency>,
     timeout: Option<Duration>,
-    hw_measurement_acc: &HwMeasurementAcc,
+    hw_measurement_acc: HwMeasurementAcc,
 ) -> CollectionResult<Vec<Vec<ScoredPoint>>>
 where
     F: Fn(String) -> Fut,
@@ -284,6 +284,7 @@ where
         collection_by_name,
         read_consistency,
         timeout,
+        hw_measurement_acc.clone(),
     )
     .await?;
 
@@ -319,7 +320,7 @@ where
                 read_consistency,
                 shard_selector,
                 timeout,
-                hw_measurement_acc,
+                hw_measurement_acc.clone(),
             ));
 
             Ok(())
@@ -370,7 +371,7 @@ fn recommend_by_avg_vector(
     );
 
     let vector_name = match using {
-        None => DEFAULT_VECTOR_NAME.to_string(),
+        None => DEFAULT_VECTOR_NAME.to_owned(),
         Some(UsingVector::Name(name)) => name,
     };
 

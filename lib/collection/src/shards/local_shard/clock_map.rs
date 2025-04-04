@@ -1,4 +1,4 @@
-use std::collections::{hash_map, HashMap};
+use std::collections::{HashMap, hash_map};
 use std::fmt;
 use std::path::Path;
 
@@ -249,7 +249,7 @@ impl RecoveryPoint {
             other
                 .clocks
                 .get(key)
-                .map_or(true, |&(other_tick, _token)| tick > other_tick)
+                .is_none_or(|&(other_tick, _token)| tick > other_tick)
         })
     }
 
@@ -262,7 +262,7 @@ impl RecoveryPoint {
             other
                 .clocks
                 .get(key)
-                .map_or(false, |&(other_tick, _token)| tick < other_tick)
+                .is_some_and(|&(other_tick, _token)| tick < other_tick)
         })
     }
 
@@ -368,8 +368,8 @@ impl TryFrom<api::grpc::qdrant::RecoveryPoint> for RecoveryPoint {
     type Error = Status;
 
     fn try_from(rp: api::grpc::qdrant::RecoveryPoint) -> Result<Self, Self::Error> {
-        let clocks = rp
-            .clocks
+        let api::grpc::qdrant::RecoveryPoint { clocks } = rp;
+        let clocks = clocks
             .into_iter()
             .map(|tag| {
                 (

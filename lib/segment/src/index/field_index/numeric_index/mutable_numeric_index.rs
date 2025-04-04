@@ -3,13 +3,14 @@ use std::ops::Bound;
 use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::Arc;
 
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::counter::iterator_hw_measurement::HwMeasurementIteratorExt;
 use common::types::PointOffsetType;
-use delegate::delegate;
 use parking_lot::RwLock;
 use rocksdb::DB;
 
 use super::{
-    numeric_index_storage_cf_name, Encodable, HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION,
+    Encodable, HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION, numeric_index_storage_cf_name,
 };
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
@@ -70,10 +71,22 @@ impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
         Ok(index)
     }
 
-    pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool) -> bool {
+    pub fn check_values_any(
+        &self,
+        idx: PointOffsetType,
+        check_fn: impl Fn(&T) -> bool,
+        hw_counter: &HardwareCounterCell,
+    ) -> bool {
         self.point_to_values
             .get(idx as usize)
-            .map(|values| values.iter().any(check_fn))
+            .map(|values| {
+                values
+                    .iter()
+                    .measure_hw_with_cell(hw_counter, size_of::<T>(), |i| {
+                        i.payload_index_io_read_counter()
+                    })
+                    .any(check_fn)
+            })
             .unwrap_or(false)
     }
 
@@ -93,14 +106,18 @@ impl<T: Encodable + Numericable + Default> InMemoryNumericIndex<T> {
         self.map.len()
     }
 
-    pub fn values_range(
-        &self,
+    pub fn values_range<'a>(
+        &'a self,
         start_bound: Bound<Point<T>>,
         end_bound: Bound<Point<T>>,
-    ) -> impl Iterator<Item = PointOffsetType> + '_ {
+        hw_counter: &'a HardwareCounterCell,
+    ) -> impl Iterator<Item = PointOffsetType> + 'a {
         self.map
             .range((start_bound, end_bound))
             .map(|point| point.idx)
+            .measure_hw_with_cell(hw_counter, size_of::<T>(), |i| {
+                i.payload_index_io_read_counter()
+            })
     }
 
     pub fn orderable_values_range(
@@ -243,11 +260,17 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
         &mut self,
         idx: PointOffsetType,
         values: Vec<T>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
+        let mut counter = 0;
         for value in &values {
             let key = value.encode_key(idx);
             self.db_wrapper.put(&key, idx.to_be_bytes())?;
+            counter += size_of_val(&key) + size_of_val(&idx);
         }
+        hw_counter
+            .payload_index_io_write_counter()
+            .incr_delta(counter);
         self.in_memory_index.add_many_to_list(idx, values);
         Ok(())
     }
@@ -270,25 +293,57 @@ impl<T: Encodable + Numericable + Default> MutableNumericIndex<T> {
         &self.in_memory_index.map
     }
 
-    delegate! {
-        to self.in_memory_index {
-            pub fn total_unique_values_count(&self) -> usize;
-            pub fn check_values_any(&self, idx: PointOffsetType, check_fn: impl Fn(&T) -> bool) -> bool;
-            pub fn get_points_count(&self) -> usize;
-            pub fn get_values(&self, idx: PointOffsetType) -> Option<Box<dyn Iterator<Item = T> + '_>>;
-            pub fn values_count(&self, idx: PointOffsetType) -> Option<usize>;
-            pub fn values_range(
-                &self,
-                start_bound: Bound<Point<T>>,
-                end_bound: Bound<Point<T>>,
-            ) -> impl Iterator<Item = PointOffsetType> + '_;
-            pub fn orderable_values_range(
-                &self,
-                start_bound: Bound<Point<T>>,
-                end_bound: Bound<Point<T>>,
-            ) -> impl DoubleEndedIterator<Item = (T, PointOffsetType)> + '_ ;
-            pub fn get_histogram(&self) -> &Histogram<T>;
-            pub fn get_max_values_per_point(&self) -> usize;
-        }
+    #[inline]
+    pub fn total_unique_values_count(&self) -> usize {
+        self.in_memory_index.total_unique_values_count()
+    }
+    #[inline]
+    pub fn check_values_any(
+        &self,
+        idx: PointOffsetType,
+        check_fn: impl Fn(&T) -> bool,
+        hw_counter: &HardwareCounterCell,
+    ) -> bool {
+        self.in_memory_index
+            .check_values_any(idx, check_fn, hw_counter)
+    }
+    #[inline]
+    pub fn get_points_count(&self) -> usize {
+        self.in_memory_index.get_points_count()
+    }
+    #[inline]
+    pub fn get_values(&self, idx: PointOffsetType) -> Option<Box<dyn Iterator<Item = T> + '_>> {
+        self.in_memory_index.get_values(idx)
+    }
+    #[inline]
+    pub fn values_count(&self, idx: PointOffsetType) -> Option<usize> {
+        self.in_memory_index.values_count(idx)
+    }
+    #[inline]
+    pub fn values_range<'a>(
+        &'a self,
+        start_bound: Bound<Point<T>>,
+        end_bound: Bound<Point<T>>,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> impl Iterator<Item = PointOffsetType> + 'a {
+        self.in_memory_index
+            .values_range(start_bound, end_bound, hw_counter)
+    }
+    #[inline]
+    pub fn orderable_values_range(
+        &self,
+        start_bound: Bound<Point<T>>,
+        end_bound: Bound<Point<T>>,
+    ) -> impl DoubleEndedIterator<Item = (T, PointOffsetType)> + '_ {
+        self.in_memory_index
+            .orderable_values_range(start_bound, end_bound)
+    }
+    #[inline]
+    pub fn get_histogram(&self) -> &Histogram<T> {
+        self.in_memory_index.get_histogram()
+    }
+    #[inline]
+    pub fn get_max_values_per_point(&self) -> usize {
+        self.in_memory_index.get_max_values_per_point()
     }
 }

@@ -1,19 +1,19 @@
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
-use common::cpu::CpuPermit;
-use criterion::{criterion_group, criterion_main, Criterion};
-use rand::prelude::StdRng;
+use common::budget::ResourcePermit;
+use common::counter::hardware_counter::HardwareCounterCell;
+use criterion::{Criterion, criterion_group, criterion_main};
 use rand::SeedableRng;
-use segment::data_types::vectors::{only_default_multi_vector, DEFAULT_VECTOR_NAME};
+use rand::prelude::StdRng;
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, only_default_multi_vector};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::random_multi_vector;
-use segment::index::hnsw_index::graph_links::GraphLinksRam;
+use segment::index::VectorIndex;
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
 use segment::index::hnsw_index::num_rayon_threads;
-use segment::index::VectorIndex;
-use segment::segment_constructor::build_segment;
+use segment::segment_constructor::{VectorIndexBuildArgs, build_segment};
 use segment::types::Distance::Dot;
 use segment::types::{
     HnswConfig, Indexes, MultiVectorConfig, SegmentConfig, SeqNumberType, VectorDataConfig,
@@ -54,13 +54,15 @@ fn multi_vector_search_benchmark(c: &mut Criterion) {
         payload_storage_type: Default::default(),
     };
 
+    let hw_counter = HardwareCounterCell::new();
+
     let mut segment = build_segment(segment_dir.path(), &segment_config, true).unwrap();
     for n in 0..NUM_POINTS {
         let idx = (n as u64).into();
         let multi_vec = random_multi_vector(&mut rnd, VECTOR_DIM, NUM_VECTORS_PER_POINT);
         let named_vectors = only_default_multi_vector(&multi_vec);
         segment
-            .upsert_point(n as SeqNumberType, idx, named_vectors)
+            .upsert_point(n as SeqNumberType, idx, named_vectors, &hw_counter)
             .unwrap();
     }
 
@@ -74,19 +76,25 @@ fn multi_vector_search_benchmark(c: &mut Criterion) {
         payload_m: None,
     };
     let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
-    let permit = Arc::new(CpuPermit::dummy(permit_cpu_count as u32));
+    let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
     let vector_storage = &segment.vector_data[DEFAULT_VECTOR_NAME].vector_storage;
     let quantized_vectors = &segment.vector_data[DEFAULT_VECTOR_NAME].quantized_vectors;
-    let hnsw_index = HNSWIndex::<GraphLinksRam>::open(HnswIndexOpenArgs {
-        path: hnsw_dir.path(),
-        id_tracker: segment.id_tracker.clone(),
-        vector_storage: vector_storage.clone(),
-        quantized_vectors: quantized_vectors.clone(),
-        payload_index: segment.payload_index.clone(),
-        hnsw_config,
-        permit: Some(permit),
-        stopped: &stopped,
-    })
+    let hnsw_index = HNSWIndex::build(
+        HnswIndexOpenArgs {
+            path: hnsw_dir.path(),
+            id_tracker: segment.id_tracker.clone(),
+            vector_storage: vector_storage.clone(),
+            quantized_vectors: quantized_vectors.clone(),
+            payload_index: segment.payload_index.clone(),
+            hnsw_config,
+        },
+        VectorIndexBuildArgs {
+            permit,
+            old_indices: &[],
+            gpu_device: None,
+            stopped: &stopped,
+        },
+    )
     .unwrap();
 
     // intent: bench `search` without filter

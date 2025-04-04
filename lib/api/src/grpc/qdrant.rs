@@ -210,6 +210,59 @@ pub struct ListCollectionsResponse {
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MaxOptimizationThreads {
+    #[prost(oneof = "max_optimization_threads::Variant", tags = "1, 2")]
+    pub variant: ::core::option::Option<max_optimization_threads::Variant>,
+}
+/// Nested message and enum types in `MaxOptimizationThreads`.
+pub mod max_optimization_threads {
+    #[derive(serde::Serialize)]
+    #[derive(
+        Clone,
+        Copy,
+        Debug,
+        PartialEq,
+        Eq,
+        Hash,
+        PartialOrd,
+        Ord,
+        ::prost::Enumeration
+    )]
+    #[repr(i32)]
+    pub enum Setting {
+        Auto = 0,
+    }
+    impl Setting {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Setting::Auto => "Auto",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "Auto" => Some(Self::Auto),
+                _ => None,
+            }
+        }
+    }
+    #[derive(serde::Serialize)]
+    #[allow(clippy::derive_partial_eq_without_eq)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Variant {
+        #[prost(uint64, tag = "1")]
+        Value(u64),
+        #[prost(enumeration = "Setting", tag = "2")]
+        Setting(i32),
+    }
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OptimizerStatus {
     #[prost(bool, tag = "1")]
     pub ok: bool,
@@ -226,7 +279,7 @@ pub struct HnswConfigDiff {
     pub m: ::core::option::Option<u64>,
     /// Number of neighbours to consider during the index building. Larger the value - more accurate the search, more time required to build the index.
     #[prost(uint64, optional, tag = "2")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_4"))]
+    #[validate(range(min = 4))]
     pub ef_construct: ::core::option::Option<u64>,
     /// Minimal size (in KiloBytes) of vectors for additional payload-based indexing.
     /// If the payload chunk is smaller than `full_scan_threshold` additional indexing won't be used -
@@ -269,7 +322,7 @@ pub struct SparseIndexConfig {
 pub struct WalConfigDiff {
     /// Size of a single WAL block file
     #[prost(uint64, optional, tag = "1")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub wal_capacity_mb: ::core::option::Option<u64>,
     /// Number of segments to create in advance
     #[prost(uint64, optional, tag = "2")]
@@ -282,11 +335,11 @@ pub struct WalConfigDiff {
 pub struct OptimizersConfigDiff {
     /// The minimal fraction of deleted vectors in a segment, required to perform segment optimization
     #[prost(double, optional, tag = "1")]
-    #[validate(custom(function = "crate::grpc::validate::validate_f64_range_1"))]
+    #[validate(range(min = 0.0, max = 1.0))]
     pub deleted_threshold: ::core::option::Option<f64>,
     /// The minimal number of vectors in a segment, required to perform segment optimization
     #[prost(uint64, optional, tag = "2")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_100"))]
+    #[validate(range(min = 100))]
     pub vacuum_min_vector_number: ::core::option::Option<u64>,
     /// Target amount of segments the optimizer will try to keep.
     /// Real amount of segments may vary depending on multiple parameters:
@@ -307,9 +360,10 @@ pub struct OptimizersConfigDiff {
     /// Note: 1Kb = 1 vector of size 256
     /// If not set, will be automatically selected considering the number of available CPUs.
     #[prost(uint64, optional, tag = "4")]
+    #[validate(range(min = 1))]
     pub max_segment_size: ::core::option::Option<u64>,
     /// Maximum size (in kilobytes) of vectors to store in-memory per segment.
-    /// Segments larger than this threshold will be stored as read-only memmaped file.
+    /// Segments larger than this threshold will be stored as read-only memmapped file.
     ///
     /// Memmap storage is disabled by default, to enable it, set this threshold to a reasonable value.
     ///
@@ -330,12 +384,15 @@ pub struct OptimizersConfigDiff {
     /// Interval between forced flushes.
     #[prost(uint64, optional, tag = "7")]
     pub flush_interval_sec: ::core::option::Option<u64>,
+    /// Deprecated in favor of `max_optimization_threads`
+    #[prost(uint64, optional, tag = "8")]
+    pub deprecated_max_optimization_threads: ::core::option::Option<u64>,
     /// Max number of threads (jobs) for running optimizations per shard.
     /// Note: each optimization job will also use `max_indexing_threads` threads by itself for index building.
-    /// If null - have no limit and choose dynamically to saturate CPU.
+    /// If "auto" - have no limit and choose dynamically to saturate CPU.
     /// If 0 - no optimization threads, optimizations will be disabled.
-    #[prost(uint64, optional, tag = "8")]
-    pub max_optimization_threads: ::core::option::Option<u64>,
+    #[prost(message, optional, tag = "9")]
+    pub max_optimization_threads: ::core::option::Option<MaxOptimizationThreads>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -347,9 +404,7 @@ pub struct ScalarQuantization {
     pub r#type: i32,
     /// Number of bits to use for quantization
     #[prost(float, optional, tag = "2")]
-    #[validate(
-        custom(function = "crate::grpc::validate::validate_f32_range_min_0_5_max_1")
-    )]
+    #[validate(range(min = 0.5, max = 1.0))]
     pub quantile: ::core::option::Option<f32>,
     /// If true - quantized vectors always will be stored in RAM, ignoring the config of main storage
     #[prost(bool, optional, tag = "3")]
@@ -452,6 +507,62 @@ pub struct StrictModeConfig {
     pub search_allow_exact: ::core::option::Option<bool>,
     #[prost(float, optional, tag = "8")]
     pub search_max_oversampling: ::core::option::Option<f32>,
+    #[prost(uint64, optional, tag = "9")]
+    pub upsert_max_batchsize: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "10")]
+    pub max_collection_vector_size_bytes: ::core::option::Option<u64>,
+    /// Max number of read operations per minute per replica
+    #[prost(uint32, optional, tag = "11")]
+    pub read_rate_limit: ::core::option::Option<u32>,
+    /// Max number of write operations per minute per replica
+    #[prost(uint32, optional, tag = "12")]
+    pub write_rate_limit: ::core::option::Option<u32>,
+    #[prost(uint64, optional, tag = "13")]
+    pub max_collection_payload_size_bytes: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "14")]
+    pub filter_max_conditions: ::core::option::Option<u64>,
+    #[prost(uint64, optional, tag = "15")]
+    pub condition_max_size: ::core::option::Option<u64>,
+    #[prost(message, optional, tag = "16")]
+    pub multivector_config: ::core::option::Option<StrictModeMultivectorConfig>,
+    #[prost(message, optional, tag = "17")]
+    pub sparse_config: ::core::option::Option<StrictModeSparseConfig>,
+    #[prost(uint64, optional, tag = "18")]
+    pub max_points_count: ::core::option::Option<u64>,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StrictModeSparseConfig {
+    #[prost(map = "string, message", tag = "1")]
+    pub sparse_config: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        StrictModeSparse,
+    >,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StrictModeSparse {
+    #[prost(uint64, optional, tag = "10")]
+    pub max_length: ::core::option::Option<u64>,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StrictModeMultivectorConfig {
+    #[prost(map = "string, message", tag = "1")]
+    pub multivector_config: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        StrictModeMultivector,
+    >,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StrictModeMultivector {
+    #[prost(uint64, optional, tag = "1")]
+    pub max_vectors: ::core::option::Option<u64>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -479,6 +590,7 @@ pub struct CreateCollection {
     pub optimizers_config: ::core::option::Option<OptimizersConfigDiff>,
     /// Number of shards in the collection, default is 1 for standalone, otherwise equal to the number of nodes. Minimum is 1
     #[prost(uint32, optional, tag = "7")]
+    #[validate(range(min = 1))]
     pub shard_number: ::core::option::Option<u32>,
     /// If true - point's payload will not be stored in memory
     #[prost(bool, optional, tag = "8")]
@@ -492,9 +604,11 @@ pub struct CreateCollection {
     pub vectors_config: ::core::option::Option<VectorsConfig>,
     /// Number of replicas of each shard that network tries to maintain, default = 1
     #[prost(uint32, optional, tag = "11")]
+    #[validate(range(min = 1))]
     pub replication_factor: ::core::option::Option<u32>,
     /// How many replicas should apply the operation for us to consider it successful, default = 1
     #[prost(uint32, optional, tag = "12")]
+    #[validate(range(min = 1))]
     pub write_consistency_factor: ::core::option::Option<u32>,
     /// Specify name of the other collection to copy data from
     #[prost(string, optional, tag = "13")]
@@ -511,6 +625,7 @@ pub struct CreateCollection {
     pub sparse_vectors_config: ::core::option::Option<SparseVectorConfig>,
     /// Configuration for strict mode
     #[prost(message, optional, tag = "17")]
+    #[validate(nested)]
     pub strict_mode_config: ::core::option::Option<StrictModeConfig>,
 }
 #[derive(validator::Validate)]
@@ -528,7 +643,7 @@ pub struct UpdateCollection {
     pub optimizers_config: ::core::option::Option<OptimizersConfigDiff>,
     /// Wait timeout for operation commit in seconds if blocking, if not specified - default value will be supplied
     #[prost(uint64, optional, tag = "3")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub timeout: ::core::option::Option<u64>,
     /// New configuration parameters for the collection
     #[prost(message, optional, tag = "4")]
@@ -551,6 +666,7 @@ pub struct UpdateCollection {
     pub sparse_vectors_config: ::core::option::Option<SparseVectorConfig>,
     /// New strict mode configuration
     #[prost(message, optional, tag = "9")]
+    #[validate(nested)]
     pub strict_mode_config: ::core::option::Option<StrictModeConfig>,
 }
 #[derive(validator::Validate)]
@@ -564,7 +680,7 @@ pub struct DeleteCollection {
     pub collection_name: ::prost::alloc::string::String,
     /// Wait timeout for operation commit in seconds, if not specified - default value will be supplied
     #[prost(uint64, optional, tag = "2")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub timeout: ::core::option::Option<u64>,
 }
 #[derive(serde::Serialize)]
@@ -616,9 +732,11 @@ pub struct CollectionParams {
 pub struct CollectionParamsDiff {
     /// Number of replicas of each shard that network tries to maintain
     #[prost(uint32, optional, tag = "1")]
+    #[validate(range(min = 1))]
     pub replication_factor: ::core::option::Option<u32>,
     /// How many replicas should apply the operation for us to consider it successful
     #[prost(uint32, optional, tag = "2")]
+    #[validate(range(min = 1))]
     pub write_consistency_factor: ::core::option::Option<u32>,
     /// If true - point's payload will not be stored in memory
     #[prost(bool, optional, tag = "3")]
@@ -627,18 +745,15 @@ pub struct CollectionParamsDiff {
     #[prost(uint32, optional, tag = "4")]
     pub read_fan_out_factor: ::core::option::Option<u32>,
 }
-#[derive(validator::Validate)]
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CollectionConfig {
     /// Collection parameters
     #[prost(message, optional, tag = "1")]
-    #[validate(nested)]
     pub params: ::core::option::Option<CollectionParams>,
     /// Configuration of vector index
     #[prost(message, optional, tag = "2")]
-    #[validate(nested)]
     pub hnsw_config: ::core::option::Option<HnswConfigDiff>,
     /// Configuration of the optimizers
     #[prost(message, optional, tag = "3")]
@@ -648,7 +763,6 @@ pub struct CollectionConfig {
     pub wal_config: ::core::option::Option<WalConfigDiff>,
     /// Configuration of the vector quantization
     #[prost(message, optional, tag = "5")]
-    #[validate(nested)]
     pub quantization_config: ::core::option::Option<QuantizationConfig>,
     /// Configuration of strict mode.
     #[prost(message, optional, tag = "6")]
@@ -724,7 +838,11 @@ pub struct TextIndexParams {
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct BoolIndexParams {}
+pub struct BoolIndexParams {
+    /// If true - store index on disk.
+    #[prost(bool, optional, tag = "1")]
+    pub on_disk: ::core::option::Option<bool>,
+}
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -845,7 +963,7 @@ pub struct ChangeAliases {
     pub actions: ::prost::alloc::vec::Vec<AliasOperations>,
     /// Wait timeout for operation commit in seconds, if not specified - default value will be supplied
     #[prost(uint64, optional, tag = "2")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub timeout: ::core::option::Option<u64>,
 }
 #[derive(serde::Serialize)]
@@ -1026,6 +1144,8 @@ pub struct ReshardingInfo {
     pub peer_id: u64,
     #[prost(message, optional, tag = "3")]
     pub shard_key: ::core::option::Option<ShardKey>,
+    #[prost(enumeration = "ReshardingDirection", tag = "4")]
+    pub direction: i32,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -1046,6 +1166,9 @@ pub struct CollectionClusterInfoResponse {
     /// Shard transfers
     #[prost(message, repeated, tag = "5")]
     pub shard_transfers: ::prost::alloc::vec::Vec<ShardTransferInfo>,
+    /// Resharding operations
+    #[prost(message, repeated, tag = "6")]
+    pub resharding_operations: ::prost::alloc::vec::Vec<ReshardingInfo>,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -1154,7 +1277,7 @@ pub struct UpdateCollectionClusterSetupRequest {
     pub collection_name: ::prost::alloc::string::String,
     /// Wait timeout for operation commit in seconds, if not specified - default value will be supplied
     #[prost(uint64, optional, tag = "6")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub timeout: ::core::option::Option<u64>,
     #[prost(
         oneof = "update_collection_cluster_setup_request::Operation",
@@ -1591,8 +1714,10 @@ pub enum ReplicaState {
     PartialSnapshot = 5,
     /// Shard is undergoing recovered by an external node; Normally rejects updates, accepts updates if force is true
     Recovery = 6,
-    /// Points are being migrated to this shard as part of resharding
+    /// Points are being migrated to this shard as part of scale-up resharding
     Resharding = 7,
+    /// Points are being migrated to this shard as part of scale-down resharding
+    ReshardingScaleDown = 8,
 }
 impl ReplicaState {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1609,6 +1734,7 @@ impl ReplicaState {
             ReplicaState::PartialSnapshot => "PartialSnapshot",
             ReplicaState::Recovery => "Recovery",
             ReplicaState::Resharding => "Resharding",
+            ReplicaState::ReshardingScaleDown => "ReshardingScaleDown",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1622,6 +1748,37 @@ impl ReplicaState {
             "PartialSnapshot" => Some(Self::PartialSnapshot),
             "Recovery" => Some(Self::Recovery),
             "Resharding" => Some(Self::Resharding),
+            "ReshardingScaleDown" => Some(Self::ReshardingScaleDown),
+            _ => None,
+        }
+    }
+}
+/// Resharding direction, scale up or down in number of shards
+#[derive(serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ReshardingDirection {
+    /// Scale up, add a new shard
+    Up = 0,
+    /// Scale down, remove a shard
+    Down = 1,
+}
+impl ReshardingDirection {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            ReshardingDirection::Up => "Up",
+            ReshardingDirection::Down => "Down",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "Up" => Some(Self::Up),
+            "Down" => Some(Self::Down),
             _ => None,
         }
     }
@@ -4089,6 +4246,7 @@ pub struct UpdatePointVectors {
     pub wait: ::core::option::Option<bool>,
     /// List of points and vectors to update
     #[prost(message, repeated, tag = "3")]
+    #[validate(nested)]
     pub points: ::prost::alloc::vec::Vec<PointVectors>,
     /// Write ordering guarantees
     #[prost(message, optional, tag = "4")]
@@ -4097,6 +4255,7 @@ pub struct UpdatePointVectors {
     #[prost(message, optional, tag = "5")]
     pub shard_key_selector: ::core::option::Option<ShardKeySelector>,
 }
+#[derive(validator::Validate)]
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -4106,6 +4265,7 @@ pub struct PointVectors {
     pub id: ::core::option::Option<PointId>,
     /// Named vectors to update, leave others intact
     #[prost(message, optional, tag = "2")]
+    #[validate(nested)]
     pub vectors: ::core::option::Option<Vectors>,
 }
 #[derive(validator::Validate)]
@@ -4399,7 +4559,7 @@ pub struct QuantizationSearchParams {
     /// For example, if `oversampling` is 2.4 and `limit` is 100, then 240 vectors will be pre-selected using quantized index,
     /// and then top-100 will be returned after re-scoring.
     #[prost(double, optional, tag = "3")]
-    #[validate(custom(function = "crate::grpc::validate::validate_f64_range_min_1"))]
+    #[validate(range(min = 1.0))]
     pub oversampling: ::core::option::Option<f64>,
 }
 #[derive(validator::Validate)]
@@ -4468,7 +4628,7 @@ pub struct SearchPoints {
     pub read_consistency: ::core::option::Option<ReadConsistency>,
     /// If set, overrides global timeout setting for this request. Unit is seconds.
     #[prost(uint64, optional, tag = "13")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub timeout: ::core::option::Option<u64>,
     /// Specify in which shards to look for the points, if not specified - look in all shards
     #[prost(message, optional, tag = "14")]
@@ -4493,7 +4653,7 @@ pub struct SearchBatchPoints {
     pub read_consistency: ::core::option::Option<ReadConsistency>,
     /// If set, overrides global timeout setting for this request. Unit is seconds.
     #[prost(uint64, optional, tag = "4")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub timeout: ::core::option::Option<u64>,
 }
 #[derive(serde::Serialize)]
@@ -4562,7 +4722,7 @@ pub struct SearchPointGroups {
     pub with_lookup: ::core::option::Option<WithLookup>,
     /// If set, overrides global timeout setting for this request. Unit is seconds.
     #[prost(uint64, optional, tag = "14")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub timeout: ::core::option::Option<u64>,
     /// Specify in which shards to look for the points, if not specified - look in all shards
     #[prost(message, optional, tag = "15")]
@@ -4624,7 +4784,7 @@ pub struct ScrollPoints {
     pub offset: ::core::option::Option<PointId>,
     /// Max number of result
     #[prost(uint32, optional, tag = "4")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u32_range_min_1"))]
+    #[validate(range(min = 1))]
     pub limit: ::core::option::Option<u32>,
     /// Options for specifying which payload to include or not
     #[prost(message, optional, tag = "6")]
@@ -4718,7 +4878,7 @@ pub struct RecommendPoints {
     pub negative_vectors: ::prost::alloc::vec::Vec<Vector>,
     /// If set, overrides global timeout setting for this request. Unit is seconds.
     #[prost(uint64, optional, tag = "19")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub timeout: ::core::option::Option<u64>,
     /// Specify in which shards to look for the points, if not specified - look in all shards
     #[prost(message, optional, tag = "20")]
@@ -4741,7 +4901,7 @@ pub struct RecommendBatchPoints {
     pub read_consistency: ::core::option::Option<ReadConsistency>,
     /// If set, overrides global timeout setting for this request. Unit is seconds.
     #[prost(uint64, optional, tag = "4")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub timeout: ::core::option::Option<u64>,
 }
 #[derive(validator::Validate)]
@@ -4813,7 +4973,7 @@ pub struct RecommendPointGroups {
     pub negative_vectors: ::prost::alloc::vec::Vec<Vector>,
     /// If set, overrides global timeout setting for this request. Unit is seconds.
     #[prost(uint64, optional, tag = "20")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub timeout: ::core::option::Option<u64>,
     /// Specify in which shards to look for the points, if not specified - look in all shards
     #[prost(message, optional, tag = "21")]
@@ -4911,7 +5071,7 @@ pub struct DiscoverPoints {
     pub read_consistency: ::core::option::Option<ReadConsistency>,
     /// If set, overrides global timeout setting for this request. Unit is seconds.
     #[prost(uint64, optional, tag = "13")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub timeout: ::core::option::Option<u64>,
     /// Specify in which shards to look for the points, if not specified - look in all shards
     #[prost(message, optional, tag = "14")]
@@ -4934,7 +5094,7 @@ pub struct DiscoverBatchPoints {
     pub read_consistency: ::core::option::Option<ReadConsistency>,
     /// If set, overrides global timeout setting for this request. Unit is seconds.
     #[prost(uint64, optional, tag = "4")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub timeout: ::core::option::Option<u64>,
 }
 #[derive(validator::Validate)]
@@ -5010,8 +5170,145 @@ pub struct ContextInput {
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Formula {
+    #[prost(message, optional, tag = "1")]
+    pub expression: ::core::option::Option<Expression>,
+    #[prost(map = "string, message", tag = "2")]
+    pub defaults: ::std::collections::HashMap<::prost::alloc::string::String, Value>,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Expression {
+    #[prost(
+        oneof = "expression::Variant",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17"
+    )]
+    pub variant: ::core::option::Option<expression::Variant>,
+}
+/// Nested message and enum types in `Expression`.
+pub mod expression {
+    #[derive(serde::Serialize)]
+    #[allow(clippy::derive_partial_eq_without_eq)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Variant {
+        #[prost(float, tag = "1")]
+        Constant(f32),
+        /// Payload key or reference to score.
+        #[prost(string, tag = "2")]
+        Variable(::prost::alloc::string::String),
+        /// Payload condition. If true, becomes 1.0; otherwise 0.0
+        #[prost(message, tag = "3")]
+        Condition(super::Condition),
+        /// Geographic distance in meters
+        #[prost(message, tag = "4")]
+        GeoDistance(super::GeoDistance),
+        /// Multiply
+        #[prost(message, tag = "5")]
+        Mult(super::MultExpression),
+        /// Sum
+        #[prost(message, tag = "6")]
+        Sum(super::SumExpression),
+        /// Divide
+        #[prost(message, tag = "7")]
+        Div(::prost::alloc::boxed::Box<super::DivExpression>),
+        /// Negate
+        #[prost(message, tag = "8")]
+        Neg(::prost::alloc::boxed::Box<super::Expression>),
+        /// Absolute value
+        #[prost(message, tag = "9")]
+        Abs(::prost::alloc::boxed::Box<super::Expression>),
+        /// Square root
+        #[prost(message, tag = "10")]
+        Sqrt(::prost::alloc::boxed::Box<super::Expression>),
+        /// Power
+        #[prost(message, tag = "11")]
+        Pow(::prost::alloc::boxed::Box<super::PowExpression>),
+        /// Exponential
+        #[prost(message, tag = "12")]
+        Exp(::prost::alloc::boxed::Box<super::Expression>),
+        /// Logarithm
+        #[prost(message, tag = "13")]
+        Log10(::prost::alloc::boxed::Box<super::Expression>),
+        /// Natural logarithm
+        #[prost(message, tag = "14")]
+        Ln(::prost::alloc::boxed::Box<super::Expression>),
+        /// Exponential decay
+        #[prost(message, tag = "15")]
+        ExpDecay(::prost::alloc::boxed::Box<super::DecayParamsExpression>),
+        /// Gaussian decay
+        #[prost(message, tag = "16")]
+        GaussDecay(::prost::alloc::boxed::Box<super::DecayParamsExpression>),
+        /// Linear decay
+        #[prost(message, tag = "17")]
+        LinDecay(::prost::alloc::boxed::Box<super::DecayParamsExpression>),
+    }
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GeoDistance {
+    #[prost(message, optional, tag = "1")]
+    pub origin: ::core::option::Option<GeoPoint>,
+    #[prost(string, tag = "2")]
+    pub to: ::prost::alloc::string::String,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MultExpression {
+    #[prost(message, repeated, tag = "1")]
+    pub mult: ::prost::alloc::vec::Vec<Expression>,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SumExpression {
+    #[prost(message, repeated, tag = "1")]
+    pub sum: ::prost::alloc::vec::Vec<Expression>,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DivExpression {
+    #[prost(message, optional, boxed, tag = "1")]
+    pub left: ::core::option::Option<::prost::alloc::boxed::Box<Expression>>,
+    #[prost(message, optional, boxed, tag = "2")]
+    pub right: ::core::option::Option<::prost::alloc::boxed::Box<Expression>>,
+    #[prost(float, optional, tag = "3")]
+    pub by_zero_default: ::core::option::Option<f32>,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PowExpression {
+    #[prost(message, optional, boxed, tag = "1")]
+    pub base: ::core::option::Option<::prost::alloc::boxed::Box<Expression>>,
+    #[prost(message, optional, boxed, tag = "2")]
+    pub exponent: ::core::option::Option<::prost::alloc::boxed::Box<Expression>>,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DecayParamsExpression {
+    /// The variable to decay
+    #[prost(message, optional, boxed, tag = "1")]
+    pub x: ::core::option::Option<::prost::alloc::boxed::Box<Expression>>,
+    /// The target value to start decaying from. Defaults to 0.
+    #[prost(message, optional, boxed, tag = "2")]
+    pub target: ::core::option::Option<::prost::alloc::boxed::Box<Expression>>,
+    /// The scale factor of the decay, in terms of `x`. Defaults to 1.0. Must be a non-zero positive number.
+    #[prost(float, optional, tag = "3")]
+    pub scale: ::core::option::Option<f32>,
+    /// The midpoint of the decay. Defaults to 0.5. Output will be this value when `|x - target| == scale`.
+    #[prost(float, optional, tag = "4")]
+    pub midpoint: ::core::option::Option<f32>,
+}
+#[derive(serde::Serialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Query {
-    #[prost(oneof = "query::Variant", tags = "1, 2, 3, 4, 5, 6, 7")]
+    #[prost(oneof = "query::Variant", tags = "1, 2, 3, 4, 5, 6, 7, 8")]
     pub variant: ::core::option::Option<query::Variant>,
 }
 /// Nested message and enum types in `Query`.
@@ -5041,6 +5338,9 @@ pub mod query {
         /// Sample points from the collection.
         #[prost(enumeration = "super::Sample", tag = "7")]
         Sample(i32),
+        /// Score boosting via an arbitrary formula
+        #[prost(message, tag = "8")]
+        Formula(super::Formula),
     }
 }
 #[derive(serde::Serialize)]
@@ -5103,7 +5403,7 @@ pub struct QueryPoints {
     pub score_threshold: ::core::option::Option<f32>,
     /// Max number of points. Default is 10.
     #[prost(uint64, optional, tag = "8")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub limit: ::core::option::Option<u64>,
     /// Offset of the result. Skip this many points. Default is 0.
     #[prost(uint64, optional, tag = "9")]
@@ -5125,7 +5425,7 @@ pub struct QueryPoints {
     pub lookup_from: ::core::option::Option<LookupLocation>,
     /// If set, overrides global timeout setting for this request. Unit is seconds.
     #[prost(uint64, optional, tag = "15")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub timeout: ::core::option::Option<u64>,
 }
 #[derive(validator::Validate)]
@@ -5144,7 +5444,7 @@ pub struct QueryBatchPoints {
     pub read_consistency: ::core::option::Option<ReadConsistency>,
     /// If set, overrides global timeout setting for this request. Unit is seconds.
     #[prost(uint64, optional, tag = "4")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub timeout: ::core::option::Option<u64>,
 }
 #[derive(serde::Serialize)]
@@ -5228,7 +5528,7 @@ pub struct FacetCounts {
     pub exact: ::core::option::Option<bool>,
     /// If set, overrides global timeout setting for this request. Unit is seconds.
     #[prost(uint64, optional, tag = "6")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub timeout: ::core::option::Option<u64>,
     /// Options for specifying read consistency guarantees
     #[prost(message, optional, tag = "7")]
@@ -5287,18 +5587,18 @@ pub struct SearchMatrixPoints {
     pub filter: ::core::option::Option<Filter>,
     /// How many points to select and search within. Default is 10.
     #[prost(uint64, optional, tag = "3")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_2"))]
+    #[validate(range(min = 2))]
     pub sample: ::core::option::Option<u64>,
     /// How many neighbours per sample to find. Default is 3.
     #[prost(uint64, optional, tag = "4")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub limit: ::core::option::Option<u64>,
     /// Define which vector to use for querying. If missing, the default vector is is used.
     #[prost(string, optional, tag = "5")]
     pub using: ::core::option::Option<::prost::alloc::string::String>,
     /// If set, overrides global timeout setting for this request. Unit is seconds.
     #[prost(uint64, optional, tag = "6")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub timeout: ::core::option::Option<u64>,
     /// Options for specifying read consistency guarantees
     #[prost(message, optional, tag = "7")]
@@ -5521,6 +5821,8 @@ pub struct PointsOperationResponse {
     /// Time spent to process
     #[prost(double, tag = "2")]
     pub time: f64,
+    #[prost(message, optional, tag = "3")]
+    pub usage: ::core::option::Option<HardwareUsage>,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -5727,6 +6029,8 @@ pub struct ScrollResponse {
     /// Time spent to process
     #[prost(double, tag = "3")]
     pub time: f64,
+    #[prost(message, optional, tag = "4")]
+    pub usage: ::core::option::Option<HardwareUsage>,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -5761,6 +6065,8 @@ pub struct GetResponse {
     /// Time spent to process
     #[prost(double, tag = "2")]
     pub time: f64,
+    #[prost(message, optional, tag = "3")]
+    pub usage: ::core::option::Option<HardwareUsage>,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -5995,6 +6301,12 @@ pub struct FieldCondition {
     /// Check if datetime is within a given range
     #[prost(message, optional, tag = "8")]
     pub datetime_range: ::core::option::Option<DatetimeRange>,
+    /// Check if field is empty
+    #[prost(bool, optional, tag = "9")]
+    pub is_empty: ::core::option::Option<bool>,
+    /// Check if field is null
+    #[prost(bool, optional, tag = "10")]
+    pub is_null: ::core::option::Option<bool>,
 }
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -6199,6 +6511,18 @@ pub struct GeoPoint {
 pub struct HardwareUsage {
     #[prost(uint64, tag = "1")]
     pub cpu: u64,
+    #[prost(uint64, tag = "2")]
+    pub payload_io_read: u64,
+    #[prost(uint64, tag = "3")]
+    pub payload_io_write: u64,
+    #[prost(uint64, tag = "4")]
+    pub payload_index_io_read: u64,
+    #[prost(uint64, tag = "5")]
+    pub payload_index_io_write: u64,
+    #[prost(uint64, tag = "6")]
+    pub vector_io_read: u64,
+    #[prost(uint64, tag = "7")]
+    pub vector_io_write: u64,
 }
 #[derive(serde::Serialize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -9006,6 +9330,8 @@ pub struct PointsOperationResponseInternal {
     /// Time spent to process
     #[prost(double, tag = "2")]
     pub time: f64,
+    #[prost(message, optional, tag = "3")]
+    pub usage: ::core::option::Option<HardwareUsage>,
 }
 /// Has to be backward compatible with `UpdateResult`!
 #[derive(serde::Serialize)]
@@ -9343,7 +9669,7 @@ pub mod query_shard_points {
     #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct Query {
-        #[prost(oneof = "query::Score", tags = "1, 2, 3, 4")]
+        #[prost(oneof = "query::Score", tags = "1, 2, 3, 4, 5")]
         pub score: ::core::option::Option<query::Score>,
     }
     /// Nested message and enum types in `Query`.
@@ -9364,6 +9690,9 @@ pub mod query_shard_points {
             /// Sample points
             #[prost(enumeration = "super::super::Sample", tag = "4")]
             Sample(i32),
+            /// Use an arbitrary formula to rescore points
+            #[prost(message, tag = "5")]
+            Formula(super::super::Formula),
         }
     }
     #[derive(serde::Serialize)]
@@ -9399,7 +9728,7 @@ pub struct QueryBatchPointsInternal {
     #[prost(uint32, optional, tag = "3")]
     pub shard_id: ::core::option::Option<u32>,
     #[prost(uint64, optional, tag = "4")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub timeout: ::core::option::Option<u64>,
 }
 #[derive(serde::Serialize)]
@@ -9447,7 +9776,7 @@ pub struct FacetCountsInternal {
     #[prost(uint32, tag = "6")]
     pub shard_id: u32,
     #[prost(uint64, optional, tag = "7")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u64_range_min_1"))]
+    #[validate(range(min = 1))]
     pub timeout: ::core::option::Option<u64>,
 }
 #[derive(serde::Serialize)]
@@ -9491,6 +9820,8 @@ pub struct FacetResponseInternal {
     /// Time spent to process
     #[prost(double, tag = "2")]
     pub time: f64,
+    #[prost(message, optional, tag = "3")]
+    pub usage: ::core::option::Option<HardwareUsage>,
 }
 /// Generated client implementations.
 pub mod points_internal_client {
@@ -11555,7 +11886,7 @@ pub struct AddPeerToKnownMessage {
     #[validate(custom(function = "common::validation::validate_not_empty"))]
     pub uri: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(uint32, optional, tag = "2")]
-    #[validate(custom(function = "crate::grpc::validate::validate_u32_range_min_1"))]
+    #[validate(range(min = 1))]
     pub port: ::core::option::Option<u32>,
     #[prost(uint64, tag = "3")]
     pub id: u64,

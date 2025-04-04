@@ -2,17 +2,19 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::mmap_hashmap::BUCKET_OFFSET_OVERHEAD;
 use common::types::PointOffsetType;
 use parking_lot::RwLock;
 use rocksdb::DB;
 use smol_str::SmolStr;
 
-use super::mutable_geo_index::{InMemoryGeoMapIndex, MutableGeoMapIndex};
 use super::GeoMapIndex;
+use super::mutable_geo_index::{InMemoryGeoMapIndex, MutableGeoMapIndex};
 use crate::common::operation_error::OperationResult;
 use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
 use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
-use crate::index::field_index::geo_hash::{encode_max_precision, GeoHash};
+use crate::index::field_index::geo_hash::{GeoHash, encode_max_precision};
 use crate::index::field_index::immutable_point_to_values::ImmutablePointToValues;
 use crate::types::GeoPoint;
 
@@ -73,9 +75,25 @@ impl ImmutableGeoMapIndex {
     pub fn check_values_any(
         &self,
         idx: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
         check_fn: impl Fn(&GeoPoint) -> bool,
     ) -> bool {
-        self.point_to_values.check_values_any(idx, check_fn)
+        let mut counter = 0usize;
+
+        let res = self.point_to_values.check_values_any(idx, |v| {
+            counter += 1;
+            check_fn(v)
+        });
+
+        hw_counter
+            .payload_index_io_read_counter()
+            .incr_delta(counter * size_of::<GeoPoint>() + BUCKET_OFFSET_OVERHEAD);
+
+        res
+    }
+
+    pub fn get_values(&self, idx: u32) -> Option<impl Iterator<Item = &GeoPoint> + '_> {
+        self.point_to_values.get_values(idx)
     }
 
     pub fn values_count(&self, idx: PointOffsetType) -> usize {
@@ -90,7 +108,14 @@ impl ImmutableGeoMapIndex {
             .map(|counts| (&counts.hash, counts.points as usize))
     }
 
-    pub fn points_of_hash(&self, hash: &GeoHash) -> usize {
+    pub fn points_of_hash(&self, hash: &GeoHash, hw_counter: &HardwareCounterCell) -> usize {
+        hw_counter
+            .payload_index_io_read_counter()
+            // Simulate binary search complexity as IO read estimation
+            .incr_delta(
+                (self.counts_per_hash.len() as f32).log2().ceil() as usize * size_of::<Counts>(),
+            );
+
         if let Ok(index) = self.counts_per_hash.binary_search_by(|x| x.hash.cmp(hash)) {
             self.counts_per_hash[index].points as usize
         } else {
@@ -98,7 +123,12 @@ impl ImmutableGeoMapIndex {
         }
     }
 
-    pub fn values_of_hash(&self, hash: &GeoHash) -> usize {
+    pub fn values_of_hash(&self, hash: &GeoHash, hw_counter: &HardwareCounterCell) -> usize {
+        hw_counter
+            .payload_index_io_read_counter()
+            // Simulate binary search complexity as IO read estimation
+            .incr_delta((self.counts_per_hash.len() as f32).log2().ceil() as usize);
+
         if let Ok(index) = self.counts_per_hash.binary_search_by(|x| x.hash.cmp(hash)) {
             self.counts_per_hash[index].values as usize
         } else {
@@ -199,15 +229,14 @@ impl ImmutableGeoMapIndex {
 
     /// Returns an iterator over all point IDs which have the `geohash` prefix.
     /// Note. Point ID may be repeated multiple times in the iterator.
-    pub fn stored_sub_regions(&self, geo: &GeoHash) -> impl Iterator<Item = PointOffsetType> + '_ {
-        let geo_clone = *geo;
+    pub fn stored_sub_regions(&self, geo: GeoHash) -> impl Iterator<Item = PointOffsetType> {
         let start_index = self
             .points_map
-            .binary_search_by(|(p, _h)| p.cmp(geo))
+            .binary_search_by(|(p, _h)| p.cmp(&geo))
             .unwrap_or_else(|index| index);
         self.points_map[start_index..]
             .iter()
-            .take_while(move |(p, _h)| p.starts_with(geo_clone))
+            .take_while(move |(p, _h)| p.starts_with(geo))
             .flat_map(|(_, points)| points.iter().copied())
     }
 

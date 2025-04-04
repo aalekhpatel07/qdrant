@@ -1,23 +1,23 @@
 use std::cmp;
 use std::collections::HashMap;
-use std::fs::{create_dir_all, File};
+use std::fs::{File, create_dir_all};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use atomicwrites::{AllowOverwrite, AtomicFile};
 use collection::operations::types::PeerMetadata;
 use collection::shards::shard::PeerId;
 use http::Uri;
 use parking_lot::RwLock;
-use raft::eraftpb::{ConfState, HardState, SnapshotMetadata};
 use raft::RaftState;
+use raft::eraftpb::{ConfState, HardState, SnapshotMetadata};
 use serde::{Deserialize, Serialize};
 
+use crate::StorageError;
 use crate::content_manager::consensus::entry_queue::{EntryApplyProgressQueue, EntryId};
 use crate::types::{PeerAddressById, PeerMetadataById};
-use crate::StorageError;
 
 // Deprecated, use `STATE_FILE_NAME` instead
 const STATE_FILE_NAME_CBOR: &str = "raft_state";
@@ -68,15 +68,36 @@ impl Persistent {
         &mut self,
         meta: &SnapshotMetadata,
         address_by_id: PeerAddressById,
-        metadata_by_id: PeerMetadataById,
+        mut metadata_by_id: PeerMetadataById,
+        new_cluster_metadata: HashMap<String, serde_json::Value>,
     ) -> Result<(), StorageError> {
-        *self.peer_address_by_id.write() = address_by_id;
-        *self.peer_metadata_by_id.write() = metadata_by_id;
-        self.state.conf_state = meta.get_conf_state().clone();
-        self.state.hard_state.term = cmp::max(self.state.hard_state.term, meta.term);
-        self.state.hard_state.commit = meta.index;
-        self.apply_progress_queue.set_from_snapshot(meta.index);
-        self.latest_snapshot_meta = meta.into();
+        // IF YOU ADD NEW DATA INTO `PERSISTENT` STATE, DON'T FORGET TO ALSO ADD IT INTO RAFT SNAPSHOT!
+        let Self {
+            state,
+            latest_snapshot_meta,
+            apply_progress_queue,
+            first_voter: _,
+            peer_address_by_id,
+            peer_metadata_by_id,
+            cluster_metadata,
+            this_peer_id: _,
+            path: _,
+            dirty: _,
+        } = self;
+
+        state.conf_state = meta.get_conf_state().clone();
+        state.hard_state.term = cmp::max(state.hard_state.term, meta.term);
+        state.hard_state.commit = meta.index;
+
+        apply_progress_queue.set_from_snapshot(meta.index);
+        *latest_snapshot_meta = meta.into();
+
+        metadata_by_id.retain(|peer_id, _| address_by_id.contains_key(peer_id));
+
+        *peer_address_by_id.write() = address_by_id;
+        *peer_metadata_by_id.write() = metadata_by_id;
+        *cluster_metadata = new_cluster_metadata;
+
         self.save()
     }
 
@@ -126,8 +147,29 @@ impl Persistent {
             state
         };
 
-        log::debug!("State: {:?}", state);
+        state.remove_unknown_peer_metadata()?;
+
+        log::debug!("State: {state:?}");
         Ok(state)
+    }
+
+    fn remove_unknown_peer_metadata(&self) -> Result<(), StorageError> {
+        let is_updated = {
+            let mut peer_metadata = self.peer_metadata_by_id.write();
+            let peer_metadata_len = peer_metadata.len();
+
+            let peer_address = self.peer_address_by_id.read();
+            peer_metadata.retain(|peer_id, _| peer_address.contains_key(peer_id));
+
+            // Check, if peer metadata was updated
+            peer_metadata_len != peer_metadata.len()
+        };
+
+        if is_updated {
+            self.save()?;
+        }
+
+        Ok(())
     }
 
     pub fn unapplied_entities_count(&self) -> usize {
@@ -261,7 +303,7 @@ impl Persistent {
         self.peer_metadata_by_id
             .read()
             .get(&self.this_peer_id())
-            .map_or(true, |metadata| metadata.is_different_version())
+            .is_none_or(|metadata| metadata.is_different_version())
     }
 
     pub fn this_peer_id(&self) -> PeerId {
@@ -329,7 +371,7 @@ impl Persistent {
             let writer = BufWriter::new(file);
             serde_json::to_writer(writer, self)
         });
-        log::trace!("Saved state: {:?}", self);
+        log::trace!("Saved state: {self:?}");
         self.dirty.store(result.is_err(), Ordering::Relaxed);
         Ok(result?)
     }

@@ -1,11 +1,11 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use actix_web::http::header::ContentType;
 use actix_web::http::StatusCode;
+use actix_web::http::header::ContentType;
 use actix_web::rt::time::Instant;
 use actix_web::web::Query;
-use actix_web::{get, post, web, HttpResponse, Responder};
+use actix_web::{HttpResponse, Responder, get, post, web};
 use actix_web_validator::Json;
 use collection::operations::verification::new_unchecked_verification_pass;
 use common::types::{DetailsLevel, TelemetryDetail};
@@ -39,7 +39,6 @@ fn telemetry(
     ActixAccess(access): ActixAccess,
 ) -> impl Future<Output = HttpResponse> {
     helpers::time(async move {
-        access.check_global_access(AccessRequirements::new())?;
         let anonymize = params.anonymize.unwrap_or(false);
         let details_level = params
             .details_level

@@ -32,6 +32,7 @@ use storage::content_manager::errors::StorageError;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
 use storage::rbac::{Access, AccessRequirements};
+use uuid::Uuid;
 
 pub async fn do_collection_exists(
     toc: &TableOfContent,
@@ -104,7 +105,7 @@ fn generate_even_placement(
     replication_factor: usize,
 ) -> ShardsPlacement {
     let mut exact_placement = Vec::new();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     pool.shuffle(&mut rng);
     let mut loop_iter = pool.iter().cycle();
 
@@ -157,8 +158,8 @@ pub async fn do_list_snapshots(
     access: Access,
     collection_name: &str,
 ) -> Result<Vec<SnapshotDescription>, StorageError> {
-    let collection_pass =
-        access.check_collection_access(collection_name, AccessRequirements::new().whole())?;
+    let collection_pass = access
+        .check_collection_access(collection_name, AccessRequirements::new().whole().extras())?;
     Ok(toc
         .get_collection(&collection_pass)
         .await?
@@ -172,7 +173,10 @@ pub async fn do_create_snapshot(
     collection_name: &str,
 ) -> Result<SnapshotDescription, StorageError> {
     let collection_pass = access
-        .check_collection_access(collection_name, AccessRequirements::new().write().whole())?
+        .check_collection_access(
+            collection_name,
+            AccessRequirements::new().write().whole().extras(),
+        )?
         .into_static();
 
     let result = tokio::spawn(async move { toc.create_snapshot(&collection_pass).await }).await??;
@@ -186,7 +190,7 @@ pub async fn do_get_collection_cluster(
     name: &str,
 ) -> Result<CollectionClusterInfo, StorageError> {
     let collection_pass =
-        access.check_collection_access(name, AccessRequirements::new().whole())?;
+        access.check_collection_access(name, AccessRequirements::new().whole().extras())?;
     let collection = toc.get_collection(&collection_pass).await?;
     Ok(collection.cluster_info(toc.this_peer_id).await?)
 }
@@ -200,7 +204,7 @@ pub async fn do_update_collection_cluster(
 ) -> Result<bool, StorageError> {
     let collection_pass = access.check_collection_access(
         &collection_name,
-        AccessRequirements::new().write().manage().whole(),
+        AccessRequirements::new().write().manage().whole().extras(),
     )?;
 
     if dispatcher.consensus_state().is_none() {
@@ -467,8 +471,8 @@ pub async fn do_update_collection_cluster(
             if !shard_keys_mapping.contains_key(&drop_sharding_key.shard_key) {
                 return Err(StorageError::BadRequest {
                     description: format!(
-                        "Sharding key {} does not exists for collection {}",
-                        drop_sharding_key.shard_key, collection_name
+                        "Sharding key {} does not exist for collection {collection_name}",
+                        drop_sharding_key.shard_key,
                     ),
                 });
             }
@@ -530,17 +534,27 @@ pub async fn do_update_collection_cluster(
         }
         ClusterOperations::StartResharding(op) => {
             let StartResharding {
+                uuid,
                 direction,
                 peer_id,
                 shard_key,
             } = op.start_resharding;
+
+            if !dispatcher.is_resharding_enabled() {
+                return Err(StorageError::bad_request(
+                    "resharding is only supported in Qdrant Cloud",
+                ));
+            }
+
+            // Assign random UUID if not specified by user before processing operation on all peers
+            let uuid = uuid.unwrap_or_else(Uuid::new_v4);
 
             let collection_state = collection.state().await;
 
             if let Some(shard_key) = &shard_key {
                 if !collection_state.shards_key_mapping.contains_key(shard_key) {
                     return Err(StorageError::bad_request(format!(
-                        "sharding key {shard_key} does not exists for collection {collection_name}"
+                        "sharding key {shard_key} does not exist for collection {collection_name}",
                     )));
                 }
             }
@@ -610,7 +624,7 @@ pub async fn do_update_collection_cluster(
                     .expect("select shard ID must always exist in collection state")
                     .replicas
                     .keys()
-                    .choose(&mut rand::thread_rng())
+                    .choose(&mut rand::rng())
                     .copied()
                     .unwrap(),
             };
@@ -627,6 +641,7 @@ pub async fn do_update_collection_cluster(
                     CollectionMetaOperations::Resharding(
                         collection_name.clone(),
                         ReshardingOperation::Start(ReshardKey {
+                            uuid,
                             direction,
                             peer_id,
                             shard_id,
@@ -652,6 +667,7 @@ pub async fn do_update_collection_cluster(
                     CollectionMetaOperations::Resharding(
                         collection_name.clone(),
                         ReshardingOperation::Abort(ReshardKey {
+                            uuid: state.uuid,
                             direction: state.direction,
                             peer_id: state.peer_id,
                             shard_id: state.shard_id,
@@ -715,6 +731,11 @@ pub async fn do_update_collection_cluster(
                 }
             };
 
+            let from_state = match state.direction {
+                ReshardingDirection::Up => replica_set::ReplicaState::Resharding,
+                ReshardingDirection::Down => replica_set::ReplicaState::ReshardingScaleDown,
+            };
+
             dispatcher
                 .submit_collection_meta_op(
                     CollectionMetaOperations::SetShardReplicaState(SetShardReplicaState {
@@ -722,7 +743,7 @@ pub async fn do_update_collection_cluster(
                         shard_id,
                         peer_id,
                         state: replica_set::ReplicaState::Active,
-                        from_state: Some(replica_set::ReplicaState::Resharding),
+                        from_state: Some(from_state),
                     }),
                     access,
                     wait_timeout,
@@ -746,6 +767,7 @@ pub async fn do_update_collection_cluster(
                     CollectionMetaOperations::Resharding(
                         collection_name.clone(),
                         ReshardingOperation::CommitRead(ReshardKey {
+                            uuid: state.uuid,
                             direction: state.direction,
                             peer_id: state.peer_id,
                             shard_id: state.shard_id,
@@ -774,6 +796,7 @@ pub async fn do_update_collection_cluster(
                     CollectionMetaOperations::Resharding(
                         collection_name.clone(),
                         ReshardingOperation::CommitWrite(ReshardKey {
+                            uuid: state.uuid,
                             direction: state.direction,
                             peer_id: state.peer_id,
                             shard_id: state.shard_id,

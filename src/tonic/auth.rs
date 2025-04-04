@@ -3,8 +3,8 @@ use std::task::{Context, Poll};
 
 use futures::future::BoxFuture;
 use storage::rbac::Access;
-use tonic::body::BoxBody;
 use tonic::Status;
+use tonic::body::BoxBody;
 use tower::{Layer, Service};
 
 use crate::common::auth::{AuthError, AuthKeys};
@@ -19,7 +19,7 @@ pub struct AuthMiddleware<S> {
 }
 
 async fn check(auth_keys: Arc<AuthKeys>, mut req: Request) -> Result<Request, Status> {
-    let access = auth_keys
+    let (access, inference_token) = auth_keys
         .validate_request(|key| req.headers().get(key).and_then(|val| val.to_str().ok()))
         .await
         .map_err(|e| match e {
@@ -29,9 +29,17 @@ async fn check(auth_keys: Arc<AuthKeys>, mut req: Request) -> Result<Request, St
         })?;
 
     let previous = req.extensions_mut().insert::<Access>(access);
+
     debug_assert!(
         previous.is_none(),
         "Previous access object should not exist in the request"
+    );
+
+    let previous_token = req.extensions_mut().insert(inference_token);
+
+    debug_assert!(
+        previous_token.is_none(),
+        "Previous inference token should not exist in the request"
     );
 
     Ok(req)
@@ -53,6 +61,7 @@ where
     fn call(&mut self, request: Request) -> Self::Future {
         let auth_keys = self.auth_keys.clone();
         let mut service = self.service.clone();
+
         Box::pin(async move {
             match check(auth_keys, request).await {
                 Ok(req) => service.call(req).await,

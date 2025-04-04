@@ -4,23 +4,24 @@ use std::sync::Arc;
 
 use atomic_refcell::AtomicRefCell;
 use bitvec::prelude::{BitSlice, BitVec};
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
-use rand::prelude::StdRng;
 use rand::SeedableRng;
+use rand::prelude::StdRng;
 
 use super::payload_fixtures::BOOL_KEY;
-use crate::common::operation_error::OperationResult;
 use crate::common::Flusher;
+use crate::common::operation_error::OperationResult;
 use crate::fixtures::payload_fixtures::{
-    generate_diverse_payload, FLT_KEY, GEO_KEY, INT_KEY, STR_KEY, TEXT_KEY,
+    FLT_KEY, GEO_KEY, INT_KEY, STR_KEY, TEXT_KEY, generate_diverse_payload,
 };
 use crate::id_tracker::IdTracker;
+use crate::index::PayloadIndex;
 use crate::index::plain_payload_index::PlainPayloadIndex;
 use crate::index::struct_payload_index::StructPayloadIndex;
-use crate::index::PayloadIndex;
+use crate::payload_storage::PayloadStorage;
 use crate::payload_storage::in_memory_payload_storage::InMemoryPayloadStorage;
 use crate::payload_storage::query_checker::SimpleConditionChecker;
-use crate::payload_storage::PayloadStorage;
 use crate::types::{PayloadSchemaType, PointIdType, SeqNumberType};
 
 /// Warn: Use for tests only
@@ -57,18 +58,20 @@ impl IdTracker for FixtureIdTracker {
     }
 
     fn internal_id(&self, external_id: PointIdType) -> Option<PointOffsetType> {
-        Some(match external_id {
+        match external_id {
             PointIdType::NumId(id) => {
                 assert!(id < self.ids.len() as u64);
-                id as PointOffsetType
+                let internal_id = id as PointOffsetType;
+                (!self.is_deleted_point(internal_id)).then_some(internal_id)
             }
             PointIdType::Uuid(_) => unreachable!(),
-        })
+        }
     }
 
     fn external_id(&self, internal_id: PointOffsetType) -> Option<PointIdType> {
         assert!(internal_id < self.ids.len() as PointOffsetType);
-        Some(PointIdType::NumId(u64::from(internal_id)))
+        let external_id = PointIdType::NumId(u64::from(internal_id));
+        (!self.is_deleted_point(internal_id)).then_some(external_id)
     }
 
     fn set_link(
@@ -92,12 +95,18 @@ impl IdTracker for FixtureIdTracker {
             self.ids
                 .iter()
                 .copied()
-                .map(|id| PointIdType::NumId(u64::from(id))),
+                .filter(|internal_id| !self.is_deleted_point(*internal_id))
+                .map(|internal_id| PointIdType::NumId(u64::from(internal_id))),
         )
     }
 
     fn iter_internal(&self) -> Box<dyn Iterator<Item = PointOffsetType> + '_> {
-        Box::new(self.ids.iter().copied())
+        Box::new(
+            self.ids
+                .iter()
+                .copied()
+                .filter(|internal_id| !self.is_deleted_point(*internal_id)),
+        )
     }
 
     fn iter_from(
@@ -116,8 +125,9 @@ impl IdTracker for FixtureIdTracker {
             self.ids
                 .iter()
                 .copied()
-                .skip_while(move |x| *x < start)
-                .map(|x| (PointIdType::NumId(u64::from(x)), x)),
+                .skip_while(move |internal_id| *internal_id < start)
+                .filter(|internal_id| !self.is_deleted_point(*internal_id))
+                .map(|internal_id| (PointIdType::NumId(u64::from(internal_id)), internal_id)),
         )
     }
 
@@ -189,10 +199,12 @@ pub fn create_payload_storage_fixture(num_points: usize, seed: u64) -> InMemoryP
     let mut payload_storage = InMemoryPayloadStorage::default();
     let mut rng = StdRng::seed_from_u64(seed);
 
+    let hw_counter = HardwareCounterCell::new();
+
     for id in 0..num_points {
         let payload = generate_diverse_payload(&mut rng);
         payload_storage
-            .set(id as PointOffsetType, &payload)
+            .set(id as PointOffsetType, &payload, &hw_counter)
             .unwrap();
     }
 
@@ -254,23 +266,49 @@ pub fn create_struct_payload_index(
     )
     .unwrap();
 
+    let hw_counter = HardwareCounterCell::new();
+
     index
-        .set_indexed(&STR_KEY.parse().unwrap(), PayloadSchemaType::Keyword)
+        .set_indexed(
+            &STR_KEY.parse().unwrap(),
+            PayloadSchemaType::Keyword,
+            &hw_counter,
+        )
         .unwrap();
     index
-        .set_indexed(&INT_KEY.parse().unwrap(), PayloadSchemaType::Integer)
+        .set_indexed(
+            &INT_KEY.parse().unwrap(),
+            PayloadSchemaType::Integer,
+            &hw_counter,
+        )
         .unwrap();
     index
-        .set_indexed(&FLT_KEY.parse().unwrap(), PayloadSchemaType::Float)
+        .set_indexed(
+            &FLT_KEY.parse().unwrap(),
+            PayloadSchemaType::Float,
+            &hw_counter,
+        )
         .unwrap();
     index
-        .set_indexed(&GEO_KEY.parse().unwrap(), PayloadSchemaType::Geo)
+        .set_indexed(
+            &GEO_KEY.parse().unwrap(),
+            PayloadSchemaType::Geo,
+            &hw_counter,
+        )
         .unwrap();
     index
-        .set_indexed(&TEXT_KEY.parse().unwrap(), PayloadSchemaType::Text)
+        .set_indexed(
+            &TEXT_KEY.parse().unwrap(),
+            PayloadSchemaType::Text,
+            &hw_counter,
+        )
         .unwrap();
     index
-        .set_indexed(&BOOL_KEY.parse().unwrap(), PayloadSchemaType::Bool)
+        .set_indexed(
+            &BOOL_KEY.parse().unwrap(),
+            PayloadSchemaType::Bool,
+            &hw_counter,
+        )
         .unwrap();
 
     index

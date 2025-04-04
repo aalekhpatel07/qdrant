@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  POETRY_VERSION: 1.8.5
 
 jobs:
   test:
@@ -29,12 +30,12 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get install clang
-          curl -sSL https://install.python-poetry.org | python3 -
+          curl -sSL https://install.python-poetry.org | python3 - --version $POETRY_VERSION
 
           poetry -C tests check --lock
           poetry -C tests install --no-root
       - name: Build
-        run: cargo build --features "service_debug data-consistency-check"
+        run: cargo build --features "service_debug data-consistency-check" --locked
       - name: Run integration tests
         run: poetry -C tests run ./tests/integration-tests.sh
         shell: bash
@@ -59,17 +60,17 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: |
-          curl -sSL https://install.python-poetry.org | python3 -
+          curl -sSL https://install.python-poetry.org | python3 - --version $POETRY_VERSION
 
           poetry -C tests check --lock
           poetry -C tests install --no-root
       - name: Build
-        run: cargo build --features "service_debug data-consistency-check"
+        run: cargo build --features "service_debug data-consistency-check" --locked
       - name: Run integration tests - 1 peer
         run: poetry -C tests run ./tests/integration-tests.sh distributed
         shell: bash
       - name: Run integration tests - multiple peers - pytest
-        run: poetry -C tests run pytest tests/consensus_tests
+        run: poetry -C tests run pytest tests/consensus_tests --durations=10
         timeout-minutes: 60
       - name: upload logs in case of failure
         uses: actions/upload-artifact@v4
@@ -90,7 +91,7 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: |
-          curl -sSL https://install.python-poetry.org | python3 -
+          curl -sSL https://install.python-poetry.org | python3 - --version $POETRY_VERSION
 
           poetry -C tests check --lock
           poetry -C tests install --no-root
@@ -154,7 +155,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Install dependencies
-        run: sudo apt-get install -y jq
+        run: sudo apt-get install -y clang jq
       - name: Docker build
         uses: docker/build-push-action@v6
         with:
@@ -307,7 +308,7 @@ jobs:
       - name: Install dependencies
         run: sudo apt-get install clang jq
       - name: Build
-        run: cargo build --bin qdrant
+        run: cargo build --bin qdrant --locked
       - name: Run Shard Snapshot API Tests (local)
         shell: bash
         run: |

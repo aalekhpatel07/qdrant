@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use strum::{EnumDiscriminants, EnumIter};
 use validator::Validate;
 
-use super::{split_iter_by_shard, OperationToShard, SplitByShard};
+use super::{OperationToShard, SplitByShard, split_iter_by_shard};
 use crate::hash_ring::HashRingRouter;
 
 /// This data structure is used in API interface and applied across multiple shards
@@ -65,13 +65,20 @@ impl TryFrom<SetPayloadShadow> for SetPayload {
     type Error = PointsSelectorValidationError;
 
     fn try_from(value: SetPayloadShadow) -> Result<Self, Self::Error> {
-        if value.points.is_some() || value.filter.is_some() {
+        let SetPayloadShadow {
+            payload,
+            points,
+            filter,
+            shard_key,
+            key,
+        } = value;
+        if points.is_some() || filter.is_some() {
             Ok(SetPayload {
-                payload: value.payload,
-                points: value.points,
-                filter: value.filter,
-                shard_key: value.shard_key,
-                key: value.key,
+                payload,
+                points,
+                filter,
+                shard_key,
+                key,
             })
         } else {
             Err(PointsSelectorValidationError)
@@ -120,12 +127,18 @@ impl TryFrom<DeletePayloadShadow> for DeletePayload {
     type Error = PointsSelectorValidationError;
 
     fn try_from(value: DeletePayloadShadow) -> Result<Self, Self::Error> {
-        if value.points.is_some() || value.filter.is_some() {
+        let DeletePayloadShadow {
+            keys,
+            points,
+            filter,
+            shard_key,
+        } = value;
+        if points.is_some() || filter.is_some() {
             Ok(DeletePayload {
-                keys: value.keys,
-                points: value.points,
-                filter: value.filter,
-                shard_key: value.shard_key,
+                keys,
+                points,
+                filter,
+                shard_key,
             })
         } else {
             Err(PointsSelectorValidationError)
@@ -161,13 +174,13 @@ impl PayloadOps {
         }
     }
 
-    pub fn point_ids(&self) -> Vec<PointIdType> {
+    pub fn point_ids(&self) -> Option<Vec<PointIdType>> {
         match self {
-            Self::SetPayload(op) => op.points.clone().unwrap_or(Vec::new()),
-            Self::DeletePayload(op) => op.points.clone().unwrap_or(Vec::new()),
-            Self::ClearPayload { points } => points.clone(),
-            Self::ClearPayloadByFilter(_) => Vec::new(),
-            Self::OverwritePayload(op) => op.points.clone().unwrap_or(Vec::new()),
+            Self::SetPayload(op) => op.points.clone(),
+            Self::DeletePayload(op) => op.points.clone(),
+            Self::ClearPayload { points } => Some(points.clone()),
+            Self::ClearPayloadByFilter(_) => None,
+            Self::OverwritePayload(op) => op.points.clone(),
         }
     }
 

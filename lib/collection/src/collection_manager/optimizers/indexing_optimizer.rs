@@ -281,20 +281,22 @@ impl SegmentOptimizer for IndexingOptimizer {
 mod tests {
     use std::collections::BTreeMap;
     use std::ops::Deref;
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
-    use common::cpu::CpuPermit;
+    use common::budget::ResourceBudget;
+    use common::counter::hardware_counter::HardwareCounterCell;
     use itertools::Itertools;
     use parking_lot::lock_api::RwLock;
-    use rand::thread_rng;
+    use rand::rng;
     use segment::data_types::vectors::DEFAULT_VECTOR_NAME;
     use segment::entry::entry_point::SegmentEntry;
     use segment::fixtures::index_fixtures::random_vector;
     use segment::index::hnsw_index::num_rayon_threads;
     use segment::json_path::JsonPath;
-    use segment::types::{Distance, Payload, PayloadSchemaType};
-    use serde_json::json;
+    use segment::payload_json;
+    use segment::segment_constructor::simple_segment_constructor::{VECTOR1_NAME, VECTOR2_NAME};
+    use segment::types::{Distance, PayloadSchemaType, VectorNameBuf};
     use tempfile::Builder;
 
     use super::*;
@@ -338,12 +340,12 @@ mod tests {
 
         let large_segment_id = holder.add_new(large_segment);
 
-        let vectors_config: BTreeMap<String, VectorParams> = segment_config
+        let vectors_config: BTreeMap<VectorNameBuf, VectorParams> = segment_config
             .vector_data
             .iter()
             .map(|(name, params)| {
                 (
-                    name.to_string(),
+                    name.to_owned(),
                     VectorParamsBuilder::new(params.size as u64, params.distance).build(),
                 )
             })
@@ -381,13 +383,15 @@ mod tests {
         assert!(suggested_to_optimize.contains(&large_segment_id));
 
         let permit_cpu_count = num_rayon_threads(0);
-        let permit = CpuPermit::dummy(permit_cpu_count as u32);
+        let budget = ResourceBudget::new(permit_cpu_count, permit_cpu_count);
+        let permit = budget.try_acquire(0, permit_cpu_count).unwrap();
 
         index_optimizer
             .optimize(
                 locked_holder.clone(),
                 suggested_to_optimize,
                 permit,
+                budget.clone(),
                 &stopped,
             )
             .unwrap();
@@ -413,8 +417,8 @@ mod tests {
 
         for config in configs {
             assert_eq!(config.vector_data.len(), 2);
-            assert_eq!(config.vector_data.get("vector1").unwrap().size, dim1);
-            assert_eq!(config.vector_data.get("vector2").unwrap().size, dim2);
+            assert_eq!(config.vector_data.get(VECTOR1_NAME).unwrap().size, dim1);
+            assert_eq!(config.vector_data.get(VECTOR2_NAME).unwrap().size, dim2);
         }
     }
 
@@ -422,7 +426,7 @@ mod tests {
     fn test_indexing_optimizer() {
         init();
 
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let mut holder = SegmentHolder::default();
 
         let payload_field: JsonPath = "number".parse().unwrap();
@@ -508,6 +512,8 @@ mod tests {
         index_optimizer.thresholds_config.indexing_threshold_kb = 50;
 
         // ----- CREATE AN INDEXED FIELD ------
+        let hw_counter = HardwareCounterCell::new();
+
         process_field_index_operation(
             locked_holder.deref(),
             opnum.next().unwrap(),
@@ -515,11 +521,13 @@ mod tests {
                 field_name: payload_field.clone(),
                 field_schema: Some(PayloadSchemaType::Integer.into()),
             }),
+            &hw_counter,
         )
         .unwrap();
 
         let permit_cpu_count = num_rayon_threads(0);
-        let permit = CpuPermit::dummy(permit_cpu_count as u32);
+        let budget = ResourceBudget::new(permit_cpu_count, permit_cpu_count);
+        let permit = budget.try_acquire(0, permit_cpu_count).unwrap();
 
         // ------ Plain -> Mmap & Indexed payload
         let suggested_to_optimize =
@@ -531,13 +539,14 @@ mod tests {
                 locked_holder.clone(),
                 suggested_to_optimize,
                 permit,
+                budget.clone(),
                 &stopped,
             )
             .unwrap();
         eprintln!("Done");
 
         // ------ Plain -> Indexed payload
-        let permit = CpuPermit::dummy(permit_cpu_count as u32);
+        let permit = budget.try_acquire(0, permit_cpu_count).unwrap();
         let suggested_to_optimize =
             index_optimizer.check_condition(locked_holder.clone(), &excluded_ids);
         assert!(suggested_to_optimize.contains(&middle_segment_id));
@@ -546,6 +555,7 @@ mod tests {
                 locked_holder.clone(),
                 suggested_to_optimize,
                 permit,
+                budget.clone(),
                 &stopped,
             )
             .unwrap();
@@ -609,7 +619,7 @@ mod tests {
             );
         }
 
-        let point_payload: Payload = json!({"number":10000i64}).into();
+        let point_payload = payload_json! {"number": 10000i64};
 
         let batch = BatchPersisted {
             ids: vec![501.into(), 502.into(), 503.into()],
@@ -634,10 +644,13 @@ mod tests {
             .unwrap()
             .num_vectors;
 
+        let hw_counter = HardwareCounterCell::new();
+
         process_point_operation(
             locked_holder.deref(),
             opnum.next().unwrap(),
             insert_point_ops,
+            &hw_counter,
         )
         .unwrap();
 
@@ -661,7 +674,7 @@ mod tests {
         // ---- New appendable segment should be created if none left
 
         // Index even the smallest segment
-        let permit = CpuPermit::dummy(permit_cpu_count as u32);
+        let permit = budget.try_acquire(0, permit_cpu_count).unwrap();
         index_optimizer.thresholds_config.indexing_threshold_kb = 20;
         let suggested_to_optimize =
             index_optimizer.check_condition(locked_holder.clone(), &Default::default());
@@ -671,6 +684,7 @@ mod tests {
                 locked_holder.clone(),
                 suggested_to_optimize,
                 permit,
+                budget.clone(),
                 &stopped,
             )
             .unwrap();
@@ -708,6 +722,7 @@ mod tests {
             locked_holder.deref(),
             opnum.next().unwrap(),
             insert_point_ops,
+            &hw_counter,
         )
         .unwrap();
     }
@@ -770,6 +785,7 @@ mod tests {
         );
 
         let permit_cpu_count = num_rayon_threads(0);
+        let budget = ResourceBudget::new(permit_cpu_count, permit_cpu_count);
 
         // Index until all segments are indexed
         let mut numer_of_optimizations = 0;
@@ -779,14 +795,15 @@ mod tests {
             if suggested_to_optimize.is_empty() {
                 break;
             }
-            log::debug!("suggested_to_optimize = {:#?}", suggested_to_optimize);
+            log::debug!("suggested_to_optimize = {suggested_to_optimize:#?}");
 
-            let permit = CpuPermit::dummy(permit_cpu_count as u32);
+            let permit = budget.try_acquire(0, permit_cpu_count).unwrap();
             index_optimizer
                 .optimize(
                     locked_holder.clone(),
                     suggested_to_optimize,
                     permit,
+                    budget.clone(),
                     &stopped,
                 )
                 .unwrap();
@@ -794,9 +811,7 @@ mod tests {
             assert!(numer_of_optimizations <= number_of_segments);
             let number_of_segments = locked_holder.read().len();
             log::debug!(
-                "numer_of_optimizations = {}, number_of_segments = {}",
-                numer_of_optimizations,
-                number_of_segments
+                "numer_of_optimizations = {numer_of_optimizations}, number_of_segments = {number_of_segments}"
             );
         }
 
@@ -907,7 +922,9 @@ mod tests {
                 .filter(|segment| segment.total_point_count() > 0)
                 .for_each(|segment| {
                     assert!(
-                        !segment.config().vector_data[""].storage_type.is_on_disk(),
+                        !segment.config().vector_data[DEFAULT_VECTOR_NAME]
+                            .storage_type
+                            .is_on_disk(),
                         "segment must not be on disk with mmap",
                     );
                 });
@@ -916,7 +933,7 @@ mod tests {
         // Remove explicit on_disk flag and go back to default
         collection_params
             .vectors
-            .get_params_mut("")
+            .get_params_mut(DEFAULT_VECTOR_NAME)
             .unwrap()
             .on_disk
             .take();
@@ -941,7 +958,8 @@ mod tests {
         );
 
         let permit_cpu_count = num_rayon_threads(0);
-        let permit = CpuPermit::dummy(permit_cpu_count as u32);
+        let budget = ResourceBudget::new(permit_cpu_count, permit_cpu_count);
+        let permit = budget.try_acquire(0, permit_cpu_count).unwrap();
 
         // Use indexing optimizer to build mmap
         let changed = index_optimizer
@@ -949,6 +967,7 @@ mod tests {
                 locked_holder.clone(),
                 vec![segment_id],
                 permit,
+                budget.clone(),
                 &false.into(),
             )
             .unwrap();
@@ -978,7 +997,9 @@ mod tests {
             .filter(|segment| segment.total_point_count() > 0)
             .for_each(|segment| {
                 assert!(
-                    segment.config().vector_data[""].storage_type.is_on_disk(),
+                    segment.config().vector_data[DEFAULT_VECTOR_NAME]
+                        .storage_type
+                        .is_on_disk(),
                     "segment must be on disk with mmap",
                 );
             });

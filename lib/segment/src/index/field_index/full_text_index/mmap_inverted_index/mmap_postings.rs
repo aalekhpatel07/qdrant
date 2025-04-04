@@ -2,11 +2,13 @@ use std::io;
 use std::io::Write;
 use std::path::PathBuf;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
+use common::zeros::WriteZerosExt;
 use memmap2::Mmap;
 use memory::madvise::{Advice, AdviceSetting};
 use memory::mmap_ops::open_read_mmap;
-use zerocopy::{AsBytes, FromBytes, FromZeroes};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::index::field_index::full_text_index::compressed_posting::compressed_chunks_reader::ChunkReader;
 use crate::index::field_index::full_text_index::compressed_posting::compressed_common::CompressedPostingChunksIndex;
@@ -15,7 +17,7 @@ use crate::index::field_index::full_text_index::inverted_index::TokenId;
 
 const ALIGNMENT: usize = 4;
 
-#[derive(Debug, Default, Clone, AsBytes, FromBytes, FromZeroes)]
+#[derive(Debug, Default, Clone, FromBytes, Immutable, IntoBytes, KnownLayout)]
 #[repr(C)]
 struct PostingsHeader {
     /// Number of posting lists. One posting list per term
@@ -25,7 +27,7 @@ struct PostingsHeader {
 
 /// This data structure should contain all the necessary information to
 /// construct `CompressedMmapPostingList` from the mmap file.
-#[derive(Debug, Default, Clone, AsBytes, FromBytes, FromZeroes)]
+#[derive(Debug, Default, Clone, FromBytes, Immutable, IntoBytes, KnownLayout)]
 #[repr(C)]
 struct PostingListHeader {
     /// Offset in bytes from the start of the mmap file
@@ -60,7 +62,7 @@ impl PostingListHeader {
 /// [ PostingListHeader, PostingListHeader, ... ] |
 /// [ CompressedMmapPostingList, CompressedMmapPostingList, ... ] |`
 pub struct MmapPostings {
-    path: PathBuf,
+    _path: PathBuf,
     mmap: Mmap,
     header: PostingsHeader,
 }
@@ -73,66 +75,68 @@ impl MmapPostings {
 
         let header_offset =
             size_of::<PostingsHeader>() + token_id as usize * size_of::<PostingListHeader>();
-        let header_bytes = self
-            .mmap
-            .get(header_offset..header_offset + size_of::<PostingListHeader>())?;
 
-        PostingListHeader::ref_from(header_bytes)
+        PostingListHeader::ref_from_prefix(self.mmap.get(header_offset..)?)
+            .ok()
+            .map(|(header, _)| header)
     }
 
     /// Create ChunkReader from the given header
     ///
     /// Assume the following layout:
     ///
-    /// * `last_doc_id: &'a PointOffsetType,`
-    /// * `chunks_index: &'a [CompressedPostingChunksIndex],`
-    /// * `data: &'a [u8],`
-    /// * `_alignment: &'a [u8], // 0-3 extra bytes to align the data`
-    /// * `remainder_postings: &'a [PointOffsetType],`
+    /// ```ignore
+    /// last_doc_id: &'a PointOffsetType,
+    /// chunks_index: &'a [CompressedPostingChunksIndex],
+    /// data: &'a [u8],
+    /// _alignment: &'a [u8], // 0-3 extra bytes to align the data
+    /// remainder_postings: &'a [PointOffsetType],
     /// ```
-    fn get_reader(&self, header: &PostingListHeader) -> Option<ChunkReader<'_>> {
-        let offset = header.offset as usize;
-        let chunks_len = header.chunks_count as usize;
-        let data_len = header.data_bytes_count as usize;
-        let alignment_len = header.alignment_bytes_count as usize;
-        let remainder_len = header.remainder_count as usize;
+    fn get_reader<'a>(
+        &'a self,
+        header: &PostingListHeader,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> Option<ChunkReader<'a>> {
+        let counter = hw_counter.payload_index_io_read_counter();
 
-        let last_doc_id_bytes = size_of::<PointOffsetType>();
-        let chunks_size_bytes = chunks_len * size_of::<CompressedPostingChunksIndex>();
-        let data_size_bytes = data_len;
-        let alignment_size_bytes = alignment_len;
-        let remainder_size_bytes = remainder_len * size_of::<PointOffsetType>();
+        let bytes = self.mmap.get(header.offset as usize..)?;
+        counter.incr_delta(size_of::<PointOffsetType>());
 
-        let last_doc_id_offset = offset;
-        let chunks_offset = last_doc_id_offset + last_doc_id_bytes;
-        let data_offset = chunks_offset + chunks_size_bytes;
-        let alignment_offset = data_offset + data_size_bytes;
-        let remainder_offset = alignment_offset + alignment_size_bytes;
+        let (last_doc_id, bytes) = PointOffsetType::read_from_prefix(bytes).ok()?;
 
-        let last_doc_id_mem = self.mmap.get(last_doc_id_offset..chunks_offset)?;
-        let last_doc_id = u32::read_from(last_doc_id_mem)?;
+        counter.incr_delta(size_of::<CompressedPostingChunksIndex>());
+        let (chunks, bytes) = <[CompressedPostingChunksIndex]>::ref_from_prefix_with_elems(
+            bytes,
+            header.chunks_count as usize,
+        )
+        .ok()?;
+        let (data, bytes) = bytes.split_at(header.data_bytes_count as usize);
+        let bytes = bytes.get(header.alignment_bytes_count as usize..)?;
 
-        let chunks_mem = self.mmap.get(chunks_offset..data_offset)?;
-        let chunks = CompressedPostingChunksIndex::slice_from(chunks_mem)?;
-
-        let data = self.mmap.get(data_offset..alignment_offset)?;
-
-        let remainder_mem = self
-            .mmap
-            .get(remainder_offset..remainder_offset + remainder_size_bytes)?;
-        let remainder_postings = u32::slice_from(remainder_mem)?;
+        let (remainder_postings, _) =
+            <[u32]>::ref_from_prefix_with_elems(bytes, header.remainder_count as usize).ok()?;
 
         Some(ChunkReader::new(
             last_doc_id,
             chunks,
             data,
             remainder_postings,
+            hw_counter,
         ))
     }
 
-    pub fn get(&self, token_id: TokenId) -> Option<ChunkReader<'_>> {
+    pub fn get<'a>(
+        &'a self,
+        token_id: TokenId,
+        hw_counter: &'a HardwareCounterCell,
+    ) -> Option<ChunkReader<'a>> {
+        hw_counter
+            .payload_index_io_read_counter()
+            .incr_delta(size_of::<PostingListHeader>());
+
         let header = self.get_header(token_id)?;
-        self.get_reader(header)
+
+        self.get_reader(header, hw_counter)
     }
 
     /// Given a vector of compressed posting lists, this function writes them to the `path` file.
@@ -191,14 +195,9 @@ impl MmapPostings {
             bufw.write_all(data)?;
 
             // Example:
-            // For data size = 5, alignment_len = 3 as (5 + 3 = 8)
-            // alignment_len = 4 - 5 % 4 = 3
-            let alignment_len = ALIGNMENT - data.len() % ALIGNMENT;
-
-            if alignment_len > 0 {
-                let alignment = vec![0; alignment_len];
-                bufw.write_all(alignment.as_slice())?;
-            }
+            // For data size = 5, alignment = 3 as (5 + 3 = 8)
+            // alignment = 4 - 5 % 4 = 3
+            bufw.write_zeros(ALIGNMENT - data.len() % ALIGNMENT)?;
 
             for posting in remainder_postings {
                 bufw.write_all(posting.as_bytes())?;
@@ -207,7 +206,7 @@ impl MmapPostings {
 
         // Dropping will flush the buffer to the file
         drop(bufw);
-
+        file.as_file().sync_all()?;
         file.persist(path)?;
 
         Ok(())
@@ -217,20 +216,17 @@ impl MmapPostings {
         let path = path.into();
         let mmap = open_read_mmap(&path, AdviceSetting::Advice(Advice::Normal), populate)?;
 
-        let header_bytes = mmap.get(0..size_of::<PostingsHeader>()).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Invalid header in {}", path.display()),
-            )
-        })?;
-
-        let header = PostingsHeader::read_from(header_bytes).ok_or_else(|| {
+        let (header, _) = PostingsHeader::read_from_prefix(&mmap).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Invalid header deserialization in {}", path.display()),
             )
         })?;
 
-        Ok(Self { path, mmap, header })
+        Ok(Self {
+            _path: path,
+            mmap,
+            header,
+        })
     }
 }

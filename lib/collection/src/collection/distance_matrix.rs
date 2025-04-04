@@ -6,9 +6,10 @@ use api::rest::{
     SearchMatrixRequestInternal,
 };
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use segment::data_types::vectors::{NamedVectorStruct, DEFAULT_VECTOR_NAME};
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, NamedVectorStruct};
 use segment::types::{
-    Condition, Filter, HasIdCondition, HasVectorCondition, PointIdType, ScoredPoint, WithVector,
+    Condition, Filter, HasIdCondition, HasVectorCondition, PointIdType, ScoredPoint, VectorNameBuf,
+    WithVector,
 };
 
 use crate::collection::Collection;
@@ -31,7 +32,7 @@ pub struct CollectionSearchMatrixRequest {
     pub sample_size: usize,
     pub limit_per_sample: usize,
     pub filter: Option<Filter>,
-    pub using: String,
+    pub using: VectorNameBuf,
 }
 
 impl CollectionSearchMatrixRequest {
@@ -52,7 +53,7 @@ impl From<SearchMatrixRequestInternal> for CollectionSearchMatrixRequest {
             limit_per_sample: limit
                 .unwrap_or(CollectionSearchMatrixRequest::DEFAULT_LIMIT_PER_SAMPLE),
             filter,
-            using: using.unwrap_or(DEFAULT_VECTOR_NAME.to_string()),
+            using: using.unwrap_or(DEFAULT_VECTOR_NAME.to_owned()),
         }
     }
 }
@@ -140,8 +141,9 @@ impl Collection {
         shard_selection: ShardSelectorInternal,
         read_consistency: Option<ReadConsistency>,
         timeout: Option<Duration>,
-        hw_measurement_acc: &HwMeasurementAcc,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<CollectionSearchMatrixResponse> {
+        let start = std::time::Instant::now();
         let CollectionSearchMatrixRequest {
             sample_size,
             limit_per_sample,
@@ -183,7 +185,7 @@ impl Collection {
                 read_consistency,
                 shard_selection.clone(),
                 timeout,
-                hw_measurement_acc,
+                hw_measurement_acc.clone(),
             )
             .await?;
 
@@ -230,6 +232,9 @@ impl Collection {
                 with_payload: None,
             });
         }
+
+        // update timeout
+        let timeout = timeout.map(|timeout| timeout.saturating_sub(start.elapsed()));
 
         // run batch search request
         let batch_request = CoreSearchRequestBatch { searches };

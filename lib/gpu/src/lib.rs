@@ -34,6 +34,15 @@ pub use shader::*;
 #[cfg(test)]
 mod basic_test;
 
+#[cfg(any(test, feature = "testing"))]
+pub static GPU_TEST_INSTANCE: std::sync::LazyLock<std::sync::Arc<Instance>> =
+    std::sync::LazyLock::new(|| {
+        Instance::builder()
+            .with_debug_messenger(Box::new(PanicIfErrorMessenger {}))
+            .build()
+            .unwrap()
+    });
+
 /// A trait for GPU resources.
 /// It's used keep GPU resources alive while they are in use by the GPU context.
 pub trait Resource: Send + Sync {}
@@ -67,7 +76,7 @@ impl From<gpu_allocator::AllocationError> for GpuError {
     fn from(error: gpu_allocator::AllocationError) -> GpuError {
         match error {
             gpu_allocator::AllocationError::OutOfMemory => GpuError::OutOfMemory,
-            _ => GpuError::Other(format!("GPU allocator error: {:?}", error)),
+            _ => GpuError::Other(format!("GPU allocator error: {error:?}")),
         }
     }
 }
@@ -94,7 +103,7 @@ impl From<vk::Result> for GpuError {
             vk::Result::ERROR_FORMAT_NOT_SUPPORTED => {
                 GpuError::NotSupported("Format is not supported".to_string())
             }
-            _ => GpuError::Other(format!("Vulkan API error: {:?}", result)),
+            _ => GpuError::Other(format!("Vulkan API error: {result:?}")),
         }
     }
 }

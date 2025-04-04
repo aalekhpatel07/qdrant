@@ -110,6 +110,10 @@ impl Issue for UnindexedField {
         "UNINDEXED_FIELD"
     }
 
+    fn related_collection(&self) -> Option<String> {
+        Some(self.collection_name.clone())
+    }
+
     fn description(&self) -> String {
         format!(
             "Unindexed field '{}' might be slowing queries down in collection '{}'",
@@ -213,6 +217,8 @@ fn infer_schema_from_field_condition(field_condition: &FieldCondition) -> Vec<Pa
         geo_radius,
         geo_polygon,
         values_count,
+        is_empty,
+        is_null,
     } = field_condition;
 
     let mut inferred = Vec::new();
@@ -250,7 +256,7 @@ fn infer_schema_from_field_condition(field_condition: &FieldCondition) -> Vec<Pa
     if geo_bounding_box.is_some() || geo_radius.is_some() || geo_polygon.is_some() {
         inferred.push(PayloadFieldSchema::FieldType(PayloadSchemaType::Geo));
     }
-    if values_count.is_some() {
+    if values_count.is_some() || is_empty.is_some() || is_null.is_some() {
         // Any index will do, let user choose depending on their data type
         inferred.extend(all_indexes());
     }

@@ -1,33 +1,33 @@
-use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use atomic_refcell::AtomicRefCell;
-use common::cpu::CpuPermit;
-use rand::prelude::StdRng;
+use common::budget::ResourcePermit;
+use common::counter::hardware_counter::HardwareCounterCell;
 use rand::SeedableRng;
-use segment::common::rocksdb_wrapper::{open_db, DB_VECTOR_CF};
+use rand::prelude::StdRng;
+use segment::common::rocksdb_wrapper::{DB_VECTOR_CF, open_db};
 use segment::data_types::vectors::{
-    only_default_vector, MultiDenseVectorInternal, QueryVector, TypedMultiDenseVectorRef,
-    VectorElementType, VectorRef, DEFAULT_VECTOR_NAME,
+    DEFAULT_VECTOR_NAME, MultiDenseVectorInternal, QueryVector, TypedMultiDenseVectorRef,
+    VectorElementType, VectorRef, only_default_vector,
 };
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::index_fixtures::random_vector;
 use segment::fixtures::payload_fixtures::random_int_payload;
-use segment::index::hnsw_index::graph_links::GraphLinksRam;
-use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
 use segment::index::VectorIndex;
+use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
 use segment::json_path::JsonPath;
-use segment::segment_constructor::build_segment;
+use segment::payload_json;
+use segment::segment_constructor::VectorIndexBuildArgs;
+use segment::segment_constructor::simple_segment_constructor::build_simple_segment;
 use segment::spaces::metric::Metric;
 use segment::spaces::simple::{CosineMetric, DotProductMetric, EuclidMetric, ManhattanMetric};
 use segment::types::{
-    Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes, MultiVectorConfig, Payload,
-    PayloadSchemaType, SegmentConfig, SeqNumberType, VectorDataConfig, VectorStorageType,
+    Condition, Distance, FieldCondition, Filter, HnswConfig, MultiVectorConfig, PayloadSchemaType,
+    SeqNumberType,
 };
-use segment::vector_storage::multi_dense::simple_multi_dense_vector_storage::open_simple_multi_dense_vector_storage;
 use segment::vector_storage::VectorStorage;
-use serde_json::json;
+use segment::vector_storage::multi_dense::simple_multi_dense_vector_storage::open_simple_multi_dense_vector_storage;
 use tempfile::Builder;
 
 #[test]
@@ -41,32 +41,18 @@ fn test_single_multi_and_dense_hnsw_equivalency() {
 
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
 
-    let config = SegmentConfig {
-        vector_data: HashMap::from([(
-            DEFAULT_VECTOR_NAME.to_owned(),
-            VectorDataConfig {
-                size: dim,
-                distance,
-                storage_type: VectorStorageType::Memory,
-                index: Indexes::Plain {},
-                quantization_config: None,
-                multivector_config: None,
-                datatype: None,
-            },
-        )]),
-        sparse_vector_data: Default::default(),
-        payload_storage_type: Default::default(),
-    };
-
     let int_key = "int";
 
-    let mut segment = build_segment(dir.path(), &config, true).unwrap();
+    let mut segment = build_simple_segment(dir.path(), dim, distance).unwrap();
+
+    let hw_counter = HardwareCounterCell::new();
 
     segment
         .create_field_index(
             0,
             &JsonPath::new(int_key),
             Some(&PayloadSchemaType::Integer.into()),
+            &hw_counter,
         )
         .unwrap();
 
@@ -102,13 +88,18 @@ fn test_single_multi_and_dense_hnsw_equivalency() {
         let vector_multi = MultiDenseVectorInternal::new(preprocessed_vector, vector.len());
 
         let int_payload = random_int_payload(&mut rnd, num_payload_values..=num_payload_values);
-        let payload: Payload = json!({int_key:int_payload,}).into();
+        let payload = payload_json! {int_key: int_payload};
 
         segment
-            .upsert_point(n as SeqNumberType, idx, only_default_vector(&vector))
+            .upsert_point(
+                n as SeqNumberType,
+                idx,
+                only_default_vector(&vector),
+                &hw_counter,
+            )
             .unwrap();
         segment
-            .set_full_payload(n as SeqNumberType, idx, &payload)
+            .set_full_payload(n as SeqNumberType, idx, &payload, &hw_counter)
             .unwrap();
 
         let internal_id = segment.id_tracker.borrow().internal_id(idx).unwrap();
@@ -116,6 +107,7 @@ fn test_single_multi_and_dense_hnsw_equivalency() {
             .insert_vector(
                 internal_id,
                 VectorRef::MultiDense(TypedMultiDenseVectorRef::from(&vector_multi)),
+                &hw_counter,
             )
             .unwrap();
     }
@@ -138,33 +130,37 @@ fn test_single_multi_and_dense_hnsw_equivalency() {
     };
 
     // single threaded mode to guarantee equivalency between single and multi hnsw
-    let permit = Arc::new(CpuPermit::dummy(1));
+    let permit = Arc::new(ResourcePermit::dummy(1));
 
     let vector_storage = &segment.vector_data[DEFAULT_VECTOR_NAME].vector_storage;
     let quantized_vectors = &segment.vector_data[DEFAULT_VECTOR_NAME].quantized_vectors;
-    let hnsw_index_dense = HNSWIndex::<GraphLinksRam>::open(HnswIndexOpenArgs {
-        path: hnsw_dir.path(),
-        id_tracker: segment.id_tracker.clone(),
-        vector_storage: vector_storage.clone(),
-        quantized_vectors: quantized_vectors.clone(),
-        payload_index: segment.payload_index.clone(),
-        hnsw_config: hnsw_config.clone(),
-        permit: Some(permit.clone()),
-        stopped: &stopped,
-    })
+    let hnsw_index_dense = HNSWIndex::build(
+        HnswIndexOpenArgs {
+            path: hnsw_dir.path(),
+            id_tracker: segment.id_tracker.clone(),
+            vector_storage: vector_storage.clone(),
+            quantized_vectors: quantized_vectors.clone(),
+            payload_index: segment.payload_index.clone(),
+            hnsw_config: hnsw_config.clone(),
+        },
+        VectorIndexBuildArgs {
+            permit: permit.clone(),
+            old_indices: &[],
+            gpu_device: None,
+            stopped: &stopped,
+        },
+    )
     .unwrap();
 
     let multi_storage = Arc::new(AtomicRefCell::new(multi_storage));
 
-    let hnsw_index_multi = HNSWIndex::<GraphLinksRam>::open(HnswIndexOpenArgs {
+    let hnsw_index_multi = HNSWIndex::open(HnswIndexOpenArgs {
         path: hnsw_dir.path(),
         id_tracker: segment.id_tracker.clone(),
         vector_storage: multi_storage,
         quantized_vectors: quantized_vectors.clone(),
         payload_index: segment.payload_index.clone(),
         hnsw_config,
-        permit: Some(permit),
-        stopped: &stopped,
     })
     .unwrap();
 

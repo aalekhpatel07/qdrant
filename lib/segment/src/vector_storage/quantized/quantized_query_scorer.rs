@@ -3,7 +3,6 @@ use std::marker::PhantomData;
 
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::{PointOffsetType, ScoreType};
-use itertools::Itertools;
 
 use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::{DenseVector, MultiDenseVectorInternal};
@@ -36,6 +35,7 @@ where
         raw_query: DenseVector,
         quantized_data: &'a TEncodedVectors,
         quantization_config: &QuantizationConfig,
+        hardware_counter: HardwareCounterCell,
     ) -> Self {
         let raw_preprocessed_query = TMetric::preprocess(raw_query);
         let original_query = TElement::slice_from_float_cow(Cow::Owned(raw_preprocessed_query));
@@ -51,7 +51,7 @@ where
             quantized_data,
             metric: PhantomData,
             element: PhantomData,
-            hardware_counter: HardwareCounterCell::new(),
+            hardware_counter,
         }
     }
 
@@ -59,23 +59,19 @@ where
         raw_query: &MultiDenseVectorInternal,
         quantized_data: &'a TEncodedVectors,
         quantization_config: &QuantizationConfig,
+        hardware_counter: HardwareCounterCell,
     ) -> Self {
-        let slices = raw_query.multi_vectors();
-        let query = slices
-            .into_iter()
-            .flat_map(|inner_vector| {
-                let inner_preprocessed = TMetric::preprocess(inner_vector.to_vec());
-                let inner_converted =
-                    TElement::slice_from_float_cow(Cow::Owned(inner_preprocessed));
-                let inner_prequantized = TElement::quantization_preprocess(
-                    quantization_config,
-                    TMetric::distance(),
-                    inner_converted.as_ref(),
-                )
-                .into_owned();
-                inner_prequantized.into_iter()
-            })
-            .collect_vec();
+        let mut query = Vec::new();
+        for inner_vector in raw_query.multi_vectors() {
+            let inner_preprocessed = TMetric::preprocess(inner_vector.to_vec());
+            let inner_converted = TElement::slice_from_float_cow(Cow::Owned(inner_preprocessed));
+            let inner_prequantized = TElement::quantization_preprocess(
+                quantization_config,
+                TMetric::distance(),
+                inner_converted.as_ref(),
+            );
+            query.extend_from_slice(&inner_prequantized);
+        }
 
         let query = quantized_data.encode_query(&query);
 
@@ -84,7 +80,7 @@ where
             quantized_data,
             metric: PhantomData,
             element: PhantomData,
-            hardware_counter: HardwareCounterCell::new(),
+            hardware_counter,
         }
     }
 }
@@ -116,15 +112,5 @@ where
     fn score_internal(&self, point_a: PointOffsetType, point_b: PointOffsetType) -> ScoreType {
         self.quantized_data
             .score_internal(point_a, point_b, &self.hardware_counter)
-    }
-
-    fn take_hardware_counter(&self) -> HardwareCounterCell {
-        let mut counter = self.hardware_counter.take();
-
-        counter
-            .cpu_counter_mut()
-            .multiplied_mut(size_of::<TElement>());
-
-        counter
     }
 }

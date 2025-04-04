@@ -1,14 +1,11 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::{Seek, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::thread::{self};
+use std::{fs, thread};
 
-use common::tar_ext;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::TelemetryDetail;
-use io::storage_version::VERSION_FILE;
-use uuid::Uuid;
 
 use super::Segment;
 use crate::common::operation_error::OperationError::TypeInferenceError;
@@ -17,23 +14,19 @@ use crate::common::{check_named_vectors, check_query_vectors, check_stopped, che
 use crate::data_types::facets::{FacetParams, FacetValue};
 use crate::data_types::named_vectors::NamedVectors;
 use crate::data_types::order_by::{OrderBy, OrderValue};
-use crate::data_types::query_context::{QueryContext, SegmentQueryContext};
+use crate::data_types::query_context::{FormulaContext, QueryContext, SegmentQueryContext};
 use crate::data_types::vectors::{QueryVector, VectorInternal};
 use crate::entry::entry_point::SegmentEntry;
 use crate::index::field_index::{CardinalityEstimation, FieldIndex};
 use crate::index::{PayloadIndex, VectorIndex};
 use crate::json_path::JsonPath;
 use crate::payload_storage::PayloadStorage;
-use crate::segment::{
-    DB_BACKUP_PATH, PAYLOAD_DB_BACKUP_PATH, SEGMENT_STATE_FILE, SNAPSHOT_FILES_PATH, SNAPSHOT_PATH,
-};
 use crate::telemetry::SegmentTelemetry;
 use crate::types::{
     Filter, Payload, PayloadFieldSchema, PayloadIndexInfo, PayloadKeyType, PayloadKeyTypeRef,
     PointIdType, ScoredPoint, SearchParams, SegmentConfig, SegmentInfo, SegmentType, SeqNumberType,
-    SnapshotFormat, VectorDataInfo, WithPayload, WithVector,
+    VectorDataInfo, VectorName, VectorNameBuf, WithPayload, WithVector,
 };
-use crate::utils::path::strip_prefix;
 use crate::vector_storage::VectorStorage;
 
 /// This is a basic implementation of `SegmentEntry`,
@@ -52,7 +45,7 @@ impl SegmentEntry for Segment {
 
     fn search_batch(
         &self,
-        vector_name: &str,
+        vector_name: &VectorName,
         query_vectors: &[&QueryVector],
         with_payload: &WithPayload,
         with_vector: &WithVector,
@@ -74,12 +67,37 @@ impl SegmentEntry for Segment {
 
         check_stopped(&vector_query_context.is_stopped())?;
 
+        let hw_counter = vector_query_context.hardware_counter();
+
         internal_results
             .into_iter()
             .map(|internal_result| {
-                self.process_search_result(internal_result, with_payload, with_vector)
+                self.process_search_result(internal_result, with_payload, with_vector, &hw_counter)
             })
             .collect()
+    }
+
+    fn rescore_with_formula(
+        &self,
+        ctx: Arc<FormulaContext>,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Vec<ScoredPoint>> {
+        let FormulaContext {
+            formula,
+            prefetches_results,
+            limit,
+            is_stopped,
+        } = &*ctx;
+
+        let internal_results = self.do_rescore_with_formula(
+            formula,
+            prefetches_results,
+            *limit,
+            is_stopped,
+            hw_counter,
+        )?;
+
+        self.process_search_result(internal_results, &false.into(), &false.into(), hw_counter)
     }
 
     fn upsert_point(
@@ -87,6 +105,7 @@ impl SegmentEntry for Segment {
         op_num: SeqNumberType,
         point_id: PointIdType,
         mut vectors: NamedVectors,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<bool> {
         debug_assert!(self.is_appendable());
         check_named_vectors(&vectors, &self.segment_config)?;
@@ -94,10 +113,10 @@ impl SegmentEntry for Segment {
         let stored_internal_point = self.id_tracker.borrow().internal_id(point_id);
         self.handle_point_version_and_failure(op_num, stored_internal_point, |segment| {
             if let Some(existing_internal_id) = stored_internal_point {
-                segment.replace_all_vectors(existing_internal_id, &vectors)?;
+                segment.replace_all_vectors(existing_internal_id, &vectors, hw_counter)?;
                 Ok((true, Some(existing_internal_id)))
             } else {
-                let new_index = segment.insert_new_vectors(point_id, &vectors)?;
+                let new_index = segment.insert_new_vectors(point_id, &vectors, hw_counter)?;
                 Ok((false, Some(new_index)))
             }
         })
@@ -107,6 +126,7 @@ impl SegmentEntry for Segment {
         &mut self,
         op_num: SeqNumberType,
         point_id: PointIdType,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<bool> {
         let internal_id = self.id_tracker.borrow().internal_id(point_id);
         match internal_id {
@@ -118,7 +138,7 @@ impl SegmentEntry for Segment {
                     segment
                         .payload_index
                         .borrow_mut()
-                        .clear_payload(internal_id)?;
+                        .clear_payload(internal_id, hw_counter)?;
                     segment.id_tracker.borrow_mut().drop(point_id)?;
 
                     // Before, we propagated point deletions to also delete its vectors. This turns
@@ -144,6 +164,7 @@ impl SegmentEntry for Segment {
         op_num: SeqNumberType,
         point_id: PointIdType,
         mut vectors: NamedVectors,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<bool> {
         check_named_vectors(&vectors, &self.segment_config)?;
         vectors.preprocess(|name| self.config().vector_data.get(name).unwrap());
@@ -154,7 +175,7 @@ impl SegmentEntry for Segment {
             }),
             Some(internal_id) => {
                 self.handle_point_version_and_failure(op_num, Some(internal_id), |segment| {
-                    segment.update_vectors(internal_id, vectors)?;
+                    segment.update_vectors(internal_id, vectors, hw_counter)?;
                     Ok((true, Some(internal_id)))
                 })
             }
@@ -165,7 +186,7 @@ impl SegmentEntry for Segment {
         &mut self,
         op_num: SeqNumberType,
         point_id: PointIdType,
-        vector_name: &str,
+        vector_name: &VectorName,
     ) -> OperationResult<bool> {
         check_vector_name(vector_name, &self.segment_config)?;
         let internal_id = self.id_tracker.borrow().internal_id(point_id);
@@ -177,7 +198,7 @@ impl SegmentEntry for Segment {
                 self.handle_point_version_and_failure(op_num, Some(internal_id), |segment| {
                     let vector_data = segment.vector_data.get(vector_name).ok_or_else(|| {
                         OperationError::VectorNameNotExists {
-                            received_name: vector_name.to_string(),
+                            received_name: vector_name.to_owned(),
                         }
                     })?;
                     let mut vector_storage = vector_data.vector_storage.borrow_mut();
@@ -193,14 +214,16 @@ impl SegmentEntry for Segment {
         op_num: SeqNumberType,
         point_id: PointIdType,
         full_payload: &Payload,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<bool> {
         let internal_id = self.id_tracker.borrow().internal_id(point_id);
         self.handle_point_version_and_failure(op_num, internal_id, |segment| match internal_id {
             Some(internal_id) => {
-                segment
-                    .payload_index
-                    .borrow_mut()
-                    .overwrite_payload(internal_id, full_payload)?;
+                segment.payload_index.borrow_mut().overwrite_payload(
+                    internal_id,
+                    full_payload,
+                    hw_counter,
+                )?;
                 Ok((true, Some(internal_id)))
             }
             None => Err(OperationError::PointIdError {
@@ -215,14 +238,17 @@ impl SegmentEntry for Segment {
         point_id: PointIdType,
         payload: &Payload,
         key: &Option<JsonPath>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<bool> {
         let internal_id = self.id_tracker.borrow().internal_id(point_id);
         self.handle_point_version_and_failure(op_num, internal_id, |segment| match internal_id {
             Some(internal_id) => {
-                segment
-                    .payload_index
-                    .borrow_mut()
-                    .set_payload(internal_id, payload, key)?;
+                segment.payload_index.borrow_mut().set_payload(
+                    internal_id,
+                    payload,
+                    key,
+                    hw_counter,
+                )?;
                 Ok((true, Some(internal_id)))
             }
             None => Err(OperationError::PointIdError {
@@ -236,6 +262,7 @@ impl SegmentEntry for Segment {
         op_num: SeqNumberType,
         point_id: PointIdType,
         key: PayloadKeyTypeRef,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<bool> {
         let internal_id = self.id_tracker.borrow().internal_id(point_id);
         self.handle_point_version_and_failure(op_num, internal_id, |segment| match internal_id {
@@ -243,7 +270,7 @@ impl SegmentEntry for Segment {
                 segment
                     .payload_index
                     .borrow_mut()
-                    .delete_payload(internal_id, key)?;
+                    .delete_payload(internal_id, key, hw_counter)?;
                 Ok((true, Some(internal_id)))
             }
             None => Err(OperationError::PointIdError {
@@ -256,6 +283,7 @@ impl SegmentEntry for Segment {
         &mut self,
         op_num: SeqNumberType,
         point_id: PointIdType,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<bool> {
         let internal_id = self.id_tracker.borrow().internal_id(point_id);
         self.handle_point_version_and_failure(op_num, internal_id, |segment| match internal_id {
@@ -263,7 +291,7 @@ impl SegmentEntry for Segment {
                 segment
                     .payload_index
                     .borrow_mut()
-                    .clear_payload(internal_id)?;
+                    .clear_payload(internal_id, hw_counter)?;
                 Ok((true, Some(internal_id)))
             }
             None => Err(OperationError::PointIdError {
@@ -274,7 +302,7 @@ impl SegmentEntry for Segment {
 
     fn vector(
         &self,
-        vector_name: &str,
+        vector_name: &VectorName,
         point_id: PointIdType,
     ) -> OperationResult<Option<VectorInternal>> {
         check_vector_name(vector_name, &self.segment_config)?;
@@ -293,9 +321,13 @@ impl SegmentEntry for Segment {
         Ok(result)
     }
 
-    fn payload(&self, point_id: PointIdType) -> OperationResult<Payload> {
+    fn payload(
+        &self,
+        point_id: PointIdType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Payload> {
         let internal_id = self.lookup_internal_id(point_id)?;
-        self.payload_by_offset(internal_id)
+        self.payload_by_offset(internal_id, hw_counter)
     }
 
     fn iter_points(&self) -> Box<dyn Iterator<Item = PointIdType> + '_> {
@@ -312,14 +344,17 @@ impl SegmentEntry for Segment {
         limit: Option<usize>,
         filter: Option<&'a Filter>,
         is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
     ) -> Vec<PointIdType> {
         match filter {
             None => self.read_by_id_stream(offset, limit),
             Some(condition) => {
-                if self.should_pre_filter(condition, limit) {
-                    self.filtered_read_by_index(offset, limit, condition, is_stopped)
+                if self.should_pre_filter(condition, limit, hw_counter) {
+                    self.filtered_read_by_index(offset, limit, condition, is_stopped, hw_counter)
                 } else {
-                    self.filtered_read_by_id_stream(offset, limit, condition, is_stopped)
+                    self.filtered_read_by_id_stream(
+                        offset, limit, condition, is_stopped, hw_counter,
+                    )
                 }
             }
         }
@@ -331,14 +366,25 @@ impl SegmentEntry for Segment {
         filter: Option<&'a Filter>,
         order_by: &'a OrderBy,
         is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<Vec<(OrderValue, PointIdType)>> {
         match filter {
-            None => self.filtered_read_by_value_stream(order_by, limit, None, is_stopped),
+            None => {
+                self.filtered_read_by_value_stream(order_by, limit, None, is_stopped, hw_counter)
+            }
             Some(filter) => {
-                if self.should_pre_filter(filter, limit) {
-                    self.filtered_read_by_index_ordered(order_by, limit, filter, is_stopped)
+                if self.should_pre_filter(filter, limit, hw_counter) {
+                    self.filtered_read_by_index_ordered(
+                        order_by, limit, filter, is_stopped, hw_counter,
+                    )
                 } else {
-                    self.filtered_read_by_value_stream(order_by, limit, Some(filter), is_stopped)
+                    self.filtered_read_by_value_stream(
+                        order_by,
+                        limit,
+                        Some(filter),
+                        is_stopped,
+                        hw_counter,
+                    )
                 }
             }
         }
@@ -349,14 +395,15 @@ impl SegmentEntry for Segment {
         limit: usize,
         filter: Option<&Filter>,
         is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
     ) -> Vec<PointIdType> {
         match filter {
             None => self.read_by_random_id(limit),
             Some(condition) => {
-                if self.should_pre_filter(condition, Some(limit)) {
-                    self.filtered_read_by_index_shuffled(limit, condition, is_stopped)
+                if self.should_pre_filter(condition, Some(limit), hw_counter) {
+                    self.filtered_read_by_index_shuffled(limit, condition, is_stopped, hw_counter)
                 } else {
-                    self.filtered_read_by_random_stream(limit, condition, is_stopped)
+                    self.filtered_read_by_random_stream(limit, condition, is_stopped, hw_counter)
                 }
             }
         }
@@ -375,6 +422,10 @@ impl SegmentEntry for Segment {
         self.id_tracker.borrow().internal_id(point_id).is_some()
     }
 
+    fn is_empty(&self) -> bool {
+        self.id_tracker.borrow().total_point_count() == 0
+    }
+
     fn available_point_count(&self) -> usize {
         self.id_tracker.borrow().available_point_count()
     }
@@ -383,15 +434,21 @@ impl SegmentEntry for Segment {
         self.id_tracker.borrow().deleted_point_count()
     }
 
-    fn available_vectors_size_in_bytes(&self, vector_name: &str) -> OperationResult<usize> {
+    fn available_vectors_size_in_bytes(&self, vector_name: &VectorName) -> OperationResult<usize> {
         check_vector_name(vector_name, &self.segment_config)?;
-        Ok(self.vector_data[vector_name]
-            .vector_storage
+        let vector_data = &self.vector_data[vector_name];
+        let size = vector_data
+            .vector_index
             .borrow()
-            .size_of_available_vectors_in_bytes())
+            .size_of_searchable_vectors_in_bytes();
+        Ok(size)
     }
 
-    fn estimate_point_count<'a>(&'a self, filter: Option<&'a Filter>) -> CardinalityEstimation {
+    fn estimate_point_count<'a>(
+        &'a self,
+        filter: Option<&'a Filter>,
+        hw_counter: &HardwareCounterCell,
+    ) -> CardinalityEstimation {
         match filter {
             None => {
                 let available = self.available_point_count();
@@ -404,7 +461,7 @@ impl SegmentEntry for Segment {
             }
             Some(filter) => {
                 let payload_index = self.payload_index.borrow();
-                payload_index.estimate_cardinality(filter)
+                payload_index.estimate_cardinality(filter, hw_counter)
             }
         }
     }
@@ -414,33 +471,25 @@ impl SegmentEntry for Segment {
         key: &JsonPath,
         filter: Option<&Filter>,
         is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<std::collections::BTreeSet<FacetValue>> {
-        self.facet_values(key, filter, is_stopped)
+        self.facet_values(key, filter, is_stopped, hw_counter)
     }
 
     fn facet(
         &self,
         request: &FacetParams,
         is_stopped: &AtomicBool,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<HashMap<FacetValue, usize>> {
-        self.approximate_facet(request, is_stopped)
+        self.approximate_facet(request, is_stopped, hw_counter)
     }
 
     fn segment_type(&self) -> SegmentType {
         self.segment_type
     }
 
-    fn info(&self) -> SegmentInfo {
-        let payload_index = self.payload_index.borrow();
-        let schema = payload_index
-            .indexed_fields()
-            .into_iter()
-            .map(|(key, index_schema)| {
-                let points_count = payload_index.indexed_points(&key);
-                (key, PayloadIndexInfo::new(index_schema, points_count))
-            })
-            .collect();
-
+    fn size_info(&self) -> SegmentInfo {
         let num_vectors = self
             .vector_data
             .values()
@@ -459,7 +508,7 @@ impl SegmentEntry for Segment {
                 let is_indexed = vector_index.is_index();
 
                 let average_vector_size_bytes = if num_vectors > 0 {
-                    vector_storage.size_of_available_vectors_in_bytes() / num_vectors
+                    vector_index.size_of_searchable_vectors_in_bytes() / num_vectors
                 } else {
                     0
                 };
@@ -491,19 +540,44 @@ impl SegmentEntry for Segment {
 
         let vectors_size_bytes = total_average_vectors_size_bytes * num_points;
 
+        // Unwrap and default to 0 here because the RocksDB storage is the only faillible one, and we will remove it eventually.
+        let payloads_size_bytes = self
+            .payload_storage
+            .borrow()
+            .get_storage_size_bytes()
+            .unwrap_or(0);
+
         SegmentInfo {
             segment_type: self.segment_type,
             num_vectors,
             num_indexed_vectors,
             num_points: self.available_point_count(),
             num_deleted_vectors: self.deleted_point_count(),
-            vectors_size_bytes, // Considers vector storage, but not payload or indices
-            ram_usage_bytes: 0, // ToDo: Implement
+            vectors_size_bytes,  // Considers vector storage, but not indices
+            payloads_size_bytes, // Considers payload storage, but not indices
+            ram_usage_bytes: 0,  // ToDo: Implement
             disk_usage_bytes: 0, // ToDo: Implement
             is_appendable: self.appendable_flag,
-            index_schema: schema,
+            index_schema: HashMap::new(),
             vector_data: vector_data_info,
         }
+    }
+
+    fn info(&self) -> SegmentInfo {
+        let payload_index = self.payload_index.borrow();
+        let schema = payload_index
+            .indexed_fields()
+            .into_iter()
+            .map(|(key, index_schema)| {
+                let points_count = payload_index.indexed_points(&key);
+                (key, PayloadIndexInfo::new(index_schema, points_count))
+            })
+            .collect();
+
+        let mut info = self.size_info();
+        info.index_schema = schema;
+
+        info
     }
 
     fn config(&self) -> &SegmentConfig {
@@ -669,6 +743,7 @@ impl SegmentEntry for Segment {
         op_num: SeqNumberType,
         key: PayloadKeyTypeRef,
         field_type: Option<&PayloadFieldSchema>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<Option<(PayloadFieldSchema, Vec<FieldIndex>)>> {
         // Check version without updating it
         if self.version.unwrap_or(0) > op_num {
@@ -680,12 +755,12 @@ impl SegmentEntry for Segment {
                 let res = self
                     .payload_index
                     .borrow()
-                    .build_index(key, schema)?
+                    .build_index(key, schema, hw_counter)?
                     .map(|field_index| (schema.to_owned(), field_index));
 
                 Ok(res)
             }
-            None => match self.infer_from_payload_data(key)? {
+            None => match self.infer_from_payload_data(key, hw_counter)? {
                 None => Err(TypeInferenceError {
                     field_name: key.clone(),
                 }),
@@ -695,7 +770,7 @@ impl SegmentEntry for Segment {
                     let res = self
                         .payload_index
                         .borrow()
-                        .build_index(key, &schema)?
+                        .build_index(key, &schema, hw_counter)?
                         .map(|field_index| (schema, field_index));
 
                     Ok(res)
@@ -732,64 +807,19 @@ impl SegmentEntry for Segment {
         &'a mut self,
         op_num: SeqNumberType,
         filter: &'a Filter,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<usize> {
         let mut deleted_points = 0;
         let is_stopped = AtomicBool::new(false);
-        for point_id in self.read_filtered(None, None, Some(filter), &is_stopped) {
-            deleted_points += usize::from(self.delete_point(op_num, point_id)?);
+        for point_id in self.read_filtered(None, None, Some(filter), &is_stopped, hw_counter) {
+            deleted_points += usize::from(self.delete_point(op_num, point_id, hw_counter)?);
         }
 
         Ok(deleted_points)
     }
 
-    fn vector_names(&self) -> HashSet<String> {
+    fn vector_names(&self) -> HashSet<VectorNameBuf> {
         self.vector_data.keys().cloned().collect()
-    }
-
-    fn take_snapshot(
-        &self,
-        temp_path: &Path,
-        tar: &tar_ext::BuilderExt,
-        format: SnapshotFormat,
-        snapshotted_segments: &mut HashSet<String>,
-    ) -> OperationResult<()> {
-        let segment_id = self
-            .current_path
-            .file_stem()
-            .and_then(|f| f.to_str())
-            .unwrap();
-
-        if !snapshotted_segments.insert(segment_id.to_string()) {
-            // Already snapshotted.
-            return Ok(());
-        }
-
-        log::debug!("Taking snapshot of segment {:?}", self.current_path);
-
-        // flush segment to capture latest state
-        self.flush(true, false)?;
-
-        match format {
-            SnapshotFormat::Ancient => {
-                debug_assert!(false, "Unsupported snapshot format: {format:?}");
-                return Err(OperationError::service_error(format!(
-                    "Unsupported snapshot format: {format:?}"
-                )));
-            }
-            SnapshotFormat::Regular => {
-                tar.blocking_write_fn(Path::new(&format!("{segment_id}.tar")), |writer| {
-                    let tar = tar_ext::BuilderExt::new_streaming_borrowed(writer);
-                    let tar = tar.descend(Path::new(SNAPSHOT_PATH))?;
-                    snapshot_files(self, temp_path, &tar)
-                })??;
-            }
-            SnapshotFormat::Streamable => {
-                let tar = tar.descend(Path::new(&segment_id))?;
-                snapshot_files(self, temp_path, &tar)?;
-            }
-        }
-
-        Ok(())
     }
 
     fn get_telemetry_data(&self, detail: TelemetryDetail) -> SegmentTelemetry {
@@ -813,86 +843,15 @@ impl SegmentEntry for Segment {
 
     fn fill_query_context(&self, query_context: &mut QueryContext) {
         query_context.add_available_point_count(self.available_point_count());
-
+        let hw_acc = query_context.hardware_usage_accumulator();
+        let hw_counter = hw_acc.get_counter_cell();
         for (vector_name, idf) in query_context.mut_idf().iter_mut() {
             if let Some(vector_data) = self.vector_data.get(vector_name) {
-                vector_data.vector_index.borrow().fill_idf_statistics(idf);
+                vector_data
+                    .vector_index
+                    .borrow()
+                    .fill_idf_statistics(idf, &hw_counter);
             }
         }
     }
-}
-
-fn snapshot_files(
-    segment: &Segment,
-    temp_path: &Path,
-    tar: &tar_ext::BuilderExt<impl Write + Seek>,
-) -> OperationResult<()> {
-    // use temp_path for intermediary files
-    let temp_path = temp_path.join(format!("segment-{}", Uuid::new_v4()));
-    let db_backup_path = temp_path.join(DB_BACKUP_PATH);
-    let payload_index_db_backup_path = temp_path.join(PAYLOAD_DB_BACKUP_PATH);
-
-    {
-        let db = segment.database.read();
-        crate::rocksdb_backup::create(&db, &db_backup_path)?;
-    }
-
-    segment
-        .payload_index
-        .borrow()
-        .take_database_snapshot(&payload_index_db_backup_path)?;
-
-    tar.blocking_append_dir_all(&temp_path, Path::new(""))?;
-
-    // remove tmp directory in background
-    let _ = thread::spawn(move || {
-        let res = fs::remove_dir_all(&temp_path);
-        if let Err(err) = res {
-            log::error!(
-                "Failed to remove tmp directory at {}: {err:?}",
-                temp_path.display(),
-            );
-        }
-    });
-
-    let tar = tar.descend(Path::new(SNAPSHOT_FILES_PATH))?;
-    for vector_data in segment.vector_data.values() {
-        for file in vector_data.vector_index.borrow().files() {
-            tar.blocking_append_file(&file, strip_prefix(&file, &segment.current_path)?)?;
-        }
-
-        for file in vector_data.vector_storage.borrow().files() {
-            tar.blocking_append_file(&file, strip_prefix(&file, &segment.current_path)?)?;
-        }
-
-        if let Some(quantized_vectors) = vector_data.quantized_vectors.borrow().as_ref() {
-            for file in quantized_vectors.files() {
-                tar.blocking_append_file(&file, strip_prefix(&file, &segment.current_path)?)?;
-            }
-        }
-    }
-
-    for file in segment.payload_index.borrow().files() {
-        tar.blocking_append_file(&file, strip_prefix(&file, &segment.current_path)?)?;
-    }
-
-    for file in segment.payload_storage.borrow().files() {
-        tar.blocking_append_file(&file, strip_prefix(&file, &segment.current_path)?)?;
-    }
-
-    for file in segment.id_tracker.borrow().files() {
-        tar.blocking_append_file(&file, strip_prefix(&file, &segment.current_path)?)?;
-    }
-
-    tar.blocking_append_file(
-        &segment.current_path.join(SEGMENT_STATE_FILE),
-        Path::new(SEGMENT_STATE_FILE),
-    )?;
-
-    tar.blocking_append_file(
-        &segment.current_path.join(VERSION_FILE),
-        Path::new(VERSION_FILE),
-    )?;
-
-    Ok(())
 }
