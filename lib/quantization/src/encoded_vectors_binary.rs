@@ -35,7 +35,25 @@ impl Encoding {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Serialize, Deserialize, Default)]
+pub enum QueryEncoding {
+    #[default]
+    SameAsStorage,
+    Scalar4bits,
+    Scalar8bits,
+}
+
+pub enum EncodedQueryBQ<TBitsStoreType: BitsStoreType> {
+    Binary(EncodedBinVector<TBitsStoreType>),
+    Scalar4bits(EncodedScalarVector<TBitsStoreType>),
+    Scalar8bits(EncodedScalarVector<TBitsStoreType>),
+}
+
 pub struct EncodedBinVector<TBitsStoreType: BitsStoreType> {
+    encoded_vector: Vec<TBitsStoreType>,
+}
+
+pub struct EncodedScalarVector<TBitsStoreType: BitsStoreType> {
     encoded_vector: Vec<TBitsStoreType>,
 }
 
@@ -45,6 +63,9 @@ struct Metadata {
     #[serde(default)]
     #[serde(skip_serializing_if = "Encoding::is_one")]
     encoding: Encoding,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query_encoding: Option<QueryEncoding>,
 }
 
 pub trait BitsStoreType:
@@ -53,13 +74,20 @@ pub trait BitsStoreType:
     + Clone
     + core::ops::BitOrAssign
     + std::ops::Shl<usize, Output = Self>
+    + std::ops::Shr<usize, Output = Self>
+    + std::ops::BitAnd<Output = Self>
     + num_traits::identities::One
+    + num_traits::cast::FromPrimitive
+    + num_traits::cast::ToPrimitive
+    + std::fmt::Debug
 {
     /// Xor vectors and return the number of bits set to 1
     ///
     /// Assume that `v1` and `v2` are aligned to `BITS_STORE_TYPE_SIZE` with both with zeros
     /// So it does not affect the resulting number of bits set to 1
     fn xor_popcnt(v1: &[Self], v2: &[Self]) -> usize;
+
+    fn xor_popcnt_scalar(v1: &[Self], v2: &[Self], bits_count: usize) -> (usize, usize);
 
     /// Estimates how many `StorageType` elements are needed to store `size` bits
     fn get_storage_size(size: usize) -> usize;
@@ -120,6 +148,21 @@ impl BitsStoreType for u8 {
         result
     }
 
+    fn xor_popcnt_scalar(v1: &[Self], v2: &[Self], bits_count: usize) -> (usize, usize) {
+        debug_assert!(v2.len() >= v1.len() * bits_count);
+
+        let mut result = 0;
+        let mut sum = 0;
+        for (&b1, b2_chunk) in v1.iter().zip(v2.chunks_exact(bits_count)) {
+            sum += b1.count_ones() as usize;
+
+            for (i, &b2) in b2_chunk.iter().enumerate() {
+                result += (b1 ^ b2).count_ones() << i;
+            }
+        }
+        (result as usize, sum)
+    }
+
     fn get_storage_size(size: usize) -> usize {
         let bytes_count = if size > 128 {
             std::mem::size_of::<u128>()
@@ -173,6 +216,21 @@ impl BitsStoreType for u128 {
         result
     }
 
+    fn xor_popcnt_scalar(v1: &[Self], v2: &[Self], bits_count: usize) -> (usize, usize) {
+        debug_assert!(v2.len() >= v1.len() * bits_count);
+
+        let mut result = 0;
+        let mut sum = 0;
+        for (&b1, b2_chunk) in v1.iter().zip(v2.chunks_exact(bits_count)) {
+            sum += b1.count_ones() as usize;
+
+            for (i, &b2) in b2_chunk.iter().enumerate() {
+                result += (b1 ^ b2).count_ones() << i;
+            }
+        }
+        (result as usize, sum)
+    }
+
     fn get_storage_size(size: usize) -> usize {
         let bits_count = u8::BITS as usize * std::mem::size_of::<Self>();
         let mut result = size / bits_count;
@@ -195,6 +253,7 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
         mut storage_builder: impl EncodedStorageBuilder<Storage = TStorage>,
         vector_parameters: &VectorParameters,
         encoding: Encoding,
+        query_encoding: Option<QueryEncoding>,
         stopped: &AtomicBool,
     ) -> Result<Self, EncodingError> {
         debug_assert!(validate_vector_parameters(orig_data.clone(), vector_parameters).is_ok());
@@ -222,6 +281,7 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
             metadata: Metadata {
                 vector_parameters: vector_parameters.clone(),
                 encoding,
+                query_encoding,
             },
             vector_stats,
             bits_store_type: PhantomData,
@@ -377,6 +437,94 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
         }
     }
 
+    fn encode_query_vector(
+        query: &[f32],
+        vector_stats: &Option<VectorStats>,
+        encoding: Encoding,
+        query_encoding: Option<QueryEncoding>,
+    ) -> EncodedQueryBQ<TBitsStoreType> {
+        if let Some(query_encoding) = query_encoding {
+            match query_encoding {
+                QueryEncoding::SameAsStorage => {
+                    EncodedQueryBQ::Binary(Self::encode_vector(query, vector_stats, encoding))
+                }
+                QueryEncoding::Scalar8bits => EncodedQueryBQ::Scalar8bits(
+                    Self::encode_scalar_query_vector(query, encoding, u8::BITS as usize),
+                ),
+                QueryEncoding::Scalar4bits => EncodedQueryBQ::Scalar4bits(
+                    Self::encode_scalar_query_vector(query, encoding, (u8::BITS / 2) as usize),
+                ),
+            }
+        } else {
+            EncodedQueryBQ::Binary(Self::encode_vector(query, vector_stats, encoding))
+        }
+    }
+
+    fn encode_scalar_query_vector(
+        query: &[f32],
+        encoding: Encoding,
+        bits_count: usize,
+    ) -> EncodedScalarVector<TBitsStoreType> {
+        match encoding {
+            Encoding::OneBit => Self::encode_scalar_extended_query_vector(query, bits_count),
+            Encoding::TwoBits => {
+                let mut extended_query = query.to_vec();
+                extended_query.extend_from_slice(query);
+                Self::encode_scalar_extended_query_vector(&extended_query, bits_count)
+            }
+            Encoding::OneAndHalfBits => {
+                let mut extended_query = query.to_vec();
+                extended_query.extend(query.chunks(2).map(|v| {
+                    if v.len() == 2 {
+                        if v[0] > v[1] { v[0] } else { v[1] }
+                    } else {
+                        v[0]
+                    }
+                }));
+                Self::encode_scalar_extended_query_vector(&extended_query, bits_count)
+            }
+        }
+    }
+
+    fn encode_scalar_extended_query_vector(
+        query: &[f32],
+        bits_count: usize,
+    ) -> EncodedScalarVector<TBitsStoreType> {
+        let encoded_query_size = TBitsStoreType::get_storage_size(query.len().max(1)) * bits_count;
+        let mut encoded_query: Vec<TBitsStoreType> = vec![Default::default(); encoded_query_size];
+
+        let min_vec = query.iter().copied().fold(f32::INFINITY, f32::min);
+        let max_vec = query.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let max = if min_vec.abs() > max_vec.abs() {
+            min_vec.abs()
+        } else {
+            max_vec.abs()
+        };
+        let min = -max;
+
+        let ranges = (1usize << bits_count) - 1;
+        let delta = (max - min) / ranges as f32;
+
+        let storage_bits_count = std::mem::size_of::<TBitsStoreType>() * u8::BITS as usize;
+        for (chunk_index, chunk) in query.chunks(storage_bits_count).enumerate() {
+            for (shift, value) in chunk.iter().enumerate() {
+                let shifted_value = value - min;
+                let delted_value = shifted_value / delta;
+                let rounded_value = delted_value.round() as usize;
+                let quantized = rounded_value % (ranges + 1);
+                let quantized = TBitsStoreType::from_usize(quantized).unwrap_or_default();
+                for b in 0..bits_count {
+                    let bit_value = ((quantized >> b) & TBitsStoreType::one()) << shift;
+                    encoded_query[bits_count * chunk_index + b] |= bit_value;
+                }
+            }
+        }
+
+        EncodedScalarVector {
+            encoded_vector: encoded_query,
+        }
+    }
+
     pub fn get_quantized_vector_size_from_params(dim: usize, encoding: Encoding) -> usize {
         let extended_dim = match encoding {
             Encoding::OneBit => dim,
@@ -430,6 +578,48 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
         }
     }
 
+    fn calculate_metric_with_scalar(
+        &self,
+        v1: &[TBitsStoreType],
+        v2: &[TBitsStoreType],
+        bits_count: usize,
+    ) -> f32 {
+        // Dot product in a range [-1; 1] is approximated by NXOR in a range [0; 1]
+        // L1 distance in range [-1; 1] (alpha=2) is approximated by alpha*XOR in a range [0; 1]
+        // L2 distance in range [-1; 1] (alpha=2) is approximated by alpha*sqrt(XOR) in a range [0; 1]
+        // For example:
+
+        // |  A   |  B   | Dot product | L1 | L2 |
+        // | -0.5 | -0.5 |  0.25       | 0  | 0  |
+        // | -0.5 |  0.5 | -0.25       | 1  | 1  |
+        // |  0.5 | -0.5 | -0.25       | 1  | 1  |
+        // |  0.5 |  0.5 |  0.25       | 0  | 0  |
+
+        // | A | B | NXOR | XOR
+        // | 0 | 0 | 1    | 0
+        // | 0 | 1 | 0    | 1
+        // | 1 | 0 | 0    | 1
+        // | 1 | 1 | 1    | 0
+
+        let (xor_product, sum) = TBitsStoreType::xor_popcnt_scalar(v1, v2, bits_count);
+        let xor_product = (xor_product as f32) / (((1 << bits_count) - 1) as f32);
+
+        let dim = self.metadata.vector_parameters.dim as f32;
+        let zeros_count = dim - xor_product;
+
+        match (
+            self.metadata.vector_parameters.distance_type,
+            self.metadata.vector_parameters.invert,
+        ) {
+            // So if `invert` is true we return XOR, otherwise we return (dim - XOR)
+            (DistanceType::Dot, true) => xor_product - zeros_count,
+            (DistanceType::Dot, false) => zeros_count - xor_product,
+            // This also results in exact ordering as L1 and L2 but reversed.
+            (DistanceType::L1 | DistanceType::L2, true) => zeros_count - xor_product,
+            (DistanceType::L1 | DistanceType::L2, false) => xor_product - zeros_count,
+        }
+    }
+
     pub fn get_quantized_vector(&self, i: u32) -> &[u8] {
         self.encoded_vectors
             .get_vector_data(i as _, self.get_quantized_vector_size())
@@ -448,12 +638,19 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
         vector_stats_path.push("vector_stats.json");
         Some(vector_stats_path)
     }
+
+    pub fn encode_internal_query(&self, point_id: u32) -> EncodedQueryBQ<TBitsStoreType> {
+        let encoded_data = self.get_quantized_vector(point_id).to_vec();
+        EncodedQueryBQ::Binary(EncodedBinVector {
+            encoded_vector: transmute_from_u8_to_slice(&encoded_data).to_vec(),
+        })
+    }
 }
 
 impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage> EncodedVectors
     for EncodedVectorsBin<TBitsStoreType, TStorage>
 {
-    type EncodedQuery = EncodedBinVector<TBitsStoreType>;
+    type EncodedQuery = EncodedQueryBQ<TBitsStoreType>;
 
     fn save(&self, data_path: &Path, meta_path: &Path) -> std::io::Result<()> {
         meta_path.parent().map(std::fs::create_dir_all);
@@ -520,14 +717,19 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage> EncodedVectors
         self.encoded_vectors.is_on_disk()
     }
 
-    fn encode_query(&self, query: &[f32]) -> EncodedBinVector<TBitsStoreType> {
+    fn encode_query(&self, query: &[f32]) -> EncodedQueryBQ<TBitsStoreType> {
         debug_assert!(query.len() == self.metadata.vector_parameters.dim);
-        Self::encode_vector(query, &self.vector_stats, self.metadata.encoding)
+        Self::encode_query_vector(
+            query,
+            &self.vector_stats,
+            self.metadata.encoding,
+            self.metadata.query_encoding,
+        )
     }
 
     fn score_point(
         &self,
-        query: &EncodedBinVector<TBitsStoreType>,
+        query: &EncodedQueryBQ<TBitsStoreType>,
         i: u32,
         hw_counter: &HardwareCounterCell,
     ) -> f32 {
@@ -537,11 +739,23 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage> EncodedVectors
 
         let vector_data_usize_1 = transmute_from_u8_to_slice(vector_data_1);
 
-        hw_counter
-            .cpu_counter()
-            .incr_delta(query.encoded_vector.len());
+        hw_counter.cpu_counter().incr_delta(vector_data_1.len());
 
-        self.calculate_metric(vector_data_usize_1, &query.encoded_vector)
+        match query {
+            EncodedQueryBQ::Binary(encoded_vector) => {
+                self.calculate_metric(vector_data_usize_1, &encoded_vector.encoded_vector)
+            }
+            EncodedQueryBQ::Scalar8bits(encoded_vector) => self.calculate_metric_with_scalar(
+                vector_data_usize_1,
+                &encoded_vector.encoded_vector,
+                u8::BITS as usize,
+            ),
+            EncodedQueryBQ::Scalar4bits(encoded_vector) => self.calculate_metric_with_scalar(
+                vector_data_usize_1,
+                &encoded_vector.encoded_vector,
+                (u8::BITS / 2) as usize,
+            ),
+        }
     }
 
     fn score_internal(&self, i: u32, j: u32, hw_counter: &HardwareCounterCell) -> f32 {
@@ -570,14 +784,14 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage> EncodedVectors
         self.get_quantized_vector_size()
     }
 
-    fn encode_internal_vector(&self, id: u32) -> Option<EncodedBinVector<TBitsStoreType>> {
-        Some(EncodedBinVector {
+    fn encode_internal_vector(&self, id: u32) -> Option<EncodedQueryBQ<TBitsStoreType>> {
+        Some(EncodedQueryBQ::Binary(EncodedBinVector {
             encoded_vector: transmute_from_u8_to_slice(
                 self.encoded_vectors
                     .get_vector_data(id as _, self.get_quantized_vector_size()),
             )
             .to_vec(),
-        })
+        }))
     }
 }
 

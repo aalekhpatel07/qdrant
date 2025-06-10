@@ -40,6 +40,7 @@ fn binary_bench(c: &mut Criterion) {
             invert: false,
         },
         Encoding::OneBit,
+        None,
         &AtomicBool::new(false),
     )
     .unwrap();
@@ -80,6 +81,7 @@ fn binary_bench(c: &mut Criterion) {
             invert: false,
         },
         Encoding::OneBit,
+        None,
         &AtomicBool::new(false),
     )
     .unwrap();

@@ -50,6 +50,7 @@ mod tests {
                 invert: false,
             },
             Encoding::OneBit,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -97,6 +98,7 @@ mod tests {
                 invert: true,
             },
             Encoding::OneBit,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -144,6 +146,7 @@ mod tests {
                 invert: false,
             },
             Encoding::OneBit,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -188,6 +191,7 @@ mod tests {
                 invert: true,
             },
             Encoding::OneBit,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -231,6 +235,7 @@ mod tests {
                 invert: false,
             },
             Encoding::OneBit,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -293,6 +298,7 @@ mod tests {
                 invert: true,
             },
             Encoding::OneBit,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -355,6 +361,7 @@ mod tests {
                 invert: false,
             },
             Encoding::OneBit,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -414,6 +421,7 @@ mod tests {
                 invert: true,
             },
             Encoding::OneBit,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -473,6 +481,7 @@ mod tests {
                 invert: false,
             },
             Encoding::OneBit,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -535,6 +544,7 @@ mod tests {
                 invert: true,
             },
             Encoding::OneBit,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -597,6 +607,7 @@ mod tests {
                 invert: false,
             },
             Encoding::OneBit,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -656,6 +667,7 @@ mod tests {
                 invert: true,
             },
             Encoding::OneBit,
+            None,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -682,5 +694,52 @@ mod tests {
         let sorted_original_indices: Vec<_> = original_scores.into_iter().map(|(_, i)| i).collect();
 
         assert_eq!(sorted_original_indices, sorted_indices);
+    }
+
+    #[test]
+    fn test_binary_scalar_internal() {
+        test_binary_scalar_internal_impl::<u8>(16, Encoding::OneBit);
+        test_binary_scalar_internal_impl::<u8>(129, Encoding::OneBit);
+        test_binary_scalar_internal_impl::<u8>(16, Encoding::TwoBits);
+        test_binary_scalar_internal_impl::<u8>(129, Encoding::TwoBits);
+        test_binary_scalar_internal_impl::<u8>(16, Encoding::OneAndHalfBits);
+        test_binary_scalar_internal_impl::<u8>(129, Encoding::OneAndHalfBits);
+    }
+
+    fn test_binary_scalar_internal_impl<TBitsStoreType: BitsStoreType>(
+        vector_dim: usize,
+        encoding: Encoding,
+    ) {
+        let vectors_count = 128;
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(41);
+        let mut vector_data: Vec<Vec<f32>> = Vec::new();
+        for _ in 0..vectors_count {
+            vector_data.push(generate_vector(vector_dim, &mut rng));
+        }
+
+        let encoded = EncodedVectorsBin::<TBitsStoreType, _>::encode(
+            vector_data.iter(),
+            Vec::<u8>::new(),
+            &VectorParameters {
+                dim: vector_dim,
+                count: vectors_count,
+                distance_type: DistanceType::Dot,
+                invert: false,
+            },
+            encoding,
+            Some(quantization::encoded_vectors_binary::QueryEncoding::Scalar4bits),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        let query_encoded = encoded.encode_query(&vector_data[0]);
+
+        let other = 1;
+        let counter = HardwareCounterCell::new();
+        let score = encoded.score_point(&query_encoded, other as u32, &counter);
+        let score_internal = encoded.score_internal(0, other as u32, &counter);
+
+        assert_eq!(score, score_internal);
     }
 }
