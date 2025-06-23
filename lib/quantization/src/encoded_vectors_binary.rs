@@ -43,6 +43,12 @@ pub enum QueryEncoding {
     Scalar8bits,
 }
 
+impl QueryEncoding {
+    pub fn is_same_as_storage(&self) -> bool {
+        matches!(self, QueryEncoding::SameAsStorage)
+    }
+}
+
 pub enum EncodedQueryBQ<TBitsStoreType: BitsStoreType> {
     Binary(EncodedBinVector<TBitsStoreType>),
     Scalar4bits(EncodedScalarVector<TBitsStoreType>),
@@ -64,8 +70,8 @@ struct Metadata {
     #[serde(skip_serializing_if = "Encoding::is_one")]
     encoding: Encoding,
     #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    query_encoding: Option<QueryEncoding>,
+    #[serde(skip_serializing_if = "QueryEncoding::is_same_as_storage")]
+    query_encoding: QueryEncoding,
 }
 
 pub trait BitsStoreType:
@@ -253,7 +259,7 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
         mut storage_builder: impl EncodedStorageBuilder<Storage = TStorage>,
         vector_parameters: &VectorParameters,
         encoding: Encoding,
-        query_encoding: Option<QueryEncoding>,
+        query_encoding: QueryEncoding,
         stopped: &AtomicBool,
     ) -> Result<Self, EncodingError> {
         debug_assert!(validate_vector_parameters(orig_data.clone(), vector_parameters).is_ok());
@@ -441,22 +447,18 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
         query: &[f32],
         vector_stats: &Option<VectorStats>,
         encoding: Encoding,
-        query_encoding: Option<QueryEncoding>,
+        query_encoding: QueryEncoding,
     ) -> EncodedQueryBQ<TBitsStoreType> {
-        if let Some(query_encoding) = query_encoding {
-            match query_encoding {
-                QueryEncoding::SameAsStorage => {
-                    EncodedQueryBQ::Binary(Self::encode_vector(query, vector_stats, encoding))
-                }
-                QueryEncoding::Scalar8bits => EncodedQueryBQ::Scalar8bits(
-                    Self::encode_scalar_query_vector(query, encoding, u8::BITS as usize),
-                ),
-                QueryEncoding::Scalar4bits => EncodedQueryBQ::Scalar4bits(
-                    Self::encode_scalar_query_vector(query, encoding, (u8::BITS / 2) as usize),
-                ),
+        match query_encoding {
+            QueryEncoding::SameAsStorage => {
+                EncodedQueryBQ::Binary(Self::encode_vector(query, vector_stats, encoding))
             }
-        } else {
-            EncodedQueryBQ::Binary(Self::encode_vector(query, vector_stats, encoding))
+            QueryEncoding::Scalar8bits => EncodedQueryBQ::Scalar8bits(
+                Self::encode_scalar_query_vector(query, encoding, u8::BITS as usize),
+            ),
+            QueryEncoding::Scalar4bits => EncodedQueryBQ::Scalar4bits(
+                Self::encode_scalar_query_vector(query, encoding, (u8::BITS / 2) as usize),
+            ),
         }
     }
 

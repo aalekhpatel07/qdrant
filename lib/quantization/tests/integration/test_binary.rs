@@ -4,7 +4,7 @@ mod tests {
 
     use common::counter::hardware_counter::HardwareCounterCell;
     use quantization::encoded_vectors::{DistanceType, EncodedVectors, VectorParameters};
-    use quantization::encoded_vectors_binary::{BitsStoreType, EncodedVectorsBin, Encoding};
+    use quantization::encoded_vectors_binary::{BitsStoreType, EncodedVectorsBin, Encoding, QueryEncoding};
     use rand::{Rng, SeedableRng};
 
     use crate::metrics::{dot_similarity, l1_similarity, l2_similarity};
@@ -50,7 +50,7 @@ mod tests {
                 invert: false,
             },
             Encoding::OneBit,
-            None,
+            QueryEncoding::SameAsStorage,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -98,7 +98,7 @@ mod tests {
                 invert: true,
             },
             Encoding::OneBit,
-            None,
+            QueryEncoding::SameAsStorage,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -146,7 +146,7 @@ mod tests {
                 invert: false,
             },
             Encoding::OneBit,
-            None,
+            QueryEncoding::SameAsStorage,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -191,7 +191,7 @@ mod tests {
                 invert: true,
             },
             Encoding::OneBit,
-            None,
+            QueryEncoding::SameAsStorage,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -235,7 +235,7 @@ mod tests {
                 invert: false,
             },
             Encoding::OneBit,
-            None,
+            QueryEncoding::SameAsStorage,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -298,7 +298,7 @@ mod tests {
                 invert: true,
             },
             Encoding::OneBit,
-            None,
+            QueryEncoding::SameAsStorage,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -361,7 +361,7 @@ mod tests {
                 invert: false,
             },
             Encoding::OneBit,
-            None,
+            QueryEncoding::SameAsStorage,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -421,7 +421,7 @@ mod tests {
                 invert: true,
             },
             Encoding::OneBit,
-            None,
+            QueryEncoding::SameAsStorage,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -481,7 +481,7 @@ mod tests {
                 invert: false,
             },
             Encoding::OneBit,
-            None,
+            QueryEncoding::SameAsStorage,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -544,7 +544,7 @@ mod tests {
                 invert: true,
             },
             Encoding::OneBit,
-            None,
+            QueryEncoding::SameAsStorage,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -607,7 +607,7 @@ mod tests {
                 invert: false,
             },
             Encoding::OneBit,
-            None,
+            QueryEncoding::SameAsStorage,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -667,7 +667,7 @@ mod tests {
                 invert: true,
             },
             Encoding::OneBit,
-            None,
+            QueryEncoding::SameAsStorage,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -728,7 +728,7 @@ mod tests {
                 invert: false,
             },
             encoding,
-            Some(quantization::encoded_vectors_binary::QueryEncoding::Scalar4bits),
+            quantization::encoded_vectors_binary::QueryEncoding::Scalar4bits,
             &AtomicBool::new(false),
         )
         .unwrap();

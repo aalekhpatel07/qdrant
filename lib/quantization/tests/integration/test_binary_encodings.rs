@@ -76,7 +76,7 @@ mod tests {
                         invert,
                     },
                     encoding,
-                    None,
+                    QueryEncoding::SameAsStorage,
                     &AtomicBool::new(false),
                 )
                 .unwrap()
@@ -181,7 +181,7 @@ mod tests {
                         invert,
                     },
                     encoding,
-                    Some(query_encoding),
+                    query_encoding,
                     &AtomicBool::new(false),
                 )
                 .unwrap()

@@ -1075,7 +1075,7 @@ impl QuantizedVectors {
                     storage_builder,
                     vector_parameters,
                     encoding,
-                    Some(quantization::encoded_vectors_binary::QueryEncoding::Scalar4bits),
+                    quantization::encoded_vectors_binary::QueryEncoding::SameAsStorage,
                     stopped,
                 )?,
             ))
@@ -1092,7 +1092,7 @@ impl QuantizedVectors {
                     storage_builder,
                     vector_parameters,
                     encoding,
-                    Some(quantization::encoded_vectors_binary::QueryEncoding::Scalar4bits),
+                    quantization::encoded_vectors_binary::QueryEncoding::SameAsStorage,
                     stopped,
                 )?,
             ))
@@ -1136,7 +1136,7 @@ impl QuantizedVectors {
                 storage_builder,
                 vector_parameters,
                 encoding,
-                Some(quantization::encoded_vectors_binary::QueryEncoding::Scalar4bits),
+                quantization::encoded_vectors_binary::QueryEncoding::SameAsStorage,
                 stopped,
             )?;
             Ok(QuantizedVectorStorage::BinaryRamMulti(
@@ -1159,7 +1159,7 @@ impl QuantizedVectors {
                 storage_builder,
                 vector_parameters,
                 encoding,
-                Some(quantization::encoded_vectors_binary::QueryEncoding::Scalar4bits),
+                quantization::encoded_vectors_binary::QueryEncoding::SameAsStorage,
                 stopped,
             )?;
             let offsets_path = path.join(QUANTIZED_OFFSETS_PATH);

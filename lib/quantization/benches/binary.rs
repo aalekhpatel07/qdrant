@@ -4,7 +4,7 @@ use common::counter::hardware_counter::HardwareCounterCell;
 use criterion::{Criterion, criterion_group, criterion_main};
 use permutation_iterator::Permutor;
 use quantization::encoded_vectors::{DistanceType, EncodedVectors, VectorParameters};
-use quantization::encoded_vectors_binary::{EncodedVectorsBin, Encoding};
+use quantization::encoded_vectors_binary::{EncodedVectorsBin, Encoding, QueryEncoding};
 use rand::{Rng, SeedableRng};
 
 fn generate_number(rng: &mut rand::rngs::StdRng) -> f32 {
@@ -40,7 +40,7 @@ fn binary_bench(c: &mut Criterion) {
             invert: false,
         },
         Encoding::OneBit,
-        None,
+        QueryEncoding::SameAsStorage,
         &AtomicBool::new(false),
     )
     .unwrap();
@@ -81,7 +81,7 @@ fn binary_bench(c: &mut Criterion) {
             invert: false,
         },
         Encoding::OneBit,
-        None,
+        QueryEncoding::SameAsStorage,
         &AtomicBool::new(false),
     )
     .unwrap();
