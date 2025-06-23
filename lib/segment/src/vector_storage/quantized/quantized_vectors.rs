@@ -1063,18 +1063,18 @@ impl QuantizedVectors {
         };
         let query_encoding = match binary_config.query_encoding {
             Some(BinaryQuantizationQueryEncoding::Scalar4Bits) => {
-                Some(quantization::encoded_vectors_binary::QueryEncoding::Scalar4bits)
+                quantization::encoded_vectors_binary::QueryEncoding::Scalar4bits
             }
             Some(BinaryQuantizationQueryEncoding::Scalar8Bits) => {
-                Some(quantization::encoded_vectors_binary::QueryEncoding::Scalar8bits)
+                quantization::encoded_vectors_binary::QueryEncoding::Scalar8bits
             }
             Some(BinaryQuantizationQueryEncoding::Binary) => {
-                Some(quantization::encoded_vectors_binary::QueryEncoding::SameAsStorage)
+                quantization::encoded_vectors_binary::QueryEncoding::SameAsStorage
             }
             Some(BinaryQuantizationQueryEncoding::Default) => {
-                Some(quantization::encoded_vectors_binary::QueryEncoding::SameAsStorage)
+                quantization::encoded_vectors_binary::QueryEncoding::SameAsStorage
             }
-            None => None,
+            None => quantization::encoded_vectors_binary::QueryEncoding::SameAsStorage,
         };
         let quantized_vector_size =
             EncodedVectorsBin::<u128, QuantizedMmapStorage>::get_quantized_vector_size_from_params(
@@ -1140,18 +1140,18 @@ impl QuantizedVectors {
         };
         let query_encoding = match binary_config.query_encoding {
             Some(BinaryQuantizationQueryEncoding::Scalar4Bits) => {
-                Some(quantization::encoded_vectors_binary::QueryEncoding::Scalar4bits)
+                quantization::encoded_vectors_binary::QueryEncoding::Scalar4bits
             }
             Some(BinaryQuantizationQueryEncoding::Scalar8Bits) => {
-                Some(quantization::encoded_vectors_binary::QueryEncoding::Scalar8bits)
+                quantization::encoded_vectors_binary::QueryEncoding::Scalar8bits
             }
             Some(BinaryQuantizationQueryEncoding::Binary) => {
-                Some(quantization::encoded_vectors_binary::QueryEncoding::SameAsStorage)
+                quantization::encoded_vectors_binary::QueryEncoding::SameAsStorage
             }
             Some(BinaryQuantizationQueryEncoding::Default) => {
-                Some(quantization::encoded_vectors_binary::QueryEncoding::SameAsStorage)
+                quantization::encoded_vectors_binary::QueryEncoding::SameAsStorage
             }
-            None => None,
+            None => quantization::encoded_vectors_binary::QueryEncoding::SameAsStorage,
         };
         let quantized_vector_size =
             EncodedVectorsBin::<u8, QuantizedMmapStorage>::get_quantized_vector_size_from_params(
