@@ -687,6 +687,7 @@ pub struct BinaryQuantizationConfig {
 
     /// Asymmetric quantization configuration allows a query to have different quantization than stored vectors.
     /// It can increase the accuracy of search at the cost of performance.
+    #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_encoding: Option<BinaryQuantizationQueryEncoding>,
 }
