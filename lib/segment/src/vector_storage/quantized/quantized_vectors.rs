@@ -20,9 +20,10 @@ use crate::common::vector_utils::TrySetCapacityExact;
 use crate::data_types::primitive::PrimitiveVectorElement;
 use crate::data_types::vectors::{QueryVector, VectorElementType};
 use crate::types::{
-    BinaryQuantization, BinaryQuantizationConfig, BinaryQuantizationEncoding, CompressionRatio,
-    Distance, MultiVectorConfig, ProductQuantization, ProductQuantizationConfig,
-    QuantizationConfig, ScalarQuantization, ScalarQuantizationConfig, VectorStorageDatatype,
+    BinaryQuantization, BinaryQuantizationConfig, BinaryQuantizationEncoding,
+    BinaryQuantizationQueryEncoding, CompressionRatio, Distance, MultiVectorConfig,
+    ProductQuantization, ProductQuantizationConfig, QuantizationConfig, ScalarQuantization,
+    ScalarQuantizationConfig, VectorStorageDatatype,
 };
 use crate::vector_storage::chunked_vectors::ChunkedVectors;
 use crate::vector_storage::quantized::quantized_mmap_storage::{
@@ -1060,6 +1061,21 @@ impl QuantizedVectors {
             }
             None => quantization::encoded_vectors_binary::Encoding::OneBit,
         };
+        let query_encoding = match binary_config.query_encoding {
+            Some(BinaryQuantizationQueryEncoding::Scalar4Bits) => {
+                Some(quantization::encoded_vectors_binary::QueryEncoding::Scalar4bits)
+            }
+            Some(BinaryQuantizationQueryEncoding::Scalar8Bits) => {
+                Some(quantization::encoded_vectors_binary::QueryEncoding::Scalar8bits)
+            }
+            Some(BinaryQuantizationQueryEncoding::Binary) => {
+                Some(quantization::encoded_vectors_binary::QueryEncoding::SameAsStorage)
+            }
+            Some(BinaryQuantizationQueryEncoding::Default) => {
+                Some(quantization::encoded_vectors_binary::QueryEncoding::SameAsStorage)
+            }
+            None => None,
+        };
         let quantized_vector_size =
             EncodedVectorsBin::<u128, QuantizedMmapStorage>::get_quantized_vector_size_from_params(
                 vector_parameters.dim,
@@ -1075,7 +1091,7 @@ impl QuantizedVectors {
                     storage_builder,
                     vector_parameters,
                     encoding,
-                    quantization::encoded_vectors_binary::QueryEncoding::Scalar8bits,
+                    query_encoding,
                     stopped,
                 )?,
             ))
@@ -1092,7 +1108,7 @@ impl QuantizedVectors {
                     storage_builder,
                     vector_parameters,
                     encoding,
-                    quantization::encoded_vectors_binary::QueryEncoding::Scalar8bits,
+                    query_encoding,
                     stopped,
                 )?,
             ))
@@ -1122,6 +1138,21 @@ impl QuantizedVectors {
             }
             None => quantization::encoded_vectors_binary::Encoding::OneBit,
         };
+        let query_encoding = match binary_config.query_encoding {
+            Some(BinaryQuantizationQueryEncoding::Scalar4Bits) => {
+                Some(quantization::encoded_vectors_binary::QueryEncoding::Scalar4bits)
+            }
+            Some(BinaryQuantizationQueryEncoding::Scalar8Bits) => {
+                Some(quantization::encoded_vectors_binary::QueryEncoding::Scalar8bits)
+            }
+            Some(BinaryQuantizationQueryEncoding::Binary) => {
+                Some(quantization::encoded_vectors_binary::QueryEncoding::SameAsStorage)
+            }
+            Some(BinaryQuantizationQueryEncoding::Default) => {
+                Some(quantization::encoded_vectors_binary::QueryEncoding::SameAsStorage)
+            }
+            None => None,
+        };
         let quantized_vector_size =
             EncodedVectorsBin::<u8, QuantizedMmapStorage>::get_quantized_vector_size_from_params(
                 vector_parameters.dim,
@@ -1136,7 +1167,7 @@ impl QuantizedVectors {
                 storage_builder,
                 vector_parameters,
                 encoding,
-                quantization::encoded_vectors_binary::QueryEncoding::Scalar8bits,
+                query_encoding,
                 stopped,
             )?;
             Ok(QuantizedVectorStorage::BinaryRamMulti(
@@ -1159,7 +1190,7 @@ impl QuantizedVectors {
                 storage_builder,
                 vector_parameters,
                 encoding,
-                quantization::encoded_vectors_binary::QueryEncoding::Scalar8bits,
+                query_encoding,
                 stopped,
             )?;
             let offsets_path = path.join(QUANTIZED_OFFSETS_PATH);

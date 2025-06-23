@@ -94,7 +94,7 @@ fn binary() -> WithQuantization {
     let config = BinaryQuantizationConfig {
         always_ram: Some(true),
         encoding: None,
-        query_quantization: None,
+        query_encoding: None,
     }
     .into();
 

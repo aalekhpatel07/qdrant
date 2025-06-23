@@ -308,7 +308,7 @@ message BinaryQuantization {
   Asymmetric quantization configuration allows a query to have different quantization than stored vectors.
   It can increase the accuracy of search at the cost of performance.
   */
-  optional QueryQuantizationConfig query_quantization = 3;
+  optional BinaryQuantizationQueryEncoding query_encoding = 3;
 }
 
 message QuantizationConfig {
@@ -319,15 +319,16 @@ message QuantizationConfig {
   }
 }
 
-message QueryQuantizationConfig {
+message BinaryQuantizationQueryEncoding {
     enum Setting {
       Default = 0;
       Binary = 1;
-      Scalar = 2;
+      Scalar4Bits = 2;
+      Scalar8Bits = 3;
     }
 
     oneof variant {
-        Setting setting = 3;
+        Setting setting = 4;
     }
 }
 

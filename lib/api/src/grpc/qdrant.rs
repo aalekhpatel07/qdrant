@@ -436,7 +436,7 @@ pub struct BinaryQuantization {
     /// Asymmetric quantization configuration allows a query to have different quantization than stored vectors.
     /// It can increase the accuracy of search at the cost of performance.
     #[prost(message, optional, tag = "3")]
-    pub query_quantization: ::core::option::Option<QueryQuantizationConfig>,
+    pub query_encoding: ::core::option::Option<BinaryQuantizationQueryEncoding>,
 }
 #[derive(validator::Validate)]
 #[derive(serde::Serialize)]
@@ -464,12 +464,12 @@ pub mod quantization_config {
 #[derive(serde::Serialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct QueryQuantizationConfig {
-    #[prost(oneof = "query_quantization_config::Variant", tags = "3")]
-    pub variant: ::core::option::Option<query_quantization_config::Variant>,
+pub struct BinaryQuantizationQueryEncoding {
+    #[prost(oneof = "binary_quantization_query_encoding::Variant", tags = "4")]
+    pub variant: ::core::option::Option<binary_quantization_query_encoding::Variant>,
 }
-/// Nested message and enum types in `QueryQuantizationConfig`.
-pub mod query_quantization_config {
+/// Nested message and enum types in `BinaryQuantizationQueryEncoding`.
+pub mod binary_quantization_query_encoding {
     #[derive(serde::Serialize)]
     #[derive(
         Clone,
@@ -486,7 +486,8 @@ pub mod query_quantization_config {
     pub enum Setting {
         Default = 0,
         Binary = 1,
-        Scalar = 2,
+        Scalar4Bits = 2,
+        Scalar8Bits = 3,
     }
     impl Setting {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -497,7 +498,8 @@ pub mod query_quantization_config {
             match self {
                 Setting::Default => "Default",
                 Setting::Binary => "Binary",
-                Setting::Scalar => "Scalar",
+                Setting::Scalar4Bits => "Scalar4Bits",
+                Setting::Scalar8Bits => "Scalar8Bits",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -505,7 +507,8 @@ pub mod query_quantization_config {
             match value {
                 "Default" => Some(Self::Default),
                 "Binary" => Some(Self::Binary),
-                "Scalar" => Some(Self::Scalar),
+                "Scalar4Bits" => Some(Self::Scalar4Bits),
+                "Scalar8Bits" => Some(Self::Scalar8Bits),
                 _ => None,
             }
         }
@@ -514,7 +517,7 @@ pub mod query_quantization_config {
     #[allow(clippy::derive_partial_eq_without_eq)]
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Variant {
-        #[prost(enumeration = "Setting", tag = "3")]
+        #[prost(enumeration = "Setting", tag = "4")]
         Setting(i32),
     }
 }
