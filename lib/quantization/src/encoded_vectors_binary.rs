@@ -222,6 +222,27 @@ impl BitsStoreType for u128 {
     fn xor_popcnt_scalar(v1: &[Self], v2: &[Self], bits_count: usize) -> usize {
         debug_assert!(v2.len() >= v1.len() * bits_count);
 
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            if bits_count == 8 {
+                unsafe {
+                    return impl_xor_popcnt_scalar8_neon_uint128(
+                        v2.as_ptr().cast::<u8>(),
+                        v1.as_ptr().cast::<u8>(),
+                        v1.len() as u32,
+                    ) as usize;
+                }
+            } else if bits_count == 4 {
+                unsafe {
+                    return impl_xor_popcnt_scalar4_neon_uint128(
+                        v2.as_ptr().cast::<u8>(),
+                        v1.as_ptr().cast::<u8>(),
+                        v1.len() as u32,
+                    ) as usize;
+                }
+            }
+        }
+
         #[cfg(target_arch = "x86_64")]
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("sse4.2") {
             if bits_count == 8 {
@@ -872,4 +893,16 @@ unsafe extern "C" {
     -> u32;
 
     fn impl_xor_popcnt_neon_uint64(query_ptr: *const u8, vector_ptr: *const u8, count: u32) -> u32;
+
+    fn impl_xor_popcnt_scalar8_neon_uint128(
+        query_ptr: *const u8,
+        vector_ptr: *const u8,
+        count: u32,
+    ) -> u32;
+
+    fn impl_xor_popcnt_scalar4_neon_uint128(
+        query_ptr: *const u8,
+        vector_ptr: *const u8,
+        count: u32,
+    ) -> u32;
 }
