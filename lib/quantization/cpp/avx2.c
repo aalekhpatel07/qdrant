@@ -120,3 +120,112 @@ EXPORT float impl_score_l1_avx(
 
     return (float) sum;
 }
+
+EXPORT uint32_t impl_xor_popcnt_scalar8_avx_uint128(
+    const uint8_t* query_ptr,
+    const uint8_t* vector_ptr,
+    uint32_t count
+) {
+    const uint64_t* v_ptr = (const uint64_t*)vector_ptr;
+    const uint64_t* q_ptr = (const uint64_t*)query_ptr;
+
+    __m256i sum1 = _mm256_set1_epi32(0);
+    __m256i sum2 = _mm256_set1_epi32(0);
+    for (uint32_t _i = 0; _i < count; _i++) {
+        uint64_t v_1 = *v_ptr;
+        uint64_t v_2 = *(v_ptr + 1);
+
+        uint64_t q_1_1 = *q_ptr;
+        uint64_t q_2_1 = *(q_ptr + 1);
+        uint64_t q_1_2 = *(q_ptr + 2);
+        uint64_t q_2_2 = *(q_ptr + 3);
+        uint64_t q_1_3 = *(q_ptr + 4);
+        uint64_t q_2_3 = *(q_ptr + 5);
+        uint64_t q_1_4 = *(q_ptr + 6);
+        uint64_t q_2_4 = *(q_ptr + 7);
+        uint64_t q_1_5 = *(q_ptr + 8);
+        uint64_t q_2_5 = *(q_ptr + 9);
+        uint64_t q_1_6 = *(q_ptr + 10);
+        uint64_t q_2_6 = *(q_ptr + 11);
+        uint64_t q_1_7 = *(q_ptr + 12);
+        uint64_t q_2_7 = *(q_ptr + 13);
+        uint64_t q_1_8 = *(q_ptr + 14);
+        uint64_t q_2_8 = *(q_ptr + 15);
+
+        __m256i popcnt1 = _mm256_set_epi32(
+            _mm_popcnt_u64(v_1 ^ q_1_1),
+            _mm_popcnt_u64(v_1 ^ q_1_2),
+            _mm_popcnt_u64(v_1 ^ q_1_3),
+            _mm_popcnt_u64(v_1 ^ q_1_4),
+            _mm_popcnt_u64(v_2 ^ q_2_1),
+            _mm_popcnt_u64(v_2 ^ q_2_2),
+            _mm_popcnt_u64(v_2 ^ q_2_3),
+            _mm_popcnt_u64(v_2 ^ q_2_4)
+        );
+        sum1 = _mm256_add_epi32(sum1, popcnt1);
+
+        __m256i popcnt2 = _mm256_set_epi32(
+            _mm_popcnt_u64(v_1 ^ q_1_5),
+            _mm_popcnt_u64(v_1 ^ q_1_6),
+            _mm_popcnt_u64(v_1 ^ q_1_7),
+            _mm_popcnt_u64(v_1 ^ q_1_8),
+            _mm_popcnt_u64(v_2 ^ q_2_5),
+            _mm_popcnt_u64(v_2 ^ q_2_6),
+            _mm_popcnt_u64(v_2 ^ q_2_7),
+            _mm_popcnt_u64(v_2 ^ q_2_8)
+        );
+        sum2 = _mm256_add_epi32(sum2, popcnt2);
+
+        v_ptr += 2;
+        q_ptr += 16;
+    }
+    __m256i factor1 = _mm256_set_epi32(1, 2, 4, 8, 1, 2, 4, 8);
+    __m256i factor2 = _mm256_set_epi32(16, 32, 64, 128, 16, 32, 64, 128);
+    __m256 result1_mm256 = _mm256_cvtepi32_ps(_mm256_mullo_epi32(sum1, factor1));
+    __m256 result2_mm256 = _mm256_cvtepi32_ps(_mm256_mullo_epi32(sum2, factor2));
+    HSUM256_PS(_mm256_add_ps(result1_mm256, result2_mm256), mul_scalar);
+    return (uint32_t)mul_scalar;
+}
+
+EXPORT uint32_t impl_xor_popcnt_scalar4_avx_uint128(
+    const uint8_t* query_ptr,
+    const uint8_t* vector_ptr,
+    uint32_t count
+) {
+    const uint64_t* v_ptr = (const uint64_t*)vector_ptr;
+    const uint64_t* q_ptr = (const uint64_t*)query_ptr;
+
+    __m256i sum = _mm256_set1_epi32(0);
+    for (uint32_t _i = 0; _i < count; _i++) {
+        uint64_t v_1 = *v_ptr;
+        uint64_t v_2 = *(v_ptr + 1);
+
+        uint64_t q_1_1 = *q_ptr;
+        uint64_t q_2_1 = *(q_ptr + 1);
+        uint64_t q_1_2 = *(q_ptr + 2);
+        uint64_t q_2_2 = *(q_ptr + 3);
+        uint64_t q_1_3 = *(q_ptr + 4);
+        uint64_t q_2_3 = *(q_ptr + 5);
+        uint64_t q_1_4 = *(q_ptr + 6);
+        uint64_t q_2_4 = *(q_ptr + 7);
+
+        __m256i popcnt = _mm256_set_epi32(
+            _mm_popcnt_u64(v_1 ^ q_1_1),
+            _mm_popcnt_u64(v_1 ^ q_1_2),
+            _mm_popcnt_u64(v_1 ^ q_1_3),
+            _mm_popcnt_u64(v_1 ^ q_1_4),
+            _mm_popcnt_u64(v_2 ^ q_2_1),
+            _mm_popcnt_u64(v_2 ^ q_2_2),
+            _mm_popcnt_u64(v_2 ^ q_2_3),
+            _mm_popcnt_u64(v_2 ^ q_2_4)
+        );
+        sum = _mm256_add_epi32(sum, popcnt);
+
+        v_ptr += 2;
+        q_ptr += 8;
+    }
+    __m256i factor = _mm256_set_epi32(1, 2, 4, 8, 1, 2, 4, 8);
+    __m256 result_mm256 = _mm256_cvtepi32_ps(_mm256_mullo_epi32(sum, factor));
+    HSUM256_PS(result_mm256, mul_scalar);
+    return (uint32_t)mul_scalar;
+}

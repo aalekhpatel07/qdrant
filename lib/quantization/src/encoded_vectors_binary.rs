@@ -93,7 +93,7 @@ pub trait BitsStoreType:
     /// So it does not affect the resulting number of bits set to 1
     fn xor_popcnt(v1: &[Self], v2: &[Self]) -> usize;
 
-    fn xor_popcnt_scalar(v1: &[Self], v2: &[Self], bits_count: usize) -> (usize, usize);
+    fn xor_popcnt_scalar(v1: &[Self], v2: &[Self], bits_count: usize) -> usize;
 
     /// Estimates how many `StorageType` elements are needed to store `size` bits
     fn get_storage_size(size: usize) -> usize;
@@ -154,19 +154,16 @@ impl BitsStoreType for u8 {
         result
     }
 
-    fn xor_popcnt_scalar(v1: &[Self], v2: &[Self], bits_count: usize) -> (usize, usize) {
+    fn xor_popcnt_scalar(v1: &[Self], v2: &[Self], bits_count: usize) -> usize {
         debug_assert!(v2.len() >= v1.len() * bits_count);
 
         let mut result = 0;
-        let mut sum = 0;
         for (&b1, b2_chunk) in v1.iter().zip(v2.chunks_exact(bits_count)) {
-            sum += b1.count_ones() as usize;
-
             for (i, &b2) in b2_chunk.iter().enumerate() {
                 result += (b1 ^ b2).count_ones() << i;
             }
         }
-        (result as usize, sum)
+        result as usize
     }
 
     fn get_storage_size(size: usize) -> usize {
@@ -222,19 +219,58 @@ impl BitsStoreType for u128 {
         result
     }
 
-    fn xor_popcnt_scalar(v1: &[Self], v2: &[Self], bits_count: usize) -> (usize, usize) {
+    fn xor_popcnt_scalar(v1: &[Self], v2: &[Self], bits_count: usize) -> usize {
         debug_assert!(v2.len() >= v1.len() * bits_count);
 
-        let mut result = 0;
-        let mut sum = 0;
-        for (&b1, b2_chunk) in v1.iter().zip(v2.chunks_exact(bits_count)) {
-            sum += b1.count_ones() as usize;
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("sse4.2") {
+            if bits_count == 8 {
+                unsafe {
+                    return impl_xor_popcnt_scalar8_avx_uint128(
+                        v2.as_ptr().cast::<u8>(),
+                        v1.as_ptr().cast::<u8>(),
+                        v1.len() as u32,
+                    ) as usize;
+                }
+            } else if bits_count == 4 {
+                unsafe {
+                    return impl_xor_popcnt_scalar4_avx_uint128(
+                        v2.as_ptr().cast::<u8>(),
+                        v1.as_ptr().cast::<u8>(),
+                        v1.len() as u32,
+                    ) as usize;
+                }
+            }
+        }
 
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if is_x86_feature_detected!("sse4.2") {
+            if bits_count == 8 {
+                unsafe {
+                    return impl_xor_popcnt_scalar8_sse_uint128(
+                        v2.as_ptr().cast::<u8>(),
+                        v1.as_ptr().cast::<u8>(),
+                        v1.len() as u32,
+                    ) as usize;
+                }
+            } else if bits_count == 4 {
+                unsafe {
+                    return impl_xor_popcnt_scalar4_sse_uint128(
+                        v2.as_ptr().cast::<u8>(),
+                        v1.as_ptr().cast::<u8>(),
+                        v1.len() as u32,
+                    ) as usize;
+                }
+            }
+        }
+
+        let mut result = 0;
+        for (&b1, b2_chunk) in v1.iter().zip(v2.chunks_exact(bits_count)) {
             for (i, &b2) in b2_chunk.iter().enumerate() {
                 result += (b1 ^ b2).count_ones() << i;
             }
         }
-        (result as usize, sum)
+        result as usize
     }
 
     fn get_storage_size(size: usize) -> usize {
@@ -603,7 +639,7 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
         // | 1 | 0 | 0    | 1
         // | 1 | 1 | 1    | 0
 
-        let (xor_product, sum) = TBitsStoreType::xor_popcnt_scalar(v1, v2, bits_count);
+        let xor_product = TBitsStoreType::xor_popcnt_scalar(v1, v2, bits_count);
         let xor_product = (xor_product as f32) / (((1 << bits_count) - 1) as f32);
 
         let dim = self.metadata.vector_parameters.dim as f32;
@@ -804,6 +840,14 @@ unsafe extern "C" {
     fn impl_xor_popcnt_sse_uint64(query_ptr: *const u8, vector_ptr: *const u8, count: u32) -> u32;
 
     fn impl_xor_popcnt_sse_uint32(query_ptr: *const u8, vector_ptr: *const u8, count: u32) -> u32;
+
+    fn impl_xor_popcnt_scalar8_sse_uint128(query_ptr: *const u8, vector_ptr: *const u8, count: u32) -> u32;
+
+    fn impl_xor_popcnt_scalar4_sse_uint128(query_ptr: *const u8, vector_ptr: *const u8, count: u32) -> u32;
+
+    fn impl_xor_popcnt_scalar8_avx_uint128(query_ptr: *const u8, vector_ptr: *const u8, count: u32) -> u32;
+
+    fn impl_xor_popcnt_scalar4_avx_uint128(query_ptr: *const u8, vector_ptr: *const u8, count: u32) -> u32;
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
