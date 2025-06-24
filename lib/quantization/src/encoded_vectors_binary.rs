@@ -841,13 +841,29 @@ unsafe extern "C" {
 
     fn impl_xor_popcnt_sse_uint32(query_ptr: *const u8, vector_ptr: *const u8, count: u32) -> u32;
 
-    fn impl_xor_popcnt_scalar8_sse_uint128(query_ptr: *const u8, vector_ptr: *const u8, count: u32) -> u32;
+    fn impl_xor_popcnt_scalar8_sse_uint128(
+        query_ptr: *const u8,
+        vector_ptr: *const u8,
+        count: u32,
+    ) -> u32;
 
-    fn impl_xor_popcnt_scalar4_sse_uint128(query_ptr: *const u8, vector_ptr: *const u8, count: u32) -> u32;
+    fn impl_xor_popcnt_scalar4_sse_uint128(
+        query_ptr: *const u8,
+        vector_ptr: *const u8,
+        count: u32,
+    ) -> u32;
 
-    fn impl_xor_popcnt_scalar8_avx_uint128(query_ptr: *const u8, vector_ptr: *const u8, count: u32) -> u32;
+    fn impl_xor_popcnt_scalar8_avx_uint128(
+        query_ptr: *const u8,
+        vector_ptr: *const u8,
+        count: u32,
+    ) -> u32;
 
-    fn impl_xor_popcnt_scalar4_avx_uint128(query_ptr: *const u8, vector_ptr: *const u8, count: u32) -> u32;
+    fn impl_xor_popcnt_scalar4_avx_uint128(
+        query_ptr: *const u8,
+        vector_ptr: *const u8,
+        count: u32,
+    ) -> u32;
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]

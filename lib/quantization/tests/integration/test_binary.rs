@@ -4,7 +4,9 @@ mod tests {
 
     use common::counter::hardware_counter::HardwareCounterCell;
     use quantization::encoded_vectors::{DistanceType, EncodedVectors, VectorParameters};
-    use quantization::encoded_vectors_binary::{BitsStoreType, EncodedVectorsBin, Encoding, QueryEncoding};
+    use quantization::encoded_vectors_binary::{
+        BitsStoreType, EncodedVectorsBin, Encoding, QueryEncoding,
+    };
     use rand::{Rng, SeedableRng};
 
     use crate::metrics::{dot_similarity, l1_similarity, l2_similarity};
