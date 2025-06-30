@@ -256,6 +256,9 @@ pub struct UpdateCollection {
     pub sparse_vectors: Option<SparseVectorsConfig>,
     #[validate(nested)]
     pub strict_mode_config: Option<StrictModeConfig>,
+    /// Arbitrary metadata to associate to a collection.
+    #[validate(nested)]
+    pub properties: Option<serde_json::Value>,
 }
 
 /// Operation for updating parameters of the existing collection
@@ -279,6 +282,7 @@ impl UpdateCollectionOperation {
                 quantization_config: None,
                 sparse_vectors: None,
                 strict_mode_config: None,
+                properties: None,
             },
             shard_replica_changes: None,
         }
@@ -427,7 +431,7 @@ impl From<CollectionConfigInternal> for CreateCollection {
             quantization_config,
             strict_mode_config,
             uuid,
-            properties: None,
+            properties,
         } = value;
 
         let CollectionParams {
